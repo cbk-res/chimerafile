@@ -1,11 +1,28 @@
 # Chimerafile
 
-A unified inference binary that combines Mozilla's **llamafile** (LLM) and **whisperfile** (speech-to-text) projects into a single [APE](https://justine.lol/ape.html) executable.
+[![build](https://github.com/cbk-res/chimerafile/actions/workflows/build.yml/badge.svg)](https://github.com/cbk-res/chimerafile/actions/workflows/build.yml)
+
+A unified inference binary that combines Mozilla's **llamafile** (LLM), **whisperfile** (speech-to-text), and **stable-diffusion.cpp** (image generation) into a single [APE](https://justine.lol/ape.html) executable.
+
+Single-file downloads for each backend variant are available from the
+[Releases](https://github.com/cbk-res/chimerafile/releases) page.
 
 ```
-./chimerafile llama   [llamafile args...]
-./chimerafile whisper [whisperfile args...]
+./chimerafile llama      [llamafile args...]
+./chimerafile whisper    [whisperfile args...]
+./chimerafile diffusion  [diffusion args...]
 ```
+
+Pre-built variants (download from [Releases](https://github.com/cbk-res/chimerafile/releases)):
+
+| Artifact | Backends | Use case |
+|---|---|---|
+| `chimerafile-VERSION-cpu.elf` | CPU | Lightest, works everywhere |
+| `chimerafile-VERSION-cpu+vulkan.elf` | CPU + Vulkan | Linux with Vulkan drivers |
+| `chimerafile-VERSION-cpu+cuda.elf` | CPU + CUDA | Linux with NVIDIA GPU |
+| `chimerafile-VERSION-cpu+rocm.elf` | CPU + ROCm | Linux with AMD GPU |
+| `chimerafile-VERSION-cpu+metal.elf` | CPU + Metal | macOS (Intel & Apple Silicon) |
+| `chimerafile-VERSION-cpu+all-gpu.elf` | CPU + Vulkan + CUDA + ROCm | Universal GPU support |
 
 Chimerafile is intentionally a minimal dispatcher addon, which extends an unmodified version of the original [llamafile](https://github.com/mozilla-ai/llamafile) repository.
 
