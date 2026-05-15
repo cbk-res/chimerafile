@@ -1,0 +1,240 @@
+# -*- mode:yaml;coding:utf-8 -*-
+# vi: set et ft=yaml ts=2 sts=2 sw=2
+#
+# Chimerafile CI — build multi-backend APE binaries
+#
+# Produces six variants:
+#   1. cpu              — CPU only
+#   2. cpu+vulkan       — CPU + Vulkan GPU
+#   3. cpu+cuda         — CPU + CUDA GPU
+#   4. cpu+rocm         — CPU + ROCm GPU
+#   5. cpu+metal        — CPU + Metal GPU (macOS)
+#   6. cpu+all          — CPU + Vulkan + CUDA + ROCm (universal)
+
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  MODE: rel
+
+jobs:
+  # ── 1. CPU-only ───────────────────────────────────────────────────────────
+  cpu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+      - uses: actions/cache@v4
+        with:
+          path: llamafile/.cosmocc
+          key: cosmocc-${{ runner.os }}-4.0.2
+      - run: make setup
+      - run: make MODE=${{ env.MODE }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chimerafile-cpu
+          path: llamafile/o/${{ env.MODE }}/chimerafile/chimerafile
+          compression-level: 0
+      - name: Upload zipalign for all-gpu bundling
+        uses: actions/upload-artifact@v4
+        with:
+          name: zipalign-tool
+          path: llamafile/o/${{ env.MODE }}/third_party/zipalign/zipalign
+          compression-level: 0
+
+  # ── 2. CPU + Vulkan ──────────────────────────────────────────────────────
+  vulkan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+      - uses: actions/cache@v4
+        with:
+          path: llamafile/.cosmocc
+          key: cosmocc-${{ runner.os }}-4.0.2
+      - name: Install Vulkan SDK
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq spirv-headers shaderc libvulkan-dev
+      - run: make setup
+      - run: make MODE=${{ env.MODE }} vulkan
+      - run: make MODE=${{ env.MODE }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chimerafile-cpu+vulkan
+          path: llamafile/o/${{ env.MODE }}/chimerafile/chimerafile
+          compression-level: 0
+      - name: Upload ggml-vulkan.so for all-gpu job
+        uses: actions/upload-artifact@v4
+        with:
+          name: ggml-vulkan-so
+          path: llamafile/o/${{ env.MODE }}/ggml-vulkan.so
+          compression-level: 0
+
+  # ── 3. CPU + CUDA ────────────────────────────────────────────────────────
+  cuda:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+      - uses: actions/cache@v4
+        with:
+          path: llamafile/.cosmocc
+          key: cosmocc-cuda-${{ runner.os }}-4.0.2
+      - name: Install CUDA toolkit
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nvidia-cuda-toolkit
+      - run: make setup
+      - run: make MODE=${{ env.MODE }} cuda
+      - run: make MODE=${{ env.MODE }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chimerafile-cpu+cuda
+          path: llamafile/o/${{ env.MODE }}/chimerafile/chimerafile
+          compression-level: 0
+      - name: Upload ggml-cuda.so for all-gpu job
+        uses: actions/upload-artifact@v4
+        with:
+          name: ggml-cuda-so
+          path: llamafile/o/${{ env.MODE }}/ggml-cuda.so
+          compression-level: 0
+
+  # ── 4. CPU + ROCm ────────────────────────────────────────────────────────
+  rocm:
+    runs-on: ubuntu-latest
+    container:
+      image: rocm/dev-ubuntu-24.04:latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+      - uses: actions/cache@v4
+        with:
+          path: llamafile/.cosmocc
+          key: cosmocc-rocm-${{ runner.os }}-4.0.2
+      - name: Install build tools
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq make git
+      - run: make setup
+      - run: make MODE=${{ env.MODE }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chimerafile-cpu+rocm
+          path: llamafile/o/${{ env.MODE }}/chimerafile/chimerafile
+          compression-level: 0
+      - name: Upload ggml-rocm.so for all-gpu job
+        uses: actions/upload-artifact@v4
+        with:
+          name: ggml-rocm-so
+          path: llamafile/o/${{ env.MODE }}/ggml-rocm.so
+          compression-level: 0
+
+  # ── 5. CPU + Metal ────────────────────────────────────────────────────────
+  # Metal backend needs macOS + Xcode.  GitHub's macos-latest (x86_64) has
+  # the Metal framework; the resulting .so works on both Intel and Apple
+  # Silicon Macs at runtime.
+  metal:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+      - uses: actions/cache@v4
+        with:
+          path: llamafile/.cosmocc
+          key: cosmocc-metal-${{ runner.os }}-4.0.2
+      - run: make setup
+      - run: make MODE=${{ env.MODE }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chimerafile-cpu+metal
+          path: llamafile/o/${{ env.MODE }}/chimerafile/chimerafile
+          compression-level: 0
+
+  # ── 6. CPU + all GPUs (Vulkan + CUDA + ROCm) ─────────────────────────────
+  # Takes the CPU binary from the cpu job and zipaligns all three GPU .so
+  # files into it.  Each .so was built in its respective job above.
+  all:
+    needs: [cpu, vulkan, cuda, rocm]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: chimerafile-cpu
+      - uses: actions/download-artifact@v4
+        with:
+          name: ggml-vulkan-so
+      - uses: actions/download-artifact@v4
+        with:
+          name: ggml-cuda-so
+      - uses: actions/download-artifact@v4
+        with:
+          name: ggml-rocm-so
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: zipalign-tool
+
+      - name: Bundle all GPU backends into single APE
+        run: |
+          chmod +x zipalign
+          cp chimerafile chimerafile-cpu+all-gpu.elf
+          chmod +x chimerafile-cpu+all-gpu.elf
+          for so in ggml-vulkan.so ggml-cuda.so ggml-rocm.so; do
+            if [ -f "$so" ]; then
+              echo "  Bundling: $so"
+              ./zipalign -j0 chimerafile-cpu+all-gpu.elf "$so"
+            fi
+          done
+          ls -lh chimerafile-cpu+all-gpu.elf
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chimerafile-cpu+all-gpu
+          path: chimerafile-cpu+all-gpu.elf
+          compression-level: 0
+
+  # ── Release ────────────────────────────────────────────────────────────────
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [cpu, vulkan, cuda, rocm, metal, all]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+
+      - name: Rename and checksum
+        run: |
+          VER=$(echo ${{ github.ref_name }} | sed s/^v//)
+          for variant in cpu cpu+vulkan cpu+cuda cpu+rocm cpu+metal cpu+all-gpu; do
+            src="chimerafile-${variant}/chimerafile"
+            [ -f "$src" ] || src="chimerafile-${variant}.elf"
+            mv "$src" "chimerafile-${VER}-${variant}.elf"
+          done
+          sha256sum *.elf > SHA256SUMS.txt
+          ls -lh *.elf
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            *.elf
+            SHA256SUMS.txt
+          generate_release_notes: true
