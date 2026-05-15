@@ -53,7 +53,12 @@ all:
 .PHONY: setup
 setup:
 	@echo "==> Initialising llamafile submodule..."
-	@cd $(CHIMERAFILE_REPO) && git submodule update --init --recursive llamafile
+	@cd $(CHIMERAFILE_REPO) && \
+		if git submodule status llamafile >/dev/null 2>&1; then \
+			git submodule update --init --recursive llamafile; \
+		else \
+			echo "   (submodule already cloned, skipping)"; \
+		fi
 	@echo "==> Running llamafile setup (cosmocc, patches, nested submodules)..."
 	$(MAKE) -C $(LLAMAFILE) setup
 	@echo ""
