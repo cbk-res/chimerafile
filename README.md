@@ -2,10 +2,7 @@
 
 [![build](https://github.com/cbk-res/chimerafile/actions/workflows/build.yml/badge.svg)](https://github.com/cbk-res/chimerafile/actions/workflows/build.yml)
 
-A unified inference binary that combines Mozilla's **llamafile** (LLM), **whisperfile** (speech-to-text), and **stable-diffusion.cpp** (image generation) into a single [APE](https://justine.lol/ape.html) executable.
-
-Single-file downloads for each backend variant are available from the
-[Releases](https://github.com/cbk-res/chimerafile/releases) page.
+A unified inference binary that combines **llamafile** (LLM), **whisperfile** (speech-to-text), and **stable-diffusion.cpp** ('diffusionfile' for image generation) into a single [APE](https://justine.lol/ape.html) executable, while making zero changes to the upstream source.
 
 ```
 ./chimerafile llama      [llamafile args...]
@@ -13,142 +10,171 @@ Single-file downloads for each backend variant are available from the
 ./chimerafile diffusion  [diffusion args...]
 ```
 
-Pre-built variants (download from [Releases](https://github.com/cbk-res/chimerafile/releases)):
+All three engines share a **single GGML runtime** — reducing duplication which might occur when projects wish to make use of one or more 'llamafiles' (e.g. an app which uses llamafile, whisperfile, and diffusionfile). We include several GPU backends (Vulkan, CUDA, ROCm, Metal), which are bundled as `.so` files inside the APE and loaded at runtime.
+
+---
+
+## Downloads
+
+Pre-built binaries from [Releases](https://github.com/cbk-res/chimerafile/releases) (CI-built on every tag):
 
 | Artifact | Backends | Use case |
 |---|---|---|
 | `chimerafile-VERSION-cpu.elf` | CPU | Lightest, works everywhere |
-| `chimerafile-VERSION-cpu+vulkan.elf` | CPU + Vulkan | Linux with Vulkan drivers |
-| `chimerafile-VERSION-cpu+cuda.elf` | CPU + CUDA | Linux with NVIDIA GPU |
+| `chimerafile-VERSION-cpu+vulkan.elf` | CPU + Vulkan | Linux (and probably Windows) with Vulkan drivers |
+| `chimerafile-VERSION-cpu+cuda.elf` | CPU + CUDA | Linux (and probably Windows) with NVIDIA GPU |
 | `chimerafile-VERSION-cpu+rocm.elf` | CPU + ROCm | Linux with AMD GPU |
 | `chimerafile-VERSION-cpu+metal.elf` | CPU + Metal | macOS (Intel & Apple Silicon) |
-| `chimerafile-VERSION-cpu+all-gpu.elf` | CPU + Vulkan + CUDA + ROCm | Universal GPU support |
-
-Chimerafile is intentionally a minimal dispatcher addon, which extends an unmodified version of the original [llamafile](https://github.com/mozilla-ai/llamafile) repository.
-
----
-
-## Requirements
-
-- Linux; macOS and Windows haven't been tested (yet)
-- Git
-- GNU Make ≥ 4.0
-
-No other dependencies — the build system downloads [cosmocc](https://github.com/jart/cosmopolitan) automatically.
+| `chimerafile-VERSION-cpu+all-gpu.elf` | CPU + Vulkan + CUDA + ROCm | Universal GPU support (outwith macOS) |
 
 ---
 
 ## Quick Start
 
 ```sh
-git clone https://github.com/you/chimerafile
+git clone https://github.com/cbk-res/chimerafile
 cd chimerafile
 make setup          # initialise submodule + download cosmocc (~50 MB)
 make                # build (debug)
-make MODE=rel       # build (optimised)
+make MODE=rel       # build (optimised, ~20 min first build)
 ```
 
-The binary is written to `llamafile/o//chimerafile/chimerafile` (debug) or `llamafile/o/rel/chimerafile/chimerafile` (release).
-
-```sh
-make install        # install to /usr/local/bin/chimerafile
-make install PREFIX=~/.local   # or a custom prefix
-```
+The binary is written to `llamafile/o//chimerafile/chimerafile`.
 
 ---
 
 ## Usage
 
+### LLM — all existing llamafile functionality is preserved
 ```sh
-# LLM — all llamafile modes work unchanged
 ./chimerafile llama --cli   -m model.gguf -p "Summarise this podcast"
 ./chimerafile llama --server -m model.gguf --port 8080
 ./chimerafile llama --chat  -m model.gguf
+```
 
-# Speech-to-text — all whisperfile flags work unchanged
+### Speech-to-text — whsiperfile is similarly unchanged
+```sh
 ./chimerafile whisper -m whisper.gguf -f audio.wav
 ./chimerafile whisper -m whisper.gguf -f audio.wav --output-csv -of transcript
-./chimerafile whisper --help
+```
 
-# Version / help
-./chimerafile --version
-./chimerafile --help
-./chimerafile llama --help
-./chimerafile whisper --help
+### Image generation — 'diffusionfile' builds on the patches for stable-diffusion.cpp present within the llamafile submodule, providing text-to-image generation and more!
+```sh
+./chimerafile diffusion -m model.safetensors -p "a cat in a spacesuit"
+./chimerafile diffusion -m model.safetensors -p "portrait" -W 1024 -H 1024 --steps 30
+./chimerafile diffusion -m model.safetensors -p "turn into van gogh" \
+    --input photo.jpg --strength 0.6
+./chimerafile diffusion -m model.gguf -p "donkey" --verbose
 ```
 
 ---
 
-## Architecture
+## Project Structure
 
 ```
-chimerafile/              ← this repo
-├── chimerafile.cpp       ← dispatcher (owns main(), ~80 lines)
-├── BUILD.mk              ← build rules (injected into llamafile's make)
-├── Makefile              ← thin wrapper, delegates to llamafile/Makefile
-├── .gitmodules           ← pins llamafile submodule
-└── llamafile/            ← git submodule (stock, unmodified)
-    ├── llamafile/        ← LLM TUI + server
-    ├── whisperfile/      ← speech-to-text CLI
-    ├── llama.cpp/        ← LLM backend (submodule)
-    ├── whisper.cpp/      ← ASR backend (submodule, patched by llamafile)
-    └── ...
+chimerafile/                    ← this repo (chimerafile layer only)
+├── chimerafile.cpp             ← dispatcher (owns main())
+├── llama_dispatch.cpp          ← llamafile mode (not compiled from submodule)
+├── diffusionfile/
+│   ├── diffusionfile.cpp       ← diffusion engine entry point
+│   ├── sd_core.cpp             ← stb conflict wrapper
+│   └── sd_ggml_compat.h        ← GGML API compatibility shim
+├── BUILD.mk                    ← build rules (injected into llamafile's make)
+├── Makefile                    ← thin wrapper, delegates to llamafile/Makefile
+├── .github/workflows/build.yml ← CI: 6 variant builds
+└── llamafile/                  ← git submodule (stock, unmodified)
+    ├── llamafile/              ← LLM TUI + server
+    ├── whisperfile/            ← speech-to-text CLI
+    ├── stable-diffusion.cpp/   ← image generation library
+    ├── llama.cpp/              ← LLM backend (submodule)
+    └── whisper.cpp/            ← ASR backend (submodule)
 ```
 
-### How the dispatch works
+### Single GGML — all three backends share one runtime
 
-`chimerafile.cpp` owns `main()`. The two backend entry points are renamed at
-compile time using `-Dmain=<name>`, requiring **zero changes** to the llamafile
-source tree:
+`whisper.cpp` and `stable-diffusion.cpp` each ship their own GGML fork.
+Linking both into one binary would produce duplicate symbols. Chimerafile
+resolves this by recompiling both backends against **llama.cpp's GGML**
+headers, giving all three engines a single, GPU-capable GGML implementation
+(Vulkan / CUDA / ROCm / Metal).
+
+For `stable-diffusion.cpp`, a compatibility shim (`sd_ggml_compat.h`) bridges
+six API differences between its upstream GGML fork and llama.cpp's GGML:
+
+| API | Resolution |
+|---|---|
+| `ggml_cpu_has_blas()` | Stub (returns 0) |
+| `ggml_internal_get_type_traits()` → `ggml_get_type_traits()` | Struct-by-value wrapper |
+| `ggml_upscale(ctx, a, 2)` (3-arg) → 4-arg | Macro appends `GGML_SCALE_MODE_NEAREST` |
+| `ggml_set_f32()` / `ggml_set_f32_1d()` | Provided by `ggml-cpu.h` |
+| `ggml_graph_compute_with_ctx()` | Provided by `ggml-cpu.h` |
+| `ggml_backend_cpu_init()` → GPU-first | Linker `--wrap` tries Vulkan/CUDA first |
+
+### Dispatch model
+
+Backend entry points are renamed at compile time (`-Dmain=<name>`),
+requiring **zero changes** to the llamafile source tree:
 
 | Source file | Compiled as |
 |---|---|
-| `llamafile/main.cpp` | `-Dmain=llamafile_main` |
+| `llamafile/llamafile/main.cpp` | `-Dmain=llamafile_main` (via `llama_dispatch.cpp`) |
 | `whisperfile/whisperfile.cpp` | `-Dmain=whisperfile_main` |
+| `diffusionfile/diffusionfile.cpp` | `-Dmain=diffusionfile_main` |
 
-`argv[1]` (`llama` or `whisper`) is consumed by the dispatcher; the rest of
-the arguments are passed verbatim to the chosen backend.
+`argv[1]` is consumed by the dispatcher; the remainder passes verbatim to
+the chosen backend.
 
-### Single GGML
+---
 
-`whisper.cpp` ships its own GGML fork. Linking both GGMLs into one binary
-produces duplicate symbols. Chimerafile resolves this by recompiling the
-whisper sources against `llama.cpp`'s GGML headers, giving both backends a
-single, GPU-capable GGML implementation.
+## GPU Backends
 
-### APE format
+GPU acceleration is automatic — no flags needed. The compat shim's
+`ggml_backend_cpu_init()` override probes for a GPU device first:
 
-Because Chimerafile uses the same cosmocc toolchain as llamafile, the output
-binary is automatically an [APE](https://justine.lol/ape.html) (Actually
-Portable Executable) — a single file that runs natively on Linux, macOS,
-Windows, and FreeBSD, on both x86_64 and aarch64.
+1. Discrete GPU (Vulkan / CUDA via `ggml_backend_dev_by_type(GPU)`)
+2. Integrated GPU (Apple Metal / AMD APU)
+3. Falls back to CPU
+
+Run with `--verbose` to see detected backends.
+
+Building GPU backends requires the respective SDK:
+```sh
+# Vulkan (needs Vulkan SDK from lunarg.com)
+make MODE=rel vulkan && make MODE=rel
+
+# CUDA (needs CUDA toolkit)
+make MODE=rel cuda && make MODE=rel
+
+# ROCm (needs ROCm stack)
+make MODE=rel rocm && make MODE=rel
+```
+
+Each produces a `.so` that gets zipaligned into the APE automatically.
 
 ---
 
 ## Bundling a model (optional)
 
-A bare `chimerafile` binary requires `-m model.gguf` at runtime. To create a
-self-contained single-file distribution with a model baked in, use llamafile's
-`zipalign` tool after the build (same workflow as llamafile itself):
+The workflow here should behave the same as it does within Mozilla's llamafile — using `zipalign` to embed a GGUF into the APE:
 
 ```sh
-# Example: bundle a Qwen3 GGUF for LLM mode
-cp llamafile/o/rel/chimerafile/chimerafile my-podcast-assistant.chimerafile
+cp llamafile/o/rel/chimerafile/chimerafile my-model.elf
 echo '--cli -m qwen3.gguf' > .args
-llamafile/o//third_party/zipalign/zipalign -j0 \
-    my-podcast-assistant.chimerafile \
+llamafile/o/rel/third_party/zipalign/zipalign -j0 \
+    my-model.elf \
     qwen3.gguf \
     .args
-chmod +x my-podcast-assistant.chimerafile
+chmod +x my-model.elf
 ```
+However, this has not yet been tested within chimerafile itself.
 
 ---
 
 ## Roadmap
 
-- **v0.1** — llama + whisper dispatch (this release)
-- **v0.2** — diffusion image generation forced endpoint (`./chimerafile diffusion`)
-- **v0.3** — auto-loading server? or more endpoints? we'll see!
+- **v0.1** — llama + whisper dispatch
+- **v0.2** — diffusion image generation (`stable-diffusion.cpp` backend, single GGML, GPU compat shim)
+- **v0.3** — support for further, optional backends is planned
 
 ## License
 
