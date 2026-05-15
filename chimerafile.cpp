@@ -40,6 +40,7 @@
 
 extern int llama_dispatch(int argc, char **argv);
 extern int whisperfile_main(int argc, char **argv);
+extern "C" int diffusionfile_main(int argc, char **argv);
 
 // ── Usage ──────────────────────────────────────────────────────────────────
 
@@ -50,19 +51,22 @@ static void print_usage(FILE *f, const char *prog) {
         "usage: %s <engine> [engine-args...]\n"
         "\n"
         "engines:\n"
-        "  llama    LLM inference (chat, server, CLI) — wraps llamafile\n"
-        "  whisper  Speech-to-text transcription      — wraps whisperfile\n"
+        "  llama      LLM inference (chat, server, CLI)  — wraps llamafile\n"
+        "  whisper    Speech-to-text transcription       — wraps whisperfile\n"
+        "  diffusion  Image generation (txt2img / img2img)\n"
         "\n"
         "examples:\n"
-        "  %s llama   --cli -m model.gguf -p \"Hello\"\n"
-        "  %s llama   --server -m model.gguf\n"
-        "  %s whisper -m whisper.gguf -f audio.wav --output-csv\n"
+        "  %s llama      --cli -m model.gguf -p \"Hello\"\n"
+        "  %s llama      --server -m model.gguf\n"
+        "  %s whisper    -m whisper.gguf -f audio.wav --output-csv\n"
+        "  %s diffusion  -m model.safetensors -p \"a cat\"\n"
         "  %s --version\n"
         "\n"
         "Pass --help after the engine name for engine-specific help:\n"
-        "  %s llama   --help\n"
-        "  %s whisper --help\n",
-        prog, prog, prog, prog, prog, prog, prog);
+        "  %s llama      --help\n"
+        "  %s whisper    --help\n"
+        "  %s diffusion  --help\n",
+        prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 // ── Entry point ────────────────────────────────────────────────────────────
@@ -97,6 +101,9 @@ int main(int argc, char **argv) {
 
     if (strcmp(engine, "whisper") == 0)
         return whisperfile_main(argc, argv);
+
+    if (strcmp(engine, "diffusion") == 0)
+        return diffusionfile_main(argc, argv);
 
     fprintf(stderr, "chimerafile: unknown engine '%s'\n\n", engine);
     print_usage(stderr, argv[0]);

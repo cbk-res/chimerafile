@@ -130,7 +130,8 @@ chmod +x my-podcast-assistant.chimerafile
 ## Roadmap
 
 - **v0.1** — llama + whisper dispatch (this release)
-- **v0.2** — diffusion image generation forced endpoint (`./chimerafile diffusion`) - next time!
+- **v0.2** — diffusion image generation forced endpoint (`./chimerafile diffusion`)
+- **v0.3** — auto-loading server? or more endpoints? we'll see!
 
 ## License
 
