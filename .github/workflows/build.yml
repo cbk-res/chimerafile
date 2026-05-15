@@ -94,7 +94,12 @@ jobs:
           cd llamafile/stable-diffusion.cpp
           git reset --hard
           git clean -fdx
-      - run: make MODE=${{ env.MODE }} vulkan
+      - name: Build Vulkan backend (verbose)
+        run: |
+          cd llamafile
+          GGML_VERSION=0.10.0 GGML_COMMIT=7b8443ac7 \
+            bash -x llamafile/vulkan.sh 2>&1 | tail -50
+        shell: bash
       - run: make MODE=${{ env.MODE }}
       - uses: actions/upload-artifact@v4
         with:
