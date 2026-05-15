@@ -53,6 +53,8 @@ jobs:
           git reset --hard
           git clean -fdx
       - run: make MODE=${{ env.MODE }}
+      - name: Build zipalign (needed by all-gpu job)
+        run: make MODE=${{ env.MODE }} o/${{ env.MODE }}/third_party/zipalign/zipalign
       - uses: actions/upload-artifact@v4
         with:
           name: chimerafile-cpu
