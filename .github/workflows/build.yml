@@ -37,6 +37,13 @@ jobs:
         with:
           path: llamafile/.cosmocc
           key: cosmocc-${{ runner.os }}-4.0.2
+      - name: Cache compiled objects (incremental build)
+        uses: actions/cache@v4
+        with:
+          path: llamafile/o
+          key: obj-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            obj-${{ runner.os }}-
       - run: make setup
       # stable-diffusion.cpp patches are buggy (wrong include paths).
       # Reset it so our compat header + include paths handle the job.
@@ -69,6 +76,13 @@ jobs:
         with:
           path: llamafile/.cosmocc
           key: cosmocc-${{ runner.os }}-4.0.2
+      - name: Cache compiled objects (incremental build)
+        uses: actions/cache@v4
+        with:
+          path: llamafile/o
+          key: obj-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            obj-${{ runner.os }}-
       - name: Cache Vulkan SDK
         id: cache-vulkan
         uses: actions/cache@v4
@@ -100,12 +114,9 @@ jobs:
           cd llamafile/stable-diffusion.cpp
           git reset --hard
           git clean -fdx
-      - name: Build Vulkan backend (verbose)
-        run: |
-          cd llamafile
-          GGML_VERSION=0.10.0 GGML_COMMIT=7b8443ac7 \
-            bash -x llamafile/vulkan.sh 2>&1 | tail -50
-        shell: bash
+      - run: make MODE=${{ env.MODE }} vulkan
+      - name: Copy ggml-vulkan.so to build tree
+        run: cp ~/ggml-vulkan.so llamafile/o/${{ env.MODE }}/ggml-vulkan.so
       - run: make MODE=${{ env.MODE }}
       - uses: actions/upload-artifact@v4
         with:
@@ -129,6 +140,13 @@ jobs:
         with:
           path: llamafile/.cosmocc
           key: cosmocc-cuda-${{ runner.os }}-4.0.2
+      - name: Cache compiled objects (incremental build)
+        uses: actions/cache@v4
+        with:
+          path: llamafile/o
+          key: obj-cuda-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            obj-cuda-${{ runner.os }}-
       - name: Install CUDA toolkit (official NVIDIA repo)
         run: |
           wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
@@ -144,6 +162,8 @@ jobs:
           git reset --hard
           git clean -fdx
       - run: make MODE=${{ env.MODE }} cuda
+      - name: Copy ggml-cuda.so to build tree
+        run: cp ~/ggml-cuda.so llamafile/o/${{ env.MODE }}/ggml-cuda.so
       - run: make MODE=${{ env.MODE }}
       - uses: actions/upload-artifact@v4
         with:
@@ -173,6 +193,13 @@ jobs:
         with:
           path: llamafile/.cosmocc
           key: cosmocc-rocm-${{ runner.os }}-4.0.2
+      - name: Cache compiled objects (incremental build)
+        uses: actions/cache@v4
+        with:
+          path: llamafile/o
+          key: obj-rocm-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            obj-rocm-${{ runner.os }}-
       - name: Install build tools
         run: |
           apt-get update -qq
@@ -183,12 +210,16 @@ jobs:
           cd llamafile/stable-diffusion.cpp
           git reset --hard
           git clean -fdx
+      - run: make MODE=${{ env.MODE }} rocm
       - run: make MODE=${{ env.MODE }}
       - uses: actions/upload-artifact@v4
         with:
           name: chimerafile-cpu+rocm
           path: llamafile/o/${{ env.MODE }}/chimerafile/chimerafile
           compression-level: 0
+      - name: Copy ggml-rocm.so to build tree
+        run: |
+          cp ~/ggml-rocm.so llamafile/o/${{ env.MODE }}/ggml-rocm.so
       - uses: actions/upload-artifact@v4
         with:
           name: ggml-rocm-so
@@ -206,6 +237,13 @@ jobs:
         with:
           path: llamafile/.cosmocc
           key: cosmocc-metal-${{ runner.os }}-4.0.2
+      - name: Cache compiled objects (incremental build)
+        uses: actions/cache@v4
+        with:
+          path: llamafile/o
+          key: obj-metal-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            obj-metal-${{ runner.os }}-
       - run: make setup
       # macOS ships an old Xcode make; cosmocc provides a compatible one
       - name: Use cosmocc make
