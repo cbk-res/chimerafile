@@ -32,13 +32,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Clone llamafile submodule
-        run: |
-          git clone --depth 1 --branch main $LLAMAFILE_REPO llamafile
+        run: git clone --depth 1 --branch main $LLAMAFILE_REPO llamafile
       - uses: actions/cache@v4
         with:
           path: llamafile/.cosmocc
           key: cosmocc-${{ runner.os }}-4.0.2
       - run: make setup
+      # stable-diffusion.cpp patches are buggy (wrong include paths).
+      # Reset it so our compat header + include paths handle the job.
+      - name: Reset stable-diffusion.cpp to unpatched state
+        run: |
+          cd llamafile/stable-diffusion.cpp
+          git reset --hard
+          git clean -fdx
       - run: make MODE=${{ env.MODE }}
       - uses: actions/upload-artifact@v4
         with:
@@ -58,8 +64,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Clone llamafile submodule
-        run: |
-          git clone --depth 1 --branch main $LLAMAFILE_REPO llamafile
+        run: git clone --depth 1 --branch main $LLAMAFILE_REPO llamafile
       - uses: actions/cache@v4
         with:
           path: llamafile/.cosmocc
@@ -79,11 +84,16 @@ jobs:
           sudo mkdir -p /opt/vulkansdk
           sudo tar -xJf /tmp/vulkansdk.tar.xz -C /opt/vulkansdk --strip-components=1
           rm /tmp/vulkansdk.tar.xz
-      - name: Set up Vulkan SDK environment
+      - name: Set Vulkan SDK environment
         run: |
           echo "VULKAN_SDK=/opt/vulkansdk" >> $GITHUB_ENV
           echo "/opt/vulkansdk/bin" >> $GITHUB_PATH
       - run: make setup
+      - name: Reset stable-diffusion.cpp to unpatched state
+        run: |
+          cd llamafile/stable-diffusion.cpp
+          git reset --hard
+          git clean -fdx
       - run: make MODE=${{ env.MODE }} vulkan
       - run: make MODE=${{ env.MODE }}
       - uses: actions/upload-artifact@v4
@@ -103,17 +113,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Clone llamafile submodule
-        run: |
-          git clone --depth 1 --branch main $LLAMAFILE_REPO llamafile
+        run: git clone --depth 1 --branch main $LLAMAFILE_REPO llamafile
       - uses: actions/cache@v4
         with:
           path: llamafile/.cosmocc
           key: cosmocc-cuda-${{ runner.os }}-4.0.2
-      - name: Install CUDA toolkit
+      - name: Install CUDA toolkit (official NVIDIA repo)
         run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update -qq
-          sudo apt-get install -y -qq nvidia-cuda-toolkit
+          sudo apt-get install -y -qq cuda-toolkit-12-6
+          echo "CUDA_PATH=/usr/local/cuda-12" >> $GITHUB_ENV
+          echo "/usr/local/cuda-12/bin" >> $GITHUB_PATH
       - run: make setup
+      - name: Reset stable-diffusion.cpp to unpatched state
+        run: |
+          cd llamafile/stable-diffusion.cpp
+          git reset --hard
+          git clean -fdx
       - run: make MODE=${{ env.MODE }} cuda
       - run: make MODE=${{ env.MODE }}
       - uses: actions/upload-artifact@v4
@@ -133,14 +151,13 @@ jobs:
     container:
       image: rocm/dev-ubuntu-24.04:latest
     steps:
-      - name: Install git (needed for checkout)
+      - name: Install prerequisites
         run: |
           apt-get update -qq
-          apt-get install -y -qq git
+          apt-get install -y -qq git unzip
       - uses: actions/checkout@v4
       - name: Clone llamafile submodule
-        run: |
-          git clone --depth 1 --branch main $LLAMAFILE_REPO llamafile
+        run: git clone --depth 1 --branch main $LLAMAFILE_REPO llamafile
       - uses: actions/cache@v4
         with:
           path: llamafile/.cosmocc
@@ -150,6 +167,11 @@ jobs:
           apt-get update -qq
           apt-get install -y -qq make python3
       - run: make setup
+      - name: Reset stable-diffusion.cpp to unpatched state
+        run: |
+          cd llamafile/stable-diffusion.cpp
+          git reset --hard
+          git clean -fdx
       - run: make MODE=${{ env.MODE }}
       - uses: actions/upload-artifact@v4
         with:
@@ -168,13 +190,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Clone llamafile submodule
-        run: |
-          git clone --depth 1 --branch main $LLAMAFILE_REPO llamafile
+        run: git clone --depth 1 --branch main $LLAMAFILE_REPO llamafile
       - uses: actions/cache@v4
         with:
           path: llamafile/.cosmocc
           key: cosmocc-metal-${{ runner.os }}-4.0.2
       - run: make setup
+      # macOS ships an old Xcode make; cosmocc provides a compatible one
+      - name: Use cosmocc make
+        run: |
+          echo "$PWD/llamafile/.cosmocc/4.0.2/bin" >> $GITHUB_PATH
+      - name: Reset stable-diffusion.cpp to unpatched state
+        run: |
+          cd llamafile/stable-diffusion.cpp
+          git reset --hard
+          git clean -fdx
       - run: make MODE=${{ env.MODE }}
       - uses: actions/upload-artifact@v4
         with:
