@@ -73,21 +73,27 @@ jobs:
         id: cache-vulkan
         uses: actions/cache@v4
         with:
-          path: /opt/vulkansdk
-          key: vulkan-sdk-1.3.296.0
+          path: /opt/vulkan
+          key: vulkan-sdk-1.4.350.0
       - name: Install Vulkan SDK
         if: steps.cache-vulkan.outputs.cache-hit != 'true'
         run: |
-          VK_VER=1.3.296.0
-          sudo apt-get install -y -qq libvulkan-dev
-          wget -q "https://sdk.lunarg.com/sdk/download/${VK_VER}/linux/vulkansdk-linux-x86_64-${VK_VER}.tar.xz" -O /tmp/vulkansdk.tar.xz
-          sudo mkdir -p /opt/vulkansdk
-          sudo tar -xJf /tmp/vulkansdk.tar.xz -C /opt/vulkansdk --strip-components=1
+          VK_VER=1.4.350.0
+          wget -q "https://sdk.lunarg.com/sdk/download/${VK_VER}/linux/vulkansdk-linux-x86_64-${VK_VER}.tar.xz" \
+            -O /tmp/vulkansdk.tar.xz
+          sudo mkdir -p /opt/vulkan
+          sudo tar -xJf /tmp/vulkansdk.tar.xz -C /opt/vulkan
+          # tarball structure: VERSION/x86_64/{bin,include,lib}
           rm /tmp/vulkansdk.tar.xz
       - name: Set Vulkan SDK environment
         run: |
-          echo "VULKAN_SDK=/opt/vulkansdk" >> $GITHUB_ENV
-          echo "/opt/vulkansdk/bin" >> $GITHUB_PATH
+          VK_VER=1.4.350.0
+          SDK=/opt/vulkan/${VK_VER}/x86_64
+          echo "VULKAN_SDK=$SDK" >> $GITHUB_ENV
+          echo "$SDK/bin" >> $GITHUB_PATH
+          # linker needs libvulkan.so for -lvulkan
+          echo "LIBRARY_PATH=$SDK/lib/VulkanLoader/lib" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=$SDK/lib/VulkanLoader/lib" >> $GITHUB_ENV
       - run: make setup
       - name: Reset stable-diffusion.cpp to unpatched state
         run: |
