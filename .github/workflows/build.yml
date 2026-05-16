@@ -119,6 +119,8 @@ jobs:
       - run: make MODE=${{ env.MODE }} vulkan
       - name: Copy ggml-vulkan.so to build tree
         run: cp ~/ggml-vulkan.so llamafile/o/${{ env.MODE }}/ggml-vulkan.so
+      - name: Build zipalign (needed for GPU backend bundling)
+        run: make MODE=${{ env.MODE }} o/${{ env.MODE }}/third_party/zipalign/zipalign
       - run: make MODE=${{ env.MODE }}
       - uses: actions/upload-artifact@v4
         with:
@@ -166,6 +168,8 @@ jobs:
       - run: make MODE=${{ env.MODE }} cuda
       - name: Copy ggml-cuda.so to build tree
         run: cp ~/ggml-cuda.so llamafile/o/${{ env.MODE }}/ggml-cuda.so
+      - name: Build zipalign (needed for GPU backend bundling)
+        run: make MODE=${{ env.MODE }} o/${{ env.MODE }}/third_party/zipalign/zipalign
       - run: make MODE=${{ env.MODE }}
       - uses: actions/upload-artifact@v4
         with:
@@ -213,6 +217,10 @@ jobs:
           git reset --hard
           git clean -fdx
       - run: make MODE=${{ env.MODE }} rocm
+      - name: Copy ggml-rocm.so to build tree
+        run: cp ~/ggml-rocm.so llamafile/o/${{ env.MODE }}/ggml-rocm.so
+      - name: Build zipalign (needed for GPU backend bundling)
+        run: make MODE=${{ env.MODE }} o/${{ env.MODE }}/third_party/zipalign/zipalign
       - run: make MODE=${{ env.MODE }}
       - uses: actions/upload-artifact@v4
         with:
@@ -317,12 +325,10 @@ jobs:
         run: |
           VER=$(echo ${{ github.ref_name }} | sed s/^v//)
           for variant in cpu cpu+vulkan cpu+cuda cpu+rocm cpu+metal cpu+all-gpu; do
-            src="chimerafile-${variant}/chimerafile"
-            [ -f "$src" ] || src="chimerafile-${variant}.elf"
-            mv "$src" "chimerafile-${VER}-${variant}.elf"
+            mv "chimerafile-${variant}/chimerafile" "chimerafile-${VER}-${variant}"
           done
-          sha256sum *.elf > SHA256SUMS.txt
-          ls -lh *.elf
+          sha256sum chimerafile-${VER}-* > SHA256SUMS.txt
+          ls -lh chimerafile-${VER}-*
 
       - uses: softprops/action-gh-release@v2
         with:

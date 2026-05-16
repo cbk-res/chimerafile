@@ -20,12 +20,12 @@ Pre-built binaries from [Releases](https://github.com/cbk-res/chimerafile/releas
 
 | Artifact | Backends | Use case |
 |---|---|---|
-| `chimerafile-VERSION-cpu.elf` | CPU | Lightest, works everywhere |
-| `chimerafile-VERSION-cpu+vulkan.elf` | CPU + Vulkan | Linux (and probably Windows) with Vulkan drivers |
-| `chimerafile-VERSION-cpu+cuda.elf` | CPU + CUDA | Linux (and probably Windows) with NVIDIA GPU |
-| `chimerafile-VERSION-cpu+rocm.elf` | CPU + ROCm | Linux with AMD GPU |
-| `chimerafile-VERSION-cpu+metal.elf` | CPU + Metal | macOS (Intel & Apple Silicon) |
-| `chimerafile-VERSION-cpu+all-gpu.elf` | CPU + Vulkan + CUDA + ROCm | Universal GPU support (outwith macOS) |
+| `chimerafile-VERSION-cpu` | CPU | Lightest, works everywhere |
+| `chimerafile-VERSION-cpu+vulkan` | CPU + Vulkan | Linux (and probably Windows) with Vulkan drivers |
+| `chimerafile-VERSION-cpu+cuda` | CPU + CUDA | Linux (and probably Windows) with NVIDIA GPU |
+| `chimerafile-VERSION-cpu+rocm` | CPU + ROCm | Linux with AMD GPU |
+| `chimerafile-VERSION-cpu+metal` | CPU + Metal | macOS (Intel & Apple Silicon) |
+| `chimerafile-VERSION-cpu+all-gpu` | CPU + Vulkan + CUDA + ROCm | Universal GPU support (outwith macOS) |
 
 ---
 
@@ -158,13 +158,13 @@ Each produces a `.so` that gets zipaligned into the APE automatically.
 The workflow here should behave the same as it does within Mozilla's llamafile — using `zipalign` to embed a GGUF into the APE:
 
 ```sh
-cp llamafile/o/rel/chimerafile/chimerafile my-model.elf
+cp llamafile/o/rel/chimerafile/chimerafile my-model
 echo '--cli -m qwen3.gguf' > .args
 llamafile/o/rel/third_party/zipalign/zipalign -j0 \
-    my-model.elf \
+    my-model \
     qwen3.gguf \
     .args
-chmod +x my-model.elf
+chmod +x my-model
 ```
 However, this has not yet been tested within chimerafile itself.
 
