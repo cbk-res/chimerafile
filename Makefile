@@ -47,6 +47,11 @@ all:
 	if [ -f "$(LLAMAFILE)/o/$(MODE)/ggml-vulkan.so" ]; then \
 		echo "   Vulkan backend built"; \
 	fi
+	@cd $(LLAMAFILE) && OUTPUT="$(LLAMAFILE)/o/$(MODE)/ggml-rocm.so" \
+		bash llamafile/rocm.sh >/dev/null 2>&1 || true; \
+	if [ -f "$(LLAMAFILE)/o/$(MODE)/ggml-rocm.so" ]; then \
+		echo "   ROCm backend built"; \
+	fi
 	@echo "==> Building chimerafile (bundling any GPU backends found)..."
 	$(SUBMAKE) o/$(MODE)/chimerafile/chimerafile
 
