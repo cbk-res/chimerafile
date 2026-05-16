@@ -309,7 +309,7 @@ o/$(MODE)/chimerafile/chimerafile: $(CHIMERAFILE_ALL_OBJS) $(CHIMERAFILE_GPU_SOS
 			-Wl,--allow-multiple-definition \
 			-Wl,--wrap=ggml_backend_cpu_init
 	@echo "==> Built: $@"
-	@ZIPALIGN=o/$(MODE)/third_party/zipalign/zipalign; \
+	@ZIPALIGN="$(CURDIR)/o/$(MODE)/third_party/zipalign/zipalign"; \
 	GPU_DIR=o/$(MODE); \
 	HAVE_GPU=0; \
 	for so in $$GPU_DIR/ggml-cuda.so $$GPU_DIR/ggml-vulkan.so $$GPU_DIR/ggml-rocm.so; do \
@@ -325,7 +325,7 @@ o/$(MODE)/chimerafile/chimerafile: $(CHIMERAFILE_ALL_OBJS) $(CHIMERAFILE_GPU_SOS
 			fi; \
 		done; \
 		cd "$$BUNDLE_DIR" && \
-		"$$ZIPALIGN" -j0 "$(LLAMAFILE)/o/$(MODE)/chimerafile/chimerafile" *.so && \
+		"$$ZIPALIGN" -j0 "$(CURDIR)/$@" *.so && \
 		rm -rf "$$BUNDLE_DIR" && \
 		echo "==> GPU backends embedded — binary has GPU support"; \
 	elif [ "$$HAVE_GPU" = "0" ]; then \

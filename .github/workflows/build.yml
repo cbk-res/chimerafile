@@ -68,23 +68,24 @@ jobs:
           compression-level: 0
 
   # ── 2. CPU + Vulkan ──────────────────────────────────────────────────────
+  # Downloads the CPU binary (built above), compiles only the Vulkan .so,
+  # then zipaligns it in.  No C/C++ recompilation — just GPU shader work.
   vulkan:
+    needs: [cpu]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Clone llamafile submodule
-        run: git clone --depth 1 --branch main $LLAMAFILE_REPO llamafile
-      - uses: actions/cache@v4
+      - name: Clone llamafile submodule (source needed for GPU build scripts)
+        run: |
+          git clone --depth 1 --branch main $LLAMAFILE_REPO llamafile
+          cd llamafile
+          git submodule update --init llama.cpp
+      - uses: actions/download-artifact@v4
         with:
-          path: llamafile/.cosmocc
-          key: cosmocc-${{ runner.os }}-4.0.2
-      - name: Cache compiled objects (incremental build)
-        uses: actions/cache@v4
+          name: chimerafile-cpu
+      - uses: actions/download-artifact@v4
         with:
-          path: llamafile/o
-          key: obj-${{ runner.os }}-${{ github.sha }}
-          restore-keys: |
-            obj-${{ runner.os }}-
+          name: zipalign-tool
       - name: Cache Vulkan SDK
         id: cache-vulkan
         uses: actions/cache@v4
@@ -99,7 +100,6 @@ jobs:
             -O /tmp/vulkansdk.tar.xz
           sudo mkdir -p /opt/vulkan
           sudo tar -xJf /tmp/vulkansdk.tar.xz -C /opt/vulkan
-          # tarball structure: VERSION/x86_64/{bin,include,lib}
           rm /tmp/vulkansdk.tar.xz
       - name: Set Vulkan SDK environment
         run: |
@@ -107,50 +107,45 @@ jobs:
           SDK=/opt/vulkan/${VK_VER}/x86_64
           echo "VULKAN_SDK=$SDK" >> $GITHUB_ENV
           echo "$SDK/bin" >> $GITHUB_PATH
-          # linker needs libvulkan.so for -lvulkan
           echo "LIBRARY_PATH=$SDK/lib/VulkanLoader/lib" >> $GITHUB_ENV
           echo "LD_LIBRARY_PATH=$SDK/lib/VulkanLoader/lib" >> $GITHUB_ENV
-      - run: make setup
-      - name: Reset stable-diffusion.cpp to unpatched state
+      - name: Build ggml-vulkan.so
         run: |
-          cd llamafile/stable-diffusion.cpp
-          git reset --hard
-          git clean -fdx
-      - run: make MODE=${{ env.MODE }} vulkan
-      - name: Copy ggml-vulkan.so to build tree
-        run: cp ~/ggml-vulkan.so llamafile/o/${{ env.MODE }}/ggml-vulkan.so
-      - name: Build zipalign (needed for GPU backend bundling)
-        run: make MODE=${{ env.MODE }} o/${{ env.MODE }}/third_party/zipalign/zipalign
-      - run: make MODE=${{ env.MODE }}
+          cd llamafile
+          OUTPUT="$PWD/../ggml-vulkan.so" bash llamafile/vulkan.sh
+      - name: Bundle Vulkan backend into chimerafile
+        run: |
+          chmod +x zipalign chimerafile
+          ./zipalign -j0 chimerafile ggml-vulkan.so
       - uses: actions/upload-artifact@v4
         with:
           name: chimerafile-cpu+vulkan
-          path: llamafile/o/${{ env.MODE }}/chimerafile/chimerafile
+          path: chimerafile
           compression-level: 0
       - uses: actions/upload-artifact@v4
         with:
           name: ggml-vulkan-so
-          path: llamafile/o/${{ env.MODE }}/ggml-vulkan.so
+          path: ggml-vulkan.so
           compression-level: 0
 
   # ── 3. CPU + CUDA ────────────────────────────────────────────────────────
+  # Downloads the CPU binary, compiles only the CUDA .so, zipaligns it in.
   cuda:
+    needs: [cpu]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Clone llamafile submodule
-        run: git clone --depth 1 --branch main $LLAMAFILE_REPO llamafile
-      - uses: actions/cache@v4
+      - name: Clone llamafile submodule (source needed for GPU build scripts)
+        run: |
+          git clone --depth 1 --branch main $LLAMAFILE_REPO llamafile
+          cd llamafile
+          git submodule update --init llama.cpp
+      - uses: actions/download-artifact@v4
         with:
-          path: llamafile/.cosmocc
-          key: cosmocc-cuda-${{ runner.os }}-4.0.2
-      - name: Cache compiled objects (incremental build)
-        uses: actions/cache@v4
+          name: chimerafile-cpu
+      - uses: actions/download-artifact@v4
         with:
-          path: llamafile/o
-          key: obj-cuda-${{ runner.os }}-${{ github.sha }}
-          restore-keys: |
-            obj-cuda-${{ runner.os }}-
+          name: zipalign-tool
       - name: Install CUDA toolkit (official NVIDIA repo)
         run: |
           wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
@@ -159,31 +154,29 @@ jobs:
           sudo apt-get install -y -qq cuda-toolkit-12-6
           echo "CUDA_PATH=/usr/local/cuda-12" >> $GITHUB_ENV
           echo "/usr/local/cuda-12/bin" >> $GITHUB_PATH
-      - run: make setup
-      - name: Reset stable-diffusion.cpp to unpatched state
+      - name: Build ggml-cuda.so
         run: |
-          cd llamafile/stable-diffusion.cpp
-          git reset --hard
-          git clean -fdx
-      - run: make MODE=${{ env.MODE }} cuda
-      - name: Copy ggml-cuda.so to build tree
-        run: cp ~/ggml-cuda.so llamafile/o/${{ env.MODE }}/ggml-cuda.so
-      - name: Build zipalign (needed for GPU backend bundling)
-        run: make MODE=${{ env.MODE }} o/${{ env.MODE }}/third_party/zipalign/zipalign
-      - run: make MODE=${{ env.MODE }}
+          cd llamafile
+          OUTPUT="$PWD/../ggml-cuda.so" bash llamafile/cuda.sh
+      - name: Bundle CUDA backend into chimerafile
+        run: |
+          chmod +x zipalign chimerafile
+          ./zipalign -j0 chimerafile ggml-cuda.so
       - uses: actions/upload-artifact@v4
         with:
           name: chimerafile-cpu+cuda
-          path: llamafile/o/${{ env.MODE }}/chimerafile/chimerafile
+          path: chimerafile
           compression-level: 0
       - uses: actions/upload-artifact@v4
         with:
           name: ggml-cuda-so
-          path: llamafile/o/${{ env.MODE }}/ggml-cuda.so
+          path: ggml-cuda.so
           compression-level: 0
 
   # ── 4. CPU + ROCm ────────────────────────────────────────────────────────
+  # Downloads the CPU binary, compiles only the ROCm .so, zipaligns it in.
   rocm:
+    needs: [cpu]
     runs-on: ubuntu-latest
     container:
       image: rocm/dev-ubuntu-24.04:latest
@@ -191,49 +184,36 @@ jobs:
       - name: Install prerequisites
         run: |
           apt-get update -qq
-          apt-get install -y -qq git unzip
+          apt-get install -y -qq git unzip hipblas-dev
       - uses: actions/checkout@v4
-      - name: Clone llamafile submodule
-        run: git clone --depth 1 --branch main $LLAMAFILE_REPO llamafile
-      - uses: actions/cache@v4
-        with:
-          path: llamafile/.cosmocc
-          key: cosmocc-rocm-${{ runner.os }}-4.0.2
-      - name: Cache compiled objects (incremental build)
-        uses: actions/cache@v4
-        with:
-          path: llamafile/o
-          key: obj-rocm-${{ runner.os }}-${{ github.sha }}
-          restore-keys: |
-            obj-rocm-${{ runner.os }}-
-      - name: Install build tools
+      - name: Clone llamafile submodule (source needed for GPU build scripts)
         run: |
-          apt-get update -qq
-          apt-get install -y -qq make python3
-      - run: make setup
-      - name: Reset stable-diffusion.cpp to unpatched state
+          git clone --depth 1 --branch main $LLAMAFILE_REPO llamafile
+          cd llamafile
+          git submodule update --init llama.cpp
+      - uses: actions/download-artifact@v4
+        with:
+          name: chimerafile-cpu
+      - uses: actions/download-artifact@v4
+        with:
+          name: zipalign-tool
+      - name: Build ggml-rocm.so
         run: |
-          cd llamafile/stable-diffusion.cpp
-          git reset --hard
-          git clean -fdx
-      - run: make MODE=${{ env.MODE }} rocm
-      - name: Copy ggml-rocm.so to build tree
-        run: cp ~/ggml-rocm.so llamafile/o/${{ env.MODE }}/ggml-rocm.so
-      - name: Build zipalign (needed for GPU backend bundling)
-        run: make MODE=${{ env.MODE }} o/${{ env.MODE }}/third_party/zipalign/zipalign
-      - run: make MODE=${{ env.MODE }}
+          cd llamafile
+          OUTPUT="$PWD/../ggml-rocm.so" bash llamafile/rocm.sh
+      - name: Bundle ROCm backend into chimerafile
+        run: |
+          chmod +x zipalign chimerafile
+          ./zipalign -j0 chimerafile ggml-rocm.so
       - uses: actions/upload-artifact@v4
         with:
           name: chimerafile-cpu+rocm
-          path: llamafile/o/${{ env.MODE }}/chimerafile/chimerafile
+          path: chimerafile
           compression-level: 0
-      - name: Copy ggml-rocm.so to build tree
-        run: |
-          cp ~/ggml-rocm.so llamafile/o/${{ env.MODE }}/ggml-rocm.so
       - uses: actions/upload-artifact@v4
         with:
           name: ggml-rocm-so
-          path: llamafile/o/${{ env.MODE }}/ggml-rocm.so
+          path: ggml-rocm.so
           compression-level: 0
 
   # ── 5. CPU + Metal ────────────────────────────────────────────────────────
@@ -294,21 +274,19 @@ jobs:
 
       - name: Bundle all GPU backends into single APE
         run: |
-          chmod +x zipalign
-          cp chimerafile chimerafile-cpu+all-gpu.elf
-          chmod +x chimerafile-cpu+all-gpu.elf
+          chmod +x zipalign chimerafile
           for so in ggml-vulkan.so ggml-cuda.so ggml-rocm.so; do
             if [ -f "$so" ]; then
               echo "   Bundling: $so"
-              ./zipalign -j0 chimerafile-cpu+all-gpu.elf "$so"
+              ./zipalign -j0 chimerafile "$so"
             fi
           done
-          ls -lh chimerafile-cpu+all-gpu.elf
+          ls -lh chimerafile
 
       - uses: actions/upload-artifact@v4
         with:
           name: chimerafile-cpu+all-gpu
-          path: chimerafile-cpu+all-gpu.elf
+          path: chimerafile
           compression-level: 0
 
   # ── Release ────────────────────────────────────────────────────────────────
@@ -333,6 +311,6 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            *.elf
+            chimerafile-*
             SHA256SUMS.txt
           generate_release_notes: true
