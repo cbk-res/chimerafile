@@ -16,7 +16,14 @@ if grep -q "CHIMERAFILE_SM61" "$TARGET"; then
     exit 0
 fi
 
-# Insert sm_61 before the first sm_75 line in the non-minimal arch block
-sed -i '/gencode arch=compute_75,code=sm_75 \\/i\  -gencode arch=compute_61,code=sm_61 \\  # CHIMERAFILE_SM61: Pascal (GTX 10-series, MX150)' "$TARGET"
+# Insert marker comment BEFORE the ARCH_FLAGS block so it stays outside
+# the double-quoted string (putting it inside would leak comment text
+# as nvcc arguments when $arch_flags is expanded unquoted).
+sed -i '/^# NVIDIA GPU architecture targets$/i\# CHIMERAFILE_SM61: Pascal (GTX 10-series, MX150)' "$TARGET"
+
+# Insert sm_61 before the first sm_75 line in the non-minimal arch block.
+# No inline comment here — the trailing \\ must be the last thing before
+# the newline for bash line continuation to work inside the "..." string.
+sed -i '/gencode arch=compute_75,code=sm_75 \\/i\  -gencode arch=compute_61,code=sm_61 \\' "$TARGET"
 
 echo "cuda.sh patched: added sm_61 (Pascal) architecture support."
