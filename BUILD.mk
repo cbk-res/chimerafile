@@ -12,17 +12,19 @@
 
 PKGS += CHIMERAFILE
 
-CHIMERAFILE_VERSION_STRING := 0.1.0
+# Version — single source of truth is the VERSION file at repo root
+CHIMERAFILE_VERSION_STRING := $(shell cat $(CHIMERAFILE_DIR)/VERSION 2>/dev/null || echo 0.0.0)
 
 # WHISPER_VERSION must match the whisper.cpp submodule.
-# Normally defined in whisper.cpp/BUILD.mk; redefined here since
-# we don't use that file's compiler flags.
 WHISPER_VERSION := 1.8.3
+
+# ── Build-time engine toggles ────────────────────────────────────────
+CHIMERAFILE_WITH_WHISPER   ?= 1
+CHIMERAFILE_WITH_DIFFUSION ?= 1
 
 # ==============================================================================
 # Include paths
 # ==============================================================================
-# CWD is the llamafile root (due to -C), so -iquote . resolves there.
 
 CHIMERAFILE_INCLUDES := \
 	-iquote . \
@@ -32,7 +34,6 @@ CHIMERAFILE_INCLUDES := \
 	-iquote whisper.cpp/examples \
 	-iquote whisperfile
 
-# Whisper sources: llama.cpp GGML headers shadow whisper.cpp's own GGML.
 CHIMERAFILE_WHISPER_INCLUDES := \
 	-iquote . \
 	-iquote whisperfile \
@@ -46,10 +47,6 @@ CHIMERAFILE_WHISPER_INCLUDES := \
 # Compiler flags
 # ==============================================================================
 
-# Increase GGML_MAX_NAME so SD1.5 GGUF models (which use longer tensor names
-# like "model.diffusion_model.input_blocks.0.0.op.weight" at 76 chars) can
-# be loaded.  The default is 64 in llama.cpp's ggml.h.  This must be set
-# globally so every translation unit sees the same ggml_tensor layout.
 CXXFLAGS += -DGGML_MAX_NAME=128
 CFLAGS   += -DGGML_MAX_NAME=128
 
@@ -61,6 +58,13 @@ CHIMERAFILE_CPPFLAGS := \
 	-DWHISPERFILE \
 	-DCHIMERAFILE_VERSION_STRING=\"$(CHIMERAFILE_VERSION_STRING)\" \
 	-DLLAMAFILE_VERSION_STRING=\"$(LLAMAFILE_VERSION_STRING)\"
+
+ifeq ($(CHIMERAFILE_WITH_WHISPER),0)
+CHIMERAFILE_CPPFLAGS += -DCHIMERAFILE_NO_WHISPER
+endif
+ifeq ($(CHIMERAFILE_WITH_DIFFUSION),0)
+CHIMERAFILE_CPPFLAGS += -DCHIMERAFILE_NO_DIFFUSION
+endif
 
 CHIMERAFILE_WHISPER_CPPFLAGS := \
 	$(CHIMERAFILE_WHISPER_INCLUDES) \
@@ -81,8 +85,6 @@ o/$(MODE)/chimerafile/llama_dispatch.o: $(CHIMERAFILE_DIR)/llama_dispatch.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $(CHIMERAFILE_CPPFLAGS) -c -o $@ $<
 
-# check_cpu.c is NOT in LLAMAFILE_SRCS_C (only compiled by whisperfile build)
-# We need it for llamafile_check_cpu() used by both chimerafile.cpp and whisperfile
 CHIMERAFILE_CHECK_CPU_OBJ = o/$(MODE)/llamafile/check_cpu.o
 $(CHIMERAFILE_CHECK_CPU_OBJ): llamafile/check_cpu.c
 	@mkdir -p $(@D)
@@ -91,6 +93,7 @@ $(CHIMERAFILE_CHECK_CPU_OBJ): llamafile/check_cpu.c
 # ==============================================================================
 # Whisperfile support + entry point
 # ==============================================================================
+ifeq ($(CHIMERAFILE_WITH_WHISPER),1)
 
 o/$(MODE)/chimerafile/whisperfile_main.o: whisperfile/whisperfile.cpp
 	@mkdir -p $(@D)
@@ -106,11 +109,6 @@ o/$(MODE)/chimerafile/slurp.o: whisperfile/slurp.cpp
 o/$(MODE)/chimerafile/color.o: whisperfile/color.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $(CHIMERAFILE_WHISPER_CPPFLAGS) -frtti -c -o $@ $<
-
-# ==============================================================================
-# Whisper.cpp common library — normally inside whisper.cpp.a
-# These provide to_timestamp(), grammar_parser, stb_vorbis, etc.
-# ==============================================================================
 
 o/$(MODE)/chimerafile/common.cpp.o: whisper.cpp/examples/common.cpp
 	@mkdir -p $(@D)
@@ -129,10 +127,6 @@ o/$(MODE)/chimerafile/grammar-parser.cpp.o: \
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $(CHIMERAFILE_WHISPER_CPPFLAGS) -frtti -c -o $@ $<
 
-# ==============================================================================
-# Whisper.cpp CLI — main() becomes whisper_cli_main() via -DWHISPERFILE
-# ==============================================================================
-
 o/$(MODE)/chimerafile/cli.chimerafile.cpp.o: \
 		whisper.cpp/examples/cli/cli.cpp
 	@mkdir -p $(@D)
@@ -140,26 +134,19 @@ o/$(MODE)/chimerafile/cli.chimerafile.cpp.o: \
 		-DGGML_MULTIPLATFORM \
 		-frtti -c -o $@ $<
 
-# ==============================================================================
-# Whisper.cpp core — recompiled against llama.cpp GGML
-# ==============================================================================
-
 o/$(MODE)/chimerafile/whisper.core.o: whisper.cpp/src/whisper.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $(CHIMERAFILE_WHISPER_CPPFLAGS) \
 		-DGGML_MULTIPLATFORM \
 		-frtti -c -o $@ $<
 
+endif  # CHIMERAFILE_WITH_WHISPER
+
 # ==============================================================================
 # Diffusion (stable-diffusion.cpp) backend
 # ==============================================================================
-# Single-GGML approach: compile stable-diffusion.cpp sources against
-# llama.cpp's GGML headers, NOT stable-diffusion.cpp/ggml/ (which is a
-# separate GGML fork that would cause duplicate symbols).
-#
-# stb_image and stb_image_write implementations come from
-# llamafile's third_party/stb/stb.a, so our wrapper files pre-include
-# those headers to absorb the STB_IMAGE_IMPLEMENTATION defines.
+
+ifeq ($(CHIMERAFILE_WITH_DIFFUSION),1)
 
 CHIMERAFILE_DIFFUSION_INCLUDES := \
 	-iquote . \
@@ -169,8 +156,6 @@ CHIMERAFILE_DIFFUSION_INCLUDES := \
 	-iquote stable-diffusion.cpp \
 	-iquote stable-diffusion.cpp/thirdparty
 
-# sd_ggml_compat.h is injected via -include to provide APIs that vanished
-# or changed between stable-diffusion.cpp's GGML fork and llama.cpp's GGML.
 CHIMERAFILE_DIFFUSION_CPPFLAGS := \
 	$(CHIMERAFILE_DIFFUSION_INCLUDES) \
 	-DCOSMOCC=1 \
@@ -179,8 +164,6 @@ CHIMERAFILE_DIFFUSION_CPPFLAGS := \
 	-DLLAMAFILE_VERSION_STRING="$(LLAMAFILE_VERSION_STRING)" \
 	-include $(CHIMERAFILE_DIR)/diffusionfile/sd_ggml_compat.h
 
-# Entry point — compiled using CHIMERAFILE_DIFFUSION_INCLUDES but WITHOUT
-# sd_ggml_compat.h (which would interfere with cosmo.h's ShowCrashReports).
 o/$(MODE)/chimerafile/diffusionfile_main.o: $(CHIMERAFILE_DIR)/diffusionfile/diffusionfile.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $(CHIMERAFILE_DIFFUSION_INCLUDES) \
@@ -192,8 +175,6 @@ o/$(MODE)/chimerafile/diffusionfile_main.o: $(CHIMERAFILE_DIR)/diffusionfile/dif
 		-frtti \
 		-c -o $@ $<
 
-# Wrapper for stable-diffusion.cpp core (handles stb pre-inclusion)
-# Uses CHIMERAFILE_DIFFUSION_CPPFLAGS which includes sd_ggml_compat.h
 o/$(MODE)/chimerafile/sd_core.o: $(CHIMERAFILE_DIR)/diffusionfile/sd_core.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $(CHIMERAFILE_DIFFUSION_CPPFLAGS) \
@@ -201,8 +182,6 @@ o/$(MODE)/chimerafile/sd_core.o: $(CHIMERAFILE_DIR)/diffusionfile/sd_core.cpp
 		-frtti \
 		-c -o $@ $<
 
-# util.cpp — uses the OLD stb_image_resize.h API (different symbols from
-# llamafile's stb_image_resize2.h), so no wrapper needed — no conflict.
 o/$(MODE)/chimerafile/sd_util.o: stable-diffusion.cpp/util.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $(CHIMERAFILE_DIFFUSION_CPPFLAGS) \
@@ -210,7 +189,6 @@ o/$(MODE)/chimerafile/sd_util.o: stable-diffusion.cpp/util.cpp
 		-frtti \
 		-c -o $@ $<
 
-# model.cpp — no stb issues (json.hpp comes from stable-diffusion.cpp/thirdparty)
 o/$(MODE)/chimerafile/sd_model.o: stable-diffusion.cpp/model.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $(CHIMERAFILE_DIFFUSION_CPPFLAGS) \
@@ -218,7 +196,6 @@ o/$(MODE)/chimerafile/sd_model.o: stable-diffusion.cpp/model.cpp
 		-frtti \
 		-c -o $@ $<
 
-# upscaler.cpp — no stb issues, compile directly
 o/$(MODE)/chimerafile/sd_upscaler.o: stable-diffusion.cpp/upscaler.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $(CHIMERAFILE_DIFFUSION_CPPFLAGS) \
@@ -226,29 +203,21 @@ o/$(MODE)/chimerafile/sd_upscaler.o: stable-diffusion.cpp/upscaler.cpp
 		-frtti \
 		-c -o $@ $<
 
-# zip.c — needed by model.cpp for .ckpt (PyTorch checkpoint) files
 o/$(MODE)/chimerafile/sd_zip.o: stable-diffusion.cpp/thirdparty/zip.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(CHIMERAFILE_DIFFUSION_CPPFLAGS) \
 		-DGGML_MULTIPLATFORM \
 		-c -o $@ $<
 
+endif  # CHIMERAFILE_WITH_DIFFUSION
+
 # ==============================================================================
 # Aggregate object list
 # ==============================================================================
 
-CHIMERAFILE_DIFFUSION_OBJS := \
-	o/$(MODE)/chimerafile/diffusionfile_main.o \
-	o/$(MODE)/chimerafile/sd_core.o \
-	o/$(MODE)/chimerafile/sd_util.o \
-	o/$(MODE)/chimerafile/sd_model.o \
-	o/$(MODE)/chimerafile/sd_upscaler.o \
-	o/$(MODE)/chimerafile/sd_zip.o
-
-CHIMERAFILE_OWN_OBJS := \
-	o/$(MODE)/chimerafile/chimerafile.o \
-	o/$(MODE)/chimerafile/llama_dispatch.o \
-	$(CHIMERAFILE_CHECK_CPU_OBJ) \
+CHIMERAFILE_WHISPER_OBJS :=
+ifeq ($(CHIMERAFILE_WITH_WHISPER),1)
+CHIMERAFILE_WHISPER_OBJS := \
 	o/$(MODE)/chimerafile/whisperfile_main.o \
 	o/$(MODE)/chimerafile/slurp.o \
 	o/$(MODE)/chimerafile/color.o \
@@ -258,10 +227,25 @@ CHIMERAFILE_OWN_OBJS := \
 	o/$(MODE)/chimerafile/grammar-parser.cpp.o \
 	o/$(MODE)/chimerafile/cli.chimerafile.cpp.o \
 	o/$(MODE)/chimerafile/whisper.core.o
+endif
 
-# All objects for the final link:
-#   our objects + llamafile's objects (includes GGML, llama, server, TUI, TinyBLAS)
-# whisper.cpp.a is NOT included — its GGML symbols conflict with GGML_OBJS.
+CHIMERAFILE_DIFFUSION_OBJS :=
+ifeq ($(CHIMERAFILE_WITH_DIFFUSION),1)
+CHIMERAFILE_DIFFUSION_OBJS := \
+	o/$(MODE)/chimerafile/diffusionfile_main.o \
+	o/$(MODE)/chimerafile/sd_core.o \
+	o/$(MODE)/chimerafile/sd_util.o \
+	o/$(MODE)/chimerafile/sd_model.o \
+	o/$(MODE)/chimerafile/sd_upscaler.o \
+	o/$(MODE)/chimerafile/sd_zip.o
+endif
+
+CHIMERAFILE_OWN_OBJS := \
+	o/$(MODE)/chimerafile/chimerafile.o \
+	o/$(MODE)/chimerafile/llama_dispatch.o \
+	$(CHIMERAFILE_CHECK_CPU_OBJ) \
+	$(CHIMERAFILE_WHISPER_OBJS)
+
 CHIMERAFILE_ALL_OBJS := \
 	$(CHIMERAFILE_OWN_OBJS) \
 	$(CHIMERAFILE_DIFFUSION_OBJS) \
@@ -274,8 +258,6 @@ CHIMERAFILE_ALL_OBJS := \
 # ==============================================================================
 # GPU backend shared libraries
 # ==============================================================================
-# These call the shell scripts from the llamafile GPU build system.
-# The OUTPUT path is overridden so the .so lands in the build tree.
 
 CHIMERAFILE_GPU_OUTDIR = o/$(MODE)
 
@@ -295,12 +277,10 @@ o/$(MODE)/ggml-vulkan.so:
 	llamafile/vulkan.sh 2>&1 | while read line; do echo "   [vulkan] $$line"; done; \
 	touch $@
 
-# GPU .so files — only added as prerequisites if they exist (via wildcard).
-# This ensures the binary is re-bundled when backends are rebuilt.
 CHIMERAFILE_GPU_SOS := $(wildcard o/$(MODE)/ggml-cuda.so o/$(MODE)/ggml-vulkan.so o/$(MODE)/ggml-rocm.so)
 
 # ==============================================================================
-# Final binary — with automatic GPU backend bundling when available
+# Final binary
 # ==============================================================================
 
 o/$(MODE)/chimerafile/chimerafile: $(CHIMERAFILE_ALL_OBJS) $(CHIMERAFILE_GPU_SOS)

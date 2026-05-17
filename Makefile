@@ -25,6 +25,10 @@ endif
 
 MODE ?=
 
+# ── Build-time engine toggles (forwarded to submake) ────────────────
+CHIMERAFILE_WITH_WHISPER   ?= 1
+CHIMERAFILE_WITH_DIFFUSION ?= 1
+
 # Invoke make inside llamafile/, reading both Makefile and our BUILD.mk.
 # Makefile is read first (sets up all LLAMAFILE_* variables via include),
 # then BUILD.mk is read (sees those variables already defined).
@@ -32,7 +36,9 @@ SUBMAKE = $(MAKE) -C $(LLAMAFILE) \
 	-f $(LLAMAFILE)/Makefile \
 	-f $(CHIMERAFILE_REPO)/BUILD.mk \
 	CHIMERAFILE_DIR=$(CHIMERAFILE_REPO) \
-	MODE=$(MODE)
+	MODE=$(MODE) \
+	CHIMERAFILE_WITH_WHISPER=$(CHIMERAFILE_WITH_WHISPER) \
+	CHIMERAFILE_WITH_DIFFUSION=$(CHIMERAFILE_WITH_DIFFUSION)
 
 .PHONY: all
 all:

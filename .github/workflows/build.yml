@@ -52,6 +52,11 @@ jobs:
           cd llamafile/stable-diffusion.cpp
           git reset --hard
           git clean -fdx
+      # Upstream vulkan.c lacks a device-count guard before registering the
+      # Vulkan backend.  Without it, the binary crashes on systems where
+      # Vulkan is present but incompatible (e.g. SDK version mismatch).
+      - name: Patch vulkan.c — add device-count guard
+        run: bash ci-patches/patch-vulkan-device-count.sh
       - run: make MODE=${{ env.MODE }}
       - name: Build zipalign (needed by all-gpu job)
         run: make MODE=${{ env.MODE }} o/${{ env.MODE }}/third_party/zipalign/zipalign
@@ -154,6 +159,11 @@ jobs:
           sudo apt-get install -y -qq cuda-toolkit-12-6
           echo "CUDA_PATH=/usr/local/cuda-12" >> $GITHUB_ENV
           echo "/usr/local/cuda-12/bin" >> $GITHUB_PATH
+      # Upstream cuda.sh only targets sm_75+ (Turing 2018+).  Older GPUs
+      # (Pascal sm_61 like the MX150 / GTX 10-series) have no compatible
+      # kernel code and crash during backend initialisation.
+      - name: Patch cuda.sh — add sm_61 (Pascal) support
+        run: bash ci-patches/patch-cuda-sm61.sh
       - name: Build ggml-cuda.so
         run: |
           cd llamafile
