@@ -69,6 +69,43 @@ The binary is written to `llamafile/o//chimerafile/chimerafile`.
 
 ---
 
+## GPU Backends
+
+GPU acceleration is automatic — no flags needed.  Use `--gpu` to override:
+
+```sh
+# Central flag (applies to all engines):
+./chimerafile --gpu nvidia llama -m model.gguf -p "Hello"
+./chimerafile --gpu off diffusion -m model.gguf -p "cat"
+
+# Per-engine override:
+./chimerafile llama --gpu nvidia -m model.gguf -p "Hello"
+./chimerafile diffusion --gpu vulkan -m model.gguf -p "cat"
+```
+
+Modes: `auto` (default), `nvidia`, `amd`, `vulkan`, `apple`, `disable`, `off`.
+
+> **Known issue:** The Vulkan backend may crash on Intel integrated GPUs
+> (Mesa ANV driver).  If you see a segfault on `--gpu auto`, try specifying a different GPU mode (e.g. `--gpu nvidia`) if avaialble or use `--gpu off` as a fallback.
+
+Run with `--verbose` to see detected backends.
+
+Building GPU backends requires the respective SDK:
+```sh
+# Vulkan (needs Vulkan SDK from lunarg.com)
+make MODE=rel vulkan && make MODE=rel
+
+# CUDA (needs CUDA toolkit)
+make MODE=rel cuda && make MODE=rel
+
+# ROCm (needs ROCm stack)
+make MODE=rel rocm && make MODE=rel
+```
+
+Each produces a `.so` that gets zipaligned into the APE automatically.
+
+---
+
 ## Project Structure
 
 ```
@@ -123,33 +160,6 @@ requiring **zero changes** to the llamafile source tree:
 
 `argv[1]` is consumed by the dispatcher; the remainder passes verbatim to
 the chosen backend.
-
----
-
-## GPU Backends
-
-GPU acceleration is automatic — no flags needed. The compat shim's
-`ggml_backend_cpu_init()` override probes for a GPU device first:
-
-1. Discrete GPU (Vulkan / CUDA via `ggml_backend_dev_by_type(GPU)`)
-2. Integrated GPU (Apple Metal / AMD APU)
-3. Falls back to CPU
-
-Run with `--verbose` to see detected backends.
-
-Building GPU backends requires the respective SDK:
-```sh
-# Vulkan (needs Vulkan SDK from lunarg.com)
-make MODE=rel vulkan && make MODE=rel
-
-# CUDA (needs CUDA toolkit)
-make MODE=rel cuda && make MODE=rel
-
-# ROCm (needs ROCm stack)
-make MODE=rel rocm && make MODE=rel
-```
-
-Each produces a `.so` that gets zipaligned into the APE automatically.
 
 ---
 

@@ -95,6 +95,7 @@ struct DiffusionParams {
     bool vae_on_cpu      = false;
     bool canny_preprocess = false;
     bool img2img_mode    = false;
+    int  gpu_mode        = LLAMAFILE_GPU_AUTO;
     int  upscale_repeats = 0;
 };
 
@@ -135,6 +136,7 @@ static void print_usage(const char *prog) {
         "  --lora-dir DIR            LoRA model directory\n"
         "  --embeddings DIR          embeddings directory\n"
         "\n"
+        "  --gpu MODE                auto, nvidia, amd, vulkan, off (default: auto)\n"
         "  --vae-tiling              enable VAE tiling (reduces VRAM)\n"
         "  --rng TYPE                std_default, cuda\n"
         "  --wtype TYPE              weight type (f32, f16, q4_0, ...)\n"
@@ -254,6 +256,19 @@ static bool parse_args(int argc, char **argv, DiffusionParams &p) {
             p.embeddings_path = argv[i];
 
         // ── flags ───────────────────────────────────────────────────
+        } else if (arg == "--gpu") {
+            if (++i >= argc) { fprintf(stderr, "error: --gpu requires mode\n"); return false; }
+            // Map "off" to "disable" (llamafile_gpu_parse expects "disable")
+            const char *mode = argv[i];
+            if (!strcasecmp(mode, "off"))
+                mode = "disable";
+            int parsed = llamafile_gpu_parse(mode);
+            if (parsed == LLAMAFILE_GPU_ERROR) {
+                fprintf(stderr, "error: unknown --gpu mode '%s' "
+                        "(valid: auto, nvidia, amd, vulkan, off)\n", argv[i]);
+                return false;
+            }
+            p.gpu_mode = parsed;
         } else if (arg == "--vae-tiling") {
             p.vae_tiling = true;
         } else if (arg == "--rng") {
@@ -342,6 +357,9 @@ extern "C" int diffusionfile_main(int argc, char **argv) {
     // llamafile bundles GPU backends as .so files inside the APE,
     // loaded lazily at runtime.  Calling llamafile_has_gpu() triggers
     // the probe & load cycle so ggml_backend_dev_by_type() finds them.
+    //
+    // --gpu MODE sets FLAG_gpu before the probe so backends are filtered.
+    FLAG_gpu = p.gpu_mode;
     bool have_gpu = llamafile_has_gpu();
 
     // Set up logging (after gpu probe so we can report the result)

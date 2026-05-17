@@ -1,0 +1,22 @@
+#!/bin/bash
+# Patch cuda.sh: add Pascal (sm_61) support for older NVIDIA GPUs like
+# the GeForce MX150 and GTX 10-series.  Without this the CUDA backend
+# has no compatible kernel code and will crash during initialisation
+# on these devices.
+#
+# We insert sm_61 as the FIRST architecture so the driver picks it for
+# older GPUs while still having PTX/SASS for newer ones.
+set -e
+
+TARGET="llamafile/llamafile/cuda.sh"
+[ -f "$TARGET" ] || { echo "ERROR: $TARGET not found"; exit 1; }
+
+if grep -q "CHIMERAFILE_SM61" "$TARGET"; then
+    echo "cuda.sh already patched, skipping."
+    exit 0
+fi
+
+# Insert sm_61 before the first sm_75 line in the non-minimal arch block
+sed -i '/gencode arch=compute_75,code=sm_75 \\/i\  -gencode arch=compute_61,code=sm_61 \\  # CHIMERAFILE_SM61: Pascal (GTX 10-series, MX150)' "$TARGET"
+
+echo "cuda.sh patched: added sm_61 (Pascal) architecture support."
