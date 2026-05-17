@@ -25,13 +25,14 @@ endif
 
 MODE ?=
 
-# ── Build-time engine toggles (forwarded to submake) ────────────────
+# ── Build-time toggles (forwarded to submake) ───────────────────────
 CHIMERAFILE_WITH_WHISPER   ?= 1
 CHIMERAFILE_WITH_DIFFUSION ?= 1
+CHIMERAFILE_WITH_CUDA      ?= 1
+CHIMERAFILE_WITH_VULKAN    ?= 1
+CHIMERAFILE_WITH_ROCM      ?= 1
 
 # Invoke make inside llamafile/, reading both Makefile and our BUILD.mk.
-# Makefile is read first (sets up all LLAMAFILE_* variables via include),
-# then BUILD.mk is read (sees those variables already defined).
 SUBMAKE = $(MAKE) -C $(LLAMAFILE) \
 	-f $(LLAMAFILE)/Makefile \
 	-f $(CHIMERAFILE_REPO)/BUILD.mk \
@@ -43,20 +44,26 @@ SUBMAKE = $(MAKE) -C $(LLAMAFILE) \
 .PHONY: all
 all:
 	@echo "==> Attempting GPU backend builds (optional)..."
-	@cd $(LLAMAFILE) && OUTPUT="$(LLAMAFILE)/o/$(MODE)/ggml-cuda.so" \
-		bash llamafile/cuda.sh >/dev/null 2>&1 || true; \
-	if [ -f "$(LLAMAFILE)/o/$(MODE)/ggml-cuda.so" ]; then \
-		echo "   CUDA backend built"; \
+	@if [ "$(CHIMERAFILE_WITH_CUDA)" = "1" ]; then \
+		cd $(LLAMAFILE) && OUTPUT="$(LLAMAFILE)/o/$(MODE)/ggml-cuda.so" \
+			bash llamafile/cuda.sh >/dev/null 2>&1 || true; \
+		if [ -f "$(LLAMAFILE)/o/$(MODE)/ggml-cuda.so" ]; then \
+			echo "   CUDA backend built"; \
+		fi; \
 	fi
-	@cd $(LLAMAFILE) && OUTPUT="$(LLAMAFILE)/o/$(MODE)/ggml-vulkan.so" \
-		bash llamafile/vulkan.sh >/dev/null 2>&1 || true; \
-	if [ -f "$(LLAMAFILE)/o/$(MODE)/ggml-vulkan.so" ]; then \
-		echo "   Vulkan backend built"; \
+	@if [ "$(CHIMERAFILE_WITH_VULKAN)" = "1" ]; then \
+		cd $(LLAMAFILE) && OUTPUT="$(LLAMAFILE)/o/$(MODE)/ggml-vulkan.so" \
+			bash llamafile/vulkan.sh >/dev/null 2>&1 || true; \
+		if [ -f "$(LLAMAFILE)/o/$(MODE)/ggml-vulkan.so" ]; then \
+			echo "   Vulkan backend built"; \
+		fi; \
 	fi
-	@cd $(LLAMAFILE) && OUTPUT="$(LLAMAFILE)/o/$(MODE)/ggml-rocm.so" \
-		bash llamafile/rocm.sh >/dev/null 2>&1 || true; \
-	if [ -f "$(LLAMAFILE)/o/$(MODE)/ggml-rocm.so" ]; then \
-		echo "   ROCm backend built"; \
+	@if [ "$(CHIMERAFILE_WITH_ROCM)" = "1" ]; then \
+		cd $(LLAMAFILE) && OUTPUT="$(LLAMAFILE)/o/$(MODE)/ggml-rocm.so" \
+			bash llamafile/rocm.sh >/dev/null 2>&1 || true; \
+		if [ -f "$(LLAMAFILE)/o/$(MODE)/ggml-rocm.so" ]; then \
+			echo "   ROCm backend built"; \
+		fi; \
 	fi
 	@echo "==> Building chimerafile (bundling any GPU backends found)..."
 	$(SUBMAKE) o/$(MODE)/chimerafile/chimerafile
@@ -86,10 +93,14 @@ install: all
 .PHONY: bundle
 bundle:
 	@echo "==> Bundle build: GPU backends + chimerafile"
-	@cd $(LLAMAFILE) && OUTPUT="$(LLAMAFILE)/o/$(MODE)/ggml-cuda.so" \
-		bash llamafile/cuda.sh 2>&1 | sed 's/^/   /' || true
-	@cd $(LLAMAFILE) && OUTPUT="$(LLAMAFILE)/o/$(MODE)/ggml-vulkan.so" \
-		bash llamafile/vulkan.sh 2>&1 | sed 's/^/   /' || true
+	@if [ "$(CHIMERAFILE_WITH_CUDA)" = "1" ]; then \
+		cd $(LLAMAFILE) && OUTPUT="$(LLAMAFILE)/o/$(MODE)/ggml-cuda.so" \
+			bash llamafile/cuda.sh 2>&1 | sed 's/^/   /' || true; \
+	fi
+	@if [ "$(CHIMERAFILE_WITH_VULKAN)" = "1" ]; then \
+		cd $(LLAMAFILE) && OUTPUT="$(LLAMAFILE)/o/$(MODE)/ggml-vulkan.so" \
+			bash llamafile/vulkan.sh 2>&1 | sed 's/^/   /' || true; \
+	fi
 	$(SUBMAKE) o/$(MODE)/chimerafile/chimerafile
 	@echo "==> Bundle complete. GPU backends are embedded in the binary."
 

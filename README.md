@@ -163,6 +163,19 @@ the chosen backend.
 
 ---
 
+
+---
+# Custom Build Options
+
+### build-time engine toggles:
+make MODE=rel CHIMERAFILE_WITH_WHISPER=0               # exclude whisper
+make MODE=rel CHIMERAFILE_WITH_DIFFUSION=0              # exclude diffusion
+make MODE=rel CHIMERAFILE_WITH_WHISPER=0 CHIMERAFILE_WITH_DIFFUSION=0  # llama only
+
+# Disable specific GPU backends:
+make MODE=rel CHIMERAFILE_WITH_VULKAN=0                # skip Vulkan
+make MODE=rel CHIMERAFILE_WITH_CUDA=0 CHIMERAFILE_WITH_ROCM=0  # skip CUDA + ROCm
+
 ## Bundling a model (optional)
 
 The workflow here should behave the same as it does within Mozilla's llamafile — using `zipalign` to embed a GGUF into the APE:
