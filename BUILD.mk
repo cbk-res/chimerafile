@@ -220,15 +220,20 @@ o/$(MODE)/chimerafile/cosmo_compat.o: transcribefile/cosmo_compat.c
 # Renamed copies of the upstream static lib (ggml*/gguf* -> trc_ggml* ...).
 # Cosmopolitan expects a .aarch64/ twin for every fat .a, so both archives
 # get the same rename map.
-o/$(MODE)/chimerafile/transcribe.cpp.a: o/$(MODE)/transcribe.cpp/transcribe.cpp.a
+CHIMERA_TRANSCRIBE_SYMS := o/$(MODE)/chimerafile/transcribe.cpp.a.syms
+
+$(CHIMERA_TRANSCRIBE_SYMS): o/$(MODE)/transcribe.cpp/transcribe.cpp.a
+	@nm -g --defined-only $< | awk '$$2 ~ /^[TDB]/ && ($$3 ~ /^ggml/ || $$3 ~ /^gguf/) {print $$3 "\ttrc_" $$3}' | sort -u > $@
+
+o/$(MODE)/chimerafile/transcribe.cpp.a: o/$(MODE)/transcribe.cpp/transcribe.cpp.a \
+		$(CHIMERA_TRANSCRIBE_SYMS)
 	@mkdir -p $(@D)
-	@nm -g --defined-only $< | awk '$$2 ~ /^[TDB]/ && ($$3 ~ /^ggml/ || $$3 ~ /^gguf/) {print $$3 "\ttrc_" $$3}' | sort -u > $@.syms
-	@objcopy --redefine-syms=$@.syms $< $@
+	@objcopy --redefine-syms=$(CHIMERA_TRANSCRIBE_SYMS) $< $@
 
 o/$(MODE)/chimerafile/.aarch64/transcribe.cpp.a: o/$(MODE)/transcribe.cpp/.aarch64/transcribe.cpp.a \
-		o/$(MODE)/chimerafile/transcribe.cpp.a
+		$(CHIMERA_TRANSCRIBE_SYMS)
 	@mkdir -p $(@D)
-	@objcopy --redefine-syms=o/$(MODE)/chimerafile/transcribe.cpp.a.syms $< $@
+	@objcopy --redefine-syms=$(CHIMERA_TRANSCRIBE_SYMS) $< $@
 
 endif  # CHIMERAFILE_WITH_TRANSCRIBE
 
