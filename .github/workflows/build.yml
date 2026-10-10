@@ -23,16 +23,17 @@ on:
 
 env:
   MODE: rel
-  LLAMAFILE_REPO: https://github.com/mozilla-ai/llamafile.git
 
 jobs:
   # ── 1. CPU-only ───────────────────────────────────────────────────────────
   cpu:
     runs-on: ubuntu-latest
     steps:
+      # submodules: recursive checks out llamafile at the pinned commit
+      # (not the tip of main), so CI builds exactly what the repo pins.
       - uses: actions/checkout@v4
-      - name: Clone llamafile submodule
-        run: git clone --depth 1 --branch main $LLAMAFILE_REPO llamafile
+        with:
+          submodules: recursive
       - uses: actions/cache@v4
         with:
           path: llamafile/.cosmocc
@@ -45,18 +46,6 @@ jobs:
           restore-keys: |
             obj-${{ runner.os }}-
       - run: make setup
-      # stable-diffusion.cpp patches are buggy (wrong include paths).
-      # Reset it so our compat header + include paths handle the job.
-      - name: Reset stable-diffusion.cpp to unpatched state
-        run: |
-          cd llamafile/stable-diffusion.cpp
-          git reset --hard
-          git clean -fdx
-      # Upstream vulkan.c lacks a device-count guard before registering the
-      # Vulkan backend.  Without it, the binary crashes on systems where
-      # Vulkan is present but incompatible (e.g. SDK version mismatch).
-      - name: Patch vulkan.c — add device-count guard
-        run: bash ci-patches/patch-vulkan-device-count.sh
       - run: make MODE=${{ env.MODE }}
       - name: Build zipalign (needed by all-gpu job)
         run: make MODE=${{ env.MODE }} o/${{ env.MODE }}/third_party/zipalign/zipalign
@@ -80,11 +69,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Clone llamafile submodule (source needed for GPU build scripts)
-        run: |
-          git clone --depth 1 --branch main $LLAMAFILE_REPO llamafile
-          cd llamafile
-          git submodule update --init llama.cpp
+        with:
+          submodules: recursive
       - uses: actions/download-artifact@v4
         with:
           name: chimerafile-cpu
@@ -140,11 +126,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Clone llamafile submodule (source needed for GPU build scripts)
-        run: |
-          git clone --depth 1 --branch main $LLAMAFILE_REPO llamafile
-          cd llamafile
-          git submodule update --init llama.cpp
+        with:
+          submodules: recursive
       - uses: actions/download-artifact@v4
         with:
           name: chimerafile-cpu
@@ -196,11 +179,8 @@ jobs:
           apt-get update -qq
           apt-get install -y -qq git unzip hipblas-dev
       - uses: actions/checkout@v4
-      - name: Clone llamafile submodule (source needed for GPU build scripts)
-        run: |
-          git clone --depth 1 --branch main $LLAMAFILE_REPO llamafile
-          cd llamafile
-          git submodule update --init llama.cpp
+        with:
+          submodules: recursive
       - uses: actions/download-artifact@v4
         with:
           name: chimerafile-cpu
@@ -231,8 +211,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Clone llamafile submodule
-        run: git clone --depth 1 --branch main $LLAMAFILE_REPO llamafile
+        with:
+          submodules: recursive
       - uses: actions/cache@v4
         with:
           path: llamafile/.cosmocc
@@ -249,11 +229,6 @@ jobs:
       - name: Use cosmocc make
         run: |
           echo "$PWD/llamafile/.cosmocc/4.0.2/bin" >> $GITHUB_PATH
-      - name: Reset stable-diffusion.cpp to unpatched state
-        run: |
-          cd llamafile/stable-diffusion.cpp
-          git reset --hard
-          git clean -fdx
       - run: make MODE=${{ env.MODE }}
       - uses: actions/upload-artifact@v4
         with:
