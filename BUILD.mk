@@ -142,74 +142,7 @@ o/$(MODE)/chimerafile/whisper.core.o: whisper.cpp/src/whisper.cpp
 
 endif  # CHIMERAFILE_WITH_WHISPER
 
-# ==============================================================================
-# Diffusion (stable-diffusion.cpp) backend
-# ==============================================================================
 
-ifeq ($(CHIMERAFILE_WITH_DIFFUSION),1)
-
-CHIMERAFILE_DIFFUSION_INCLUDES := \
-	-iquote . \
-	-iquote llama.cpp/ggml/include \
-	-iquote llama.cpp/ggml/src \
-	-iquote third_party/stb \
-	-iquote stable-diffusion.cpp \
-	-iquote stable-diffusion.cpp/thirdparty
-
-CHIMERAFILE_DIFFUSION_CPPFLAGS := \
-	$(CHIMERAFILE_DIFFUSION_INCLUDES) \
-	-DCOSMOCC=1 \
-	-D_XOPEN_SOURCE=600 \
-	-DCHIMERAFILE=1 \
-	-DLLAMAFILE_VERSION_STRING="$(LLAMAFILE_VERSION_STRING)" \
-	-include $(CHIMERAFILE_DIR)/diffusionfile/sd_ggml_compat.h
-
-o/$(MODE)/chimerafile/diffusionfile_main.o: $(CHIMERAFILE_DIR)/diffusionfile/diffusionfile.cpp
-	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $(CHIMERAFILE_DIFFUSION_INCLUDES) \
-		-DCOSMOCC=1 \
-		-D_XOPEN_SOURCE=600 \
-		-DCHIMERAFILE=1 \
-		-DLLAMAFILE_VERSION_STRING="$(LLAMAFILE_VERSION_STRING)" \
-		-Dmain=diffusionfile_main \
-		-frtti \
-		-c -o $@ $<
-
-o/$(MODE)/chimerafile/sd_core.o: $(CHIMERAFILE_DIR)/diffusionfile/sd_core.cpp
-	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $(CHIMERAFILE_DIFFUSION_CPPFLAGS) \
-		-DGGML_MULTIPLATFORM \
-		-frtti \
-		-c -o $@ $<
-
-o/$(MODE)/chimerafile/sd_util.o: stable-diffusion.cpp/util.cpp
-	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $(CHIMERAFILE_DIFFUSION_CPPFLAGS) \
-		-DGGML_MULTIPLATFORM \
-		-frtti \
-		-c -o $@ $<
-
-o/$(MODE)/chimerafile/sd_model.o: stable-diffusion.cpp/model.cpp
-	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $(CHIMERAFILE_DIFFUSION_CPPFLAGS) \
-		-DGGML_MULTIPLATFORM \
-		-frtti \
-		-c -o $@ $<
-
-o/$(MODE)/chimerafile/sd_upscaler.o: stable-diffusion.cpp/upscaler.cpp
-	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $(CHIMERAFILE_DIFFUSION_CPPFLAGS) \
-		-DGGML_MULTIPLATFORM \
-		-frtti \
-		-c -o $@ $<
-
-o/$(MODE)/chimerafile/sd_zip.o: stable-diffusion.cpp/thirdparty/zip.c
-	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) $(CHIMERAFILE_DIFFUSION_CPPFLAGS) \
-		-DGGML_MULTIPLATFORM \
-		-c -o $@ $<
-
-endif  # CHIMERAFILE_WITH_DIFFUSION
 
 # ==============================================================================
 # Aggregate object list
@@ -229,17 +162,6 @@ CHIMERAFILE_WHISPER_OBJS := \
 	o/$(MODE)/chimerafile/whisper.core.o
 endif
 
-CHIMERAFILE_DIFFUSION_OBJS :=
-ifeq ($(CHIMERAFILE_WITH_DIFFUSION),1)
-CHIMERAFILE_DIFFUSION_OBJS := \
-	o/$(MODE)/chimerafile/diffusionfile_main.o \
-	o/$(MODE)/chimerafile/sd_core.o \
-	o/$(MODE)/chimerafile/sd_util.o \
-	o/$(MODE)/chimerafile/sd_model.o \
-	o/$(MODE)/chimerafile/sd_upscaler.o \
-	o/$(MODE)/chimerafile/sd_zip.o
-endif
-
 CHIMERAFILE_OWN_OBJS := \
 	o/$(MODE)/chimerafile/chimerafile.o \
 	o/$(MODE)/chimerafile/llama_dispatch.o \
@@ -248,7 +170,6 @@ CHIMERAFILE_OWN_OBJS := \
 
 CHIMERAFILE_ALL_OBJS := \
 	$(CHIMERAFILE_OWN_OBJS) \
-	$(CHIMERAFILE_DIFFUSION_OBJS) \
 	o/$(MODE)/llamafile/server.cpp.o \
 	$(LLAMAFILE_OBJS) \
 	$(LLAMAFILE_DEPS) \
