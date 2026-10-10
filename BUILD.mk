@@ -217,12 +217,18 @@ o/$(MODE)/chimerafile/cosmo_compat.o: transcribefile/cosmo_compat.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-# Renamed copy of the upstream static lib (ggml*/gguf* -> trc_ggml* ...)
+# Renamed copies of the upstream static lib (ggml*/gguf* -> trc_ggml* ...).
+# Cosmopolitan expects a .aarch64/ twin for every fat .a, so both archives
+# get the same rename map.
 o/$(MODE)/chimerafile/transcribe.cpp.a: o/$(MODE)/transcribe.cpp/transcribe.cpp.a
 	@mkdir -p $(@D)
 	@nm -g --defined-only $< | awk '$$2 ~ /^[TDB]/ && ($$3 ~ /^ggml/ || $$3 ~ /^gguf/) {print $$3 "\ttrc_" $$3}' | sort -u > $@.syms
 	@objcopy --redefine-syms=$@.syms $< $@
-	@rm -f $@.syms
+
+o/$(MODE)/chimerafile/.aarch64/transcribe.cpp.a: o/$(MODE)/transcribe.cpp/.aarch64/transcribe.cpp.a \
+		o/$(MODE)/chimerafile/transcribe.cpp.a
+	@mkdir -p $(@D)
+	@objcopy --redefine-syms=o/$(MODE)/chimerafile/transcribe.cpp.a.syms $< $@
 
 endif  # CHIMERAFILE_WITH_TRANSCRIBE
 
@@ -267,12 +273,14 @@ endif
 CHIMERAFILE_TRANSCRIBE_OBJS :=
 ifeq ($(CHIMERAFILE_WITH_TRANSCRIBE),1)
 # The .o files come before the .a so the renamed ggml members get pulled in.
+# The .aarch64 twin must be on the link line for cosmopolitan's fat linker.
 CHIMERAFILE_TRANSCRIBE_OBJS := \
 	o/$(MODE)/chimerafile/transcribefile_main.o \
 	o/$(MODE)/chimerafile/cli.transcribe.cpp.o \
 	o/$(MODE)/chimerafile/wav.cpp.o \
 	o/$(MODE)/chimerafile/cosmo_compat.o \
-	o/$(MODE)/chimerafile/transcribe.cpp.a
+	o/$(MODE)/chimerafile/transcribe.cpp.a \
+	o/$(MODE)/chimerafile/.aarch64/transcribe.cpp.a
 endif
 
 CHIMERAFILE_ALL_OBJS := \
