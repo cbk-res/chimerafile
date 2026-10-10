@@ -124,7 +124,8 @@ static int combined_main(const LlamafileArgs &args) {
     auto on_ready = [&](const std::string &listen_addr) {
         auto *ctx = new TuiThreadCtx{
             &shutdown_fn, &mu, &cv, &shutdown_ready,
-            listen_addr, args.system_prompt, args.model_path
+            listen_addr, args.system_prompt,
+            args.model_path.empty() ? args.remote_model : args.model_path
         };
         pthread_attr_t attr;
         pthread_attr_init(&attr);

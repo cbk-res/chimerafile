@@ -51,14 +51,15 @@ CHIMERAFILE_WHISPER_INCLUDES := \
 CXXFLAGS += -DGGML_MAX_NAME=128
 CFLAGS   += -DGGML_MAX_NAME=128
 
+# LLAMAFILE_VERSION_STRING comes from llamafile/version.h at compile time.
+
 CHIMERAFILE_CPPFLAGS := \
 	$(CHIMERAFILE_INCLUDES) \
 	-DLLAMAFILE_TUI \
 	-DCOSMOCC=1 \
 	-DCHIMERAFILE=1 \
 	-DWHISPERFILE \
-	-DCHIMERAFILE_VERSION_STRING=\"$(CHIMERAFILE_VERSION_STRING)\" \
-	-DLLAMAFILE_VERSION_STRING=\"$(LLAMAFILE_VERSION_STRING)\"
+	-DCHIMERAFILE_VERSION_STRING=\"$(CHIMERAFILE_VERSION_STRING)\"
 
 ifeq ($(CHIMERAFILE_WITH_WHISPER),0)
 CHIMERAFILE_CPPFLAGS += -DCHIMERAFILE_NO_WHISPER
@@ -89,10 +90,8 @@ o/$(MODE)/chimerafile/llama_dispatch.o: $(CHIMERAFILE_DIR)/llama_dispatch.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $(CHIMERAFILE_CPPFLAGS) -c -o $@ $<
 
-CHIMERAFILE_CHECK_CPU_OBJ = o/$(MODE)/llamafile/check_cpu.o
-$(CHIMERAFILE_CHECK_CPU_OBJ): llamafile/check_cpu.c
-	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) $(LLAMAFILE_CPPFLAGS) -c -o $@ $<
+# o/$(MODE)/llamafile/check_cpu.o is built by llamafile/BUILD.mk's pattern
+# rule and comes in via $(LLAMAFILE_OBJS).
 
 # ==============================================================================
 # Whisperfile support + entry point
@@ -102,7 +101,6 @@ ifeq ($(CHIMERAFILE_WITH_WHISPER),1)
 o/$(MODE)/chimerafile/whisperfile_main.o: whisperfile/whisperfile.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $(CHIMERAFILE_WHISPER_CPPFLAGS) \
-		-DLLAMAFILE_VERSION_STRING="$(LLAMAFILE_VERSION_STRING)" \
 		-Dmain=whisperfile_main \
 		-c -o $@ $<
 
