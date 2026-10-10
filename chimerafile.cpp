@@ -44,9 +44,14 @@ static void print_engines(void) {
     fprintf(stderr, "    whisper    — (not built; set CHIMERAFILE_WITH_WHISPER=1)\n");
 #endif
 #ifndef CHIMERAFILE_NO_DIFFUSION
-    fprintf(stderr, "    diffusion  — text-to-image generation\n");
+    fprintf(stderr, "    diffusion  — text-to-image / video generation\n");
 #else
     fprintf(stderr, "    diffusion  — (not built; set CHIMERAFILE_WITH_DIFFUSION=1)\n");
+#endif
+#ifndef CHIMERAFILE_NO_TRANSCRIBE
+    fprintf(stderr, "    transcribe — speech-to-text (transcribe.cpp)\n");
+#else
+    fprintf(stderr, "    transcribe — (not built; set CHIMERAFILE_WITH_TRANSCRIBE=1)\n");
 #endif
     fprintf(stderr, "\n");
 }
@@ -88,49 +93,39 @@ extern int llama_dispatch(int argc, char **argv);
 extern int whisperfile_main(int argc, char **argv);
 #endif
 #ifndef CHIMERAFILE_NO_DIFFUSION
-extern "C" int diffusionfile_main(int argc, char **argv);
+extern int diffusionfile_main(int argc, char **argv);
+#endif
+#ifndef CHIMERAFILE_NO_TRANSCRIBE
+extern int transcribefile_main(int argc, char **argv);
 #endif
 
 // ── Usage ──────────────────────────────────────────────────────────────────
 
 static void print_usage(FILE *f, const char *prog) {
-    fprintf(f,
-        "usage: %s <engine> [engine-args...]\n"
-        "\n"
-        "examples:\n"
-        "  %s llama      --cli -m model.gguf -p \"Hello\"\n"
+    fprintf(f, "usage: %s <engine> [engine-args...]\n\n", prog);
+    fprintf(f, "examples:\n");
+    fprintf(f, "  %s llama      --cli -m model.gguf -p \"Hello\"\n", prog);
 #ifndef CHIMERAFILE_NO_WHISPER
-        "  %s whisper    -m whisper.gguf -f audio.wav --output-csv\n"
+    fprintf(f, "  %s whisper    -m whisper.gguf -f audio.wav --output-csv\n", prog);
 #endif
 #ifndef CHIMERAFILE_NO_DIFFUSION
-        "  %s diffusion  -m model.safetensors -p \"a cat\"\n"
+    fprintf(f, "  %s diffusion  -m model.safetensors -p \"a cat\"\n", prog);
 #endif
-        "  %s --version\n"
-        "\n"
-        "Pass --help after the engine name for engine-specific help:\n"
-        "  %s llama      --help\n"
+#ifndef CHIMERAFILE_NO_TRANSCRIBE
+    fprintf(f, "  %s transcribe -m model.bin -f audio.wav\n", prog);
+#endif
+    fprintf(f, "  %s --version\n\n", prog);
+    fprintf(f, "Pass --help after the engine name for engine-specific help:\n");
+    fprintf(f, "  %s llama      --help\n", prog);
 #ifndef CHIMERAFILE_NO_WHISPER
-        "  %s whisper    --help\n"
+    fprintf(f, "  %s whisper    --help\n", prog);
 #endif
 #ifndef CHIMERAFILE_NO_DIFFUSION
-        "  %s diffusion  --help\n"
+    fprintf(f, "  %s diffusion  --help\n", prog);
 #endif
-        ,
-        prog, prog
-#ifndef CHIMERAFILE_NO_WHISPER
-        , prog
+#ifndef CHIMERAFILE_NO_TRANSCRIBE
+    fprintf(f, "  %s transcribe --help\n", prog);
 #endif
-#ifndef CHIMERAFILE_NO_DIFFUSION
-        , prog
-#endif
-        , prog, prog
-#ifndef CHIMERAFILE_NO_WHISPER
-        , prog
-#endif
-#ifndef CHIMERAFILE_NO_DIFFUSION
-        , prog
-#endif
-    );
 }
 
 // ── Entry point ────────────────────────────────────────────────────────────
@@ -188,6 +183,11 @@ int main(int argc, char **argv) {
 #ifndef CHIMERAFILE_NO_DIFFUSION
     if (strcmp(engine, "diffusion") == 0)
         return diffusionfile_main(argc, argv);
+#endif
+
+#ifndef CHIMERAFILE_NO_TRANSCRIBE
+    if (strcmp(engine, "transcribe") == 0)
+        return transcribefile_main(argc, argv);
 #endif
 
     fprintf(stderr, "chimerafile: unknown engine '%s'\n\n", engine);

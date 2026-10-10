@@ -19,8 +19,9 @@ CHIMERAFILE_VERSION_STRING := $(shell cat $(CHIMERAFILE_DIR)/VERSION 2>/dev/null
 WHISPER_VERSION := 1.8.3
 
 # ── Build-time engine toggles ────────────────────────────────────────
-CHIMERAFILE_WITH_WHISPER   ?= 1
-CHIMERAFILE_WITH_DIFFUSION ?= 1
+CHIMERAFILE_WITH_WHISPER    ?= 1
+CHIMERAFILE_WITH_DIFFUSION  ?= 1
+CHIMERAFILE_WITH_TRANSCRIBE ?= 1
 
 # ==============================================================================
 # Include paths
@@ -64,6 +65,9 @@ CHIMERAFILE_CPPFLAGS += -DCHIMERAFILE_NO_WHISPER
 endif
 ifeq ($(CHIMERAFILE_WITH_DIFFUSION),0)
 CHIMERAFILE_CPPFLAGS += -DCHIMERAFILE_NO_DIFFUSION
+endif
+ifeq ($(CHIMERAFILE_WITH_TRANSCRIBE),0)
+CHIMERAFILE_CPPFLAGS += -DCHIMERAFILE_NO_TRANSCRIBE
 endif
 
 CHIMERAFILE_WHISPER_CPPFLAGS := \
@@ -165,6 +169,66 @@ o/$(MODE)/chimerafile/diffusionfile_main.o: diffusionfile/diffusionfile.cpp
 endif  # CHIMERAFILE_WITH_DIFFUSION
 
 # ==============================================================================
+# Transcribe (transcribe.cpp) backend
+# ==============================================================================
+# transcribe.cpp ships its OWN vendored ggml (ggml-org/ggml 0.15.2), a
+# different version from llama.cpp's GGML (0.20).  To keep one shared GGML
+# for the llama/whisper/diffusion engines, we rename every ggml*/gguf*
+# symbol in transcribe.cpp.a (objcopy --redefine-syms) so the transcribe
+# engine runs on its own private copy instead.  As in upstream transcribefile,
+# it stays CPU-only: llamafile's runtime GPU loaders register with
+# llama.cpp's GGML, not with this one.
+
+ifeq ($(CHIMERAFILE_WITH_TRANSCRIBE),1)
+
+CHIMERA_TRANSCRIBE_VERSION := $(shell cd transcribe.cpp 2>/dev/null && git rev-parse --short HEAD 2>/dev/null || echo unknown)
+
+# llamafile's transcribefile wrapper, with main renamed for our dispatcher
+o/$(MODE)/chimerafile/transcribefile_main.o: transcribefile/main.cpp
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) \
+		-iquote . \
+		-iquote transcribe.cpp/include \
+		-iquote transcribe.cpp/examples/common \
+		-DCOSMOCC=1 \
+		-DTRANSCRIBEFILE_VERSION_STRING=\"$(CHIMERA_TRANSCRIBE_VERSION)\" \
+		-Dmain=transcribefile_main \
+		-c -o $@ $<
+
+# transcribe.cpp's example CLI; -DTRANSCRIBEFILE renames its main() to
+# transcribe_cli_main() (see transcribe.cpp.patches)
+o/$(MODE)/chimerafile/cli.transcribe.cpp.o: transcribe.cpp/examples/cli/main.cpp
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) \
+		-iquote transcribe.cpp/include \
+		-iquote transcribe.cpp/examples/common \
+		-DCOSMOCC=1 \
+		-DTRANSCRIBEFILE \
+		-Wno-sign-compare -Wno-unused-function \
+		-c -o $@ $<
+
+o/$(MODE)/chimerafile/wav.cpp.o: transcribe.cpp/examples/common/wav.cpp
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) \
+		-iquote transcribe.cpp/include \
+		-iquote transcribe.cpp/examples/common \
+		-DCOSMOCC=1 \
+		-c -o $@ $<
+
+o/$(MODE)/chimerafile/cosmo_compat.o: transcribefile/cosmo_compat.c
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# Renamed copy of the upstream static lib (ggml*/gguf* -> trc_ggml* ...)
+o/$(MODE)/chimerafile/transcribe.cpp.a: o/$(MODE)/transcribe.cpp/transcribe.cpp.a
+	@mkdir -p $(@D)
+	@nm -g --defined-only $< | awk '$$2 ~ /^[TDB]/ && ($$3 ~ /^ggml/ || $$3 ~ /^gguf/) {print $$3 "\ttrc_" $$3}' | sort -u > $@.syms
+	@objcopy --redefine-syms=$@.syms $< $@
+	@rm -f $@.syms
+
+endif  # CHIMERAFILE_WITH_TRANSCRIBE
+
+# ==============================================================================
 # Aggregate object list
 # ==============================================================================
 
@@ -203,6 +267,15 @@ CHIMERAFILE_DIFFUSION_OBJS := \
 endif
 
 CHIMERAFILE_TRANSCRIBE_OBJS :=
+ifeq ($(CHIMERAFILE_WITH_TRANSCRIBE),1)
+# The .o files come before the .a so the renamed ggml members get pulled in.
+CHIMERAFILE_TRANSCRIBE_OBJS := \
+	o/$(MODE)/chimerafile/transcribefile_main.o \
+	o/$(MODE)/chimerafile/cli.transcribe.cpp.o \
+	o/$(MODE)/chimerafile/wav.cpp.o \
+	o/$(MODE)/chimerafile/cosmo_compat.o \
+	o/$(MODE)/chimerafile/transcribe.cpp.a
+endif
 
 CHIMERAFILE_ALL_OBJS := \
 	$(CHIMERAFILE_OWN_OBJS) \
