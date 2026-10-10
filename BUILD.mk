@@ -90,8 +90,12 @@ o/$(MODE)/chimerafile/llama_dispatch.o: $(CHIMERAFILE_DIR)/llama_dispatch.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $(CHIMERAFILE_CPPFLAGS) -c -o $@ $<
 
-# o/$(MODE)/llamafile/check_cpu.o is built by llamafile/BUILD.mk's pattern
-# rule and comes in via $(LLAMAFILE_OBJS).
+# check_cpu.c is not in LLAMAFILE_SRCS_C (the standalone packages pull it in
+# via the pattern rule below), so we build it explicitly.
+CHIMERAFILE_CHECK_CPU_OBJ = o/$(MODE)/llamafile/check_cpu.o
+$(CHIMERAFILE_CHECK_CPU_OBJ): llamafile/check_cpu.c
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(LLAMAFILE_CPPFLAGS) -c -o $@ $<
 
 # ==============================================================================
 # Whisperfile support + entry point
@@ -263,6 +267,7 @@ endif
 CHIMERAFILE_OWN_OBJS := \
 	o/$(MODE)/chimerafile/chimerafile.o \
 	o/$(MODE)/chimerafile/llama_dispatch.o \
+	$(CHIMERAFILE_CHECK_CPU_OBJ) \
 	$(CHIMERAFILE_WHISPER_OBJS)
 
 CHIMERAFILE_DIFFUSION_OBJS :=
