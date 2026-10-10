@@ -142,7 +142,27 @@ o/$(MODE)/chimerafile/whisper.core.o: whisper.cpp/src/whisper.cpp
 
 endif  # CHIMERAFILE_WITH_WHISPER
 
+# ==============================================================================
+# Diffusion (stable-diffusion.cpp) backend — upstream diffusionfile pattern
+# ==============================================================================
+# We compile llamafile's own diffusionfile wrapper (diffusionfile/diffusionfile.cpp)
+# with -Dmain=diffusionfile_main so the chimerafile dispatcher owns main();
+# the wrapper then calls diffusion_cli_main(), which is stable-diffusion.cpp's
+# examples/cli/main.cpp compiled with -DDIFFUSIONFILE by the upstream package.
+# stable-diffusion.cpp.a, its thirdparty zip and the sd_math_shim are built by
+# the upstream patched BUILD.mk against llama.cpp's GGML (single-GGML model).
 
+ifeq ($(CHIMERAFILE_WITH_DIFFUSION),1)
+
+o/$(MODE)/chimerafile/diffusionfile_main.o: diffusionfile/diffusionfile.cpp
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) \
+		-iquote . \
+		-DCOSMOCC=1 \
+		-Dmain=diffusionfile_main \
+		-c -o $@ $<
+
+endif  # CHIMERAFILE_WITH_DIFFUSION
 
 # ==============================================================================
 # Aggregate object list
@@ -165,16 +185,32 @@ endif
 CHIMERAFILE_OWN_OBJS := \
 	o/$(MODE)/chimerafile/chimerafile.o \
 	o/$(MODE)/chimerafile/llama_dispatch.o \
-	$(CHIMERAFILE_CHECK_CPU_OBJ) \
 	$(CHIMERAFILE_WHISPER_OBJS)
+
+CHIMERAFILE_DIFFUSION_OBJS :=
+ifeq ($(CHIMERAFILE_WITH_DIFFUSION),1)
+# The stable-diffusion.cpp package targets (main.diffusionfile.cpp.o,
+# stable-diffusion.cpp.a, zip.c.o, sd_math_shim.o) are defined by the
+# upstream patched BUILD.mk.  stb.a is listed before the .a so llamafile's
+# stb copy wins the duplicate-symbol resolution.
+CHIMERAFILE_DIFFUSION_OBJS := \
+	o/$(MODE)/chimerafile/diffusionfile_main.o \
+	o/$(MODE)/third_party/stb/stb.a \
+	o/$(MODE)/stable-diffusion.cpp/stable-diffusion.cpp.a \
+	o/$(MODE)/stable-diffusion.cpp/examples/cli/main.diffusionfile.cpp.o \
+	o/$(MODE)/stable-diffusion.cpp/thirdparty/zip.c.o \
+	o/$(MODE)/stable-diffusion.cpp.patches/sd_math_shim.o
+endif
+
+CHIMERAFILE_TRANSCRIBE_OBJS :=
 
 CHIMERAFILE_ALL_OBJS := \
 	$(CHIMERAFILE_OWN_OBJS) \
 	o/$(MODE)/llamafile/server.cpp.o \
 	$(LLAMAFILE_OBJS) \
 	$(LLAMAFILE_DEPS) \
-	$(SERVER_ASSETS) \
-	o/$(MODE)/third_party/stb/stb.a
+	$(CHIMERAFILE_DIFFUSION_OBJS) \
+	$(CHIMERAFILE_TRANSCRIBE_OBJS)
 
 # ==============================================================================
 # GPU backend shared libraries
