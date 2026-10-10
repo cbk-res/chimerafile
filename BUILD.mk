@@ -311,11 +311,12 @@ CHIMERAFILE_GPU_SOS := $(wildcard o/$(MODE)/ggml-cuda.so o/$(MODE)/ggml-vulkan.s
 # Final binary
 # ==============================================================================
 
+# --allow-multiple-definition dedupes stb (llamafile's third_party/stb vs
+# stable-diffusion.cpp's bundled copy) and other benign overlaps.
 o/$(MODE)/chimerafile/chimerafile: $(CHIMERAFILE_ALL_OBJS) $(CHIMERAFILE_GPU_SOS)
 	@mkdir -p $(@D)
 	$(CXX) $(LDFLAGS) -o $@ $(filter %.o %.a,$^) $(LDLIBS) \
-			-Wl,--allow-multiple-definition \
-			-Wl,--wrap=ggml_backend_cpu_init
+			-Wl,--allow-multiple-definition
 	@echo "==> Built: $@"
 	@ZIPALIGN="$(CURDIR)/o/$(MODE)/third_party/zipalign/zipalign"; \
 	GPU_DIR=o/$(MODE); \
