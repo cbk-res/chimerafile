@@ -2,15 +2,16 @@
 
 [![build](https://github.com/cbk-res/chimerafile/actions/workflows/build.yml/badge.svg)](https://github.com/cbk-res/chimerafile/actions/workflows/build.yml)
 
-A unified inference binary that combines **llamafile** (LLM), **whisperfile** (speech-to-text), and **stable-diffusion.cpp** ('diffusionfile' for image generation) into a single [APE](https://justine.lol/ape.html) executable, while making zero changes to the upstream source.
+A unified inference binary that combines **llamafile** (LLM), **whisperfile** (speech-to-text), **diffusionfile** (stable-diffusion.cpp image/video generation), and **transcribefile** (transcribe.cpp speech-to-text) into a single [APE](https://justine.lol/ape.html) executable, while making zero changes to the upstream source.
 
 ```
 ./chimerafile llama      [llamafile args...]
 ./chimerafile whisper    [whisperfile args...]
-./chimerafile diffusion  [diffusion args...]
+./chimerafile diffusion  [diffusionfile args...]
+./chimerafile transcribe [transcribefile args...]
 ```
 
-All three engines share a **single GGML runtime** — reducing duplication which might occur when projects wish to make use of one or more 'llamafiles' (e.g. an app which uses llamafile, whisperfile, and diffusionfile). We include several GPU backends (Vulkan, CUDA, ROCm, Metal), which are bundled as `.so` files inside the APE and loaded at runtime.
+All engines share one **llama.cpp GGML runtime** (whisper and stable-diffusion.cpp are compiled against it; transcribe.cpp keeps its own private copy — see below), reducing duplication for projects that would otherwise bundle several standalone 'llamafiles'. GPU backends (Vulkan, CUDA, ROCm, Metal) are bundled as `.so` files inside the APE and loaded at runtime.
 
 ---
 
@@ -39,7 +40,7 @@ make                # build (debug)
 make MODE=rel       # build (optimised, ~20 min first build)
 ```
 
-The binary is written to `llamafile/o//chimerafile/chimerafile`.
+The binary is written to `llamafile/o/$(MODE)/chimerafile/chimerafile` (`o//` in debug builds, i.e. the empty-MODE path).
 
 ---
 
@@ -52,41 +53,50 @@ The binary is written to `llamafile/o//chimerafile/chimerafile`.
 ./chimerafile llama --chat  -m model.gguf
 ```
 
-### Speech-to-text — whsiperfile is similarly unchanged
+### Speech-to-text — whisperfile is unchanged
 ```sh
 ./chimerafile whisper -m whisper.gguf -f audio.wav
 ./chimerafile whisper -m whisper.gguf -f audio.wav --output-csv -of transcript
 ```
 
-### Image generation — 'diffusionfile' builds on the patches for stable-diffusion.cpp present within the llamafile submodule, providing text-to-image generation and more!
+### Image/video generation — diffusionfile, as provided upstream
+The diffusion engine is stable-diffusion.cpp's own CLI (built by the
+`diffusionfile` package inside the llamafile submodule, with its `main()`
+renamed for our dispatcher). Run `--help` for the full option list:
 ```sh
 ./chimerafile diffusion -m model.safetensors -p "a cat in a spacesuit"
-./chimerafile diffusion -m model.safetensors -p "portrait" -W 1024 -H 1024 --steps 30
-./chimerafile diffusion -m model.safetensors -p "turn into van gogh" \
-    --input photo.jpg --strength 0.6
-./chimerafile diffusion -m model.gguf -p "donkey" --verbose
+./chimerafile diffusion -m model.safetensors -p "a cat" -o out.png
+./chimerafile diffusion -M upscale -m model.safetensors -i photo.jpg
+./chimerafile diffusion -m model.safetensors --version
 ```
+Modes (`-M`): `img_gen` (default), `vid_gen`, `upscale`, `convert`, `metadata`.
+
+### Speech-to-text — transcribefile (transcribe.cpp)
+```sh
+./chimerafile transcribe -m model.gguf audio.wav
+./chimerafile transcribe -m model.gguf -l en audio.wav
+./chimerafile transcribe --help
+```
+Note: the transcribe engine runs on its own private GGML copy (see below)
+and is therefore CPU-only.
 
 ---
 
 ## GPU Backends
 
-GPU acceleration is automatic — no flags needed.  Use `--gpu` to override:
+GPU acceleration for the llama/whisper/diffusion engines is automatic — no
+flags needed. Use `--gpu` to override:
 
 ```sh
 # Central flag (applies to all engines):
 ./chimerafile --gpu nvidia llama -m model.gguf -p "Hello"
-./chimerafile --gpu off diffusion -m model.gguf -p "cat"
+./chimerafile --gpu off diffusion -m model.safetensors -p "cat"
 
-# Per-engine override:
+# Per-engine override (engines that accept --gpu):
 ./chimerafile llama --gpu nvidia -m model.gguf -p "Hello"
-./chimerafile diffusion --gpu vulkan -m model.gguf -p "cat"
 ```
 
 Modes: `auto` (default), `nvidia`, `amd`, `vulkan`, `apple`, `disable`, `off`.
-
-> **Known issue:** The Vulkan backend may crash on Intel integrated GPUs
-> (Mesa ANV driver).  If you see a segfault on `--gpu auto`, try specifying a different GPU mode (e.g. `--gpu nvidia`) if avaialble or use `--gpu off` as a fallback.
 
 Run with `--verbose` to see detected backends.
 
@@ -111,41 +121,40 @@ Each produces a `.so` that gets zipaligned into the APE automatically.
 ```
 chimerafile/                    ← this repo (chimerafile layer only)
 ├── chimerafile.cpp             ← dispatcher (owns main())
-├── llama_dispatch.cpp          ← llamafile mode (not compiled from submodule)
-├── diffusionfile/
-│   ├── diffusionfile.cpp       ← diffusion engine entry point
-│   ├── sd_core.cpp             ← stb conflict wrapper
-│   └── sd_ggml_compat.h        ← GGML API compatibility shim
+├── llama_dispatch.cpp          ← llamafile mode dispatch
 ├── BUILD.mk                    ← build rules (injected into llamafile's make)
 ├── Makefile                    ← thin wrapper, delegates to llamafile/Makefile
+├── ci-patches/                 ← CI-only patches (Pascal sm_61 for cuda.sh)
 ├── .github/workflows/build.yml ← CI: 6 variant builds
-└── llamafile/                  ← git submodule (stock, unmodified)
+└── llamafile/                  ← git submodule (stock, unmodified, v0.10.6)
     ├── llamafile/              ← LLM TUI + server
-    ├── whisperfile/            ← speech-to-text CLI
-    ├── stable-diffusion.cpp/   ← image generation library
-    ├── llama.cpp/              ← LLM backend (submodule)
-    └── whisper.cpp/            ← ASR backend (submodule)
+    ├── whisperfile/            ← speech-to-text CLI wrapper
+    ├── diffusionfile/          ← image generation CLI wrapper
+    ├── transcribefile/         ← transcribe.cpp CLI wrapper
+    ├── llama.cpp/              ← LLM backend (nested submodule)
+    ├── whisper.cpp/            ← ASR backend (nested submodule)
+    ├── stable-diffusion.cpp/   ← image generation library (nested submodule)
+    └── transcribe.cpp/         ← ASR backend (nested submodule)
 ```
 
-### Single GGML — all three backends share one runtime
+### Single GGML — mostly
 
-`whisper.cpp` and `stable-diffusion.cpp` each ship their own GGML fork.
-Linking both into one binary would produce duplicate symbols. Chimerafile
-resolves this by recompiling both backends against **llama.cpp's GGML**
-headers, giving all three engines a single, GPU-capable GGML implementation
-(Vulkan / CUDA / ROCm / Metal).
+`llamafile`, `whisperfile` and `diffusionfile` share **llama.cpp's GGML**:
+whisper.cpp's core/common sources are recompiled against llama.cpp's GGML
+headers, and stable-diffusion.cpp is built by the upstream diffusionfile
+package against the same GGML — one GPU-capable runtime (Vulkan / CUDA /
+ROCm / Metal) for all three engines.
 
-For `stable-diffusion.cpp`, a compatibility shim (`sd_ggml_compat.h`) bridges
-six API differences between its upstream GGML fork and llama.cpp's GGML:
+`transcribe.cpp` is the exception: it vendors its own GGML (ggml-org/ggml
+0.15.2), a different version from llama.cpp's GGML (0.20). Rather than
+recompile the whole engine, the transcribe build renames every `ggml*`/
+`gguf*` symbol inside its static library (`objcopy --redefine-syms`,
+see BUILD.mk) so the binary carries one private, isolated copy for the
+transcribe engine. Consequences:
 
-| API | Resolution |
-|---|---|
-| `ggml_cpu_has_blas()` | Stub (returns 0) |
-| `ggml_internal_get_type_traits()` → `ggml_get_type_traits()` | Struct-by-value wrapper |
-| `ggml_upscale(ctx, a, 2)` (3-arg) → 4-arg | Macro appends `GGML_SCALE_MODE_NEAREST` |
-| `ggml_set_f32()` / `ggml_set_f32_1d()` | Provided by `ggml-cpu.h` |
-| `ggml_graph_compute_with_ctx()` | Provided by `ggml-cpu.h` |
-| `ggml_backend_cpu_init()` → GPU-first | Linker `--wrap` tries Vulkan/CUDA first |
+- no symbol collisions with the shared GGML;
+- the llamafile GPU loaders register with llama.cpp's GGML, so the
+  transcribe engine stays CPU-only in this build.
 
 ### Dispatch model
 
@@ -154,23 +163,23 @@ requiring **zero changes** to the llamafile source tree:
 
 | Source file | Compiled as |
 |---|---|
-| `llamafile/llamafile/main.cpp` | `-Dmain=llamafile_main` (via `llama_dispatch.cpp`) |
+| `llamafile/llamafile/main.cpp` (via `llama_dispatch.cpp`) | `llama_dispatch()` |
 | `whisperfile/whisperfile.cpp` | `-Dmain=whisperfile_main` |
 | `diffusionfile/diffusionfile.cpp` | `-Dmain=diffusionfile_main` |
+| `transcribefile/main.cpp` | `-Dmain=transcribefile_main` |
 
 `argv[1]` is consumed by the dispatcher; the remainder passes verbatim to
 the chosen backend.
 
 ---
 
-
----
-# Custom Build Options
+## Custom Build Options
 
 ### build-time engine toggles:
 make MODE=rel CHIMERAFILE_WITH_WHISPER=0               # exclude whisper
 make MODE=rel CHIMERAFILE_WITH_DIFFUSION=0              # exclude diffusion
-make MODE=rel CHIMERAFILE_WITH_WHISPER=0 CHIMERAFILE_WITH_DIFFUSION=0  # llama only
+make MODE=rel CHIMERAFILE_WITH_TRANSCRIBE=0             # exclude transcribe
+make MODE=rel CHIMERAFILE_WITH_WHISPER=0 CHIMERAFILE_WITH_DIFFUSION=0 CHIMERAFILE_WITH_TRANSCRIBE=0  # llama only
 
 # Disable specific GPU backends:
 make MODE=rel CHIMERAFILE_WITH_VULKAN=0                # skip Vulkan
@@ -196,8 +205,8 @@ However, this has not yet been tested within chimerafile itself.
 ## Roadmap
 
 - **v0.1** — llama + whisper dispatch
-- **v0.2** — diffusion image generation (`stable-diffusion.cpp` backend, single GGML, GPU compat shim)
-- **v0.3** — support for further, optional backends is planned
+- **v0.2** — diffusion image generation (custom stable-diffusion.cpp backend, GPU compat shim)
+- **v0.3** — aligned with llamafile v0.10.6: upstream diffusionfile pattern, transcribe engine, CI builds the pinned submodule
 
 ## License
 

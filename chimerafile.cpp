@@ -30,7 +30,7 @@ static void print_banner(void) {
         "░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░      ░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░      ░▒▓█▓▒░▒▓█▓▒░      ░▒▓█▓▒░       \n"
         " ░▒▓██████▓▒░░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░░▒▓█▓▒░▒▓████████▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░      ░▒▓█▓▒░▒▓████████▓▒░▒▓████████▓▒░\n"
         "\n"
-        "  chimerafile v" CHIMERAFILE_VERSION_STRING "  —  llama + whisper + diffusion in one APE\n"
+        "  chimerafile v" CHIMERAFILE_VERSION_STRING "  —  llama + whisper + diffusion + transcribe in one APE\n"
         "\n"
     );
 }
