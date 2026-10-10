@@ -274,8 +274,8 @@ ifeq ($(CHIMERAFILE_WITH_DIFFUSION),1)
 CHIMERAFILE_DIFFUSION_OBJS := \
 	o/$(MODE)/chimerafile/diffusionfile_main.o \
 	o/$(MODE)/third_party/stb/stb.a \
-	o/$(MODE)/stable-diffusion.cpp/stable-diffusion.cpp.a \
 	o/$(MODE)/stable-diffusion.cpp/examples/cli/main.diffusionfile.cpp.o \
+	o/$(MODE)/stable-diffusion.cpp/stable-diffusion.cpp.a \
 	o/$(MODE)/stable-diffusion.cpp/thirdparty/zip.c.o \
 	o/$(MODE)/stable-diffusion.cpp.patches/sd_math_shim.o
 endif
