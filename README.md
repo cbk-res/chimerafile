@@ -114,6 +114,31 @@ make MODE=rel rocm && make MODE=rel
 
 Each produces a `.so` that gets zipaligned into the APE automatically.
 
+### Troubleshooting: "Vulkan is not usable" on SELinux Fedora
+
+On SELinux-enforcing Fedora you may see:
+
+```
+fatal error: --gpu vulkan was explicitly requested but Vulkan is not usable
+on this system
+```
+
+even though `vulkaninfo` lists your GPU. This is a host policy issue, not a
+build issue. Cosmopolitan's `cosmo_dlopen` runs the host `ld-linux`
+in-process; its loader zero-fills a page of the mapped loader before making
+it executable, and SELinux's `file_mprotect` hook then requires the
+`execmod` permission on the loader's file type. Fedora's policy grants
+`unconfined_t` `execmod` on `user_home_t`/`user_tmp_t` but **not** on
+`ld_so_t` (`/lib64`), so the `mprotect` fails with EACCES and the probe
+aborts.
+
+Workaround: relocate the loader into `$HOME` (type `user_home_t`) and point
+the cached `dlopen-helper` at it — the APE reuses the helper when it is newer
+than the binary. This repo ships the fixer at
+`scripts/fix-cosmo-dlopen-selinux.sh` (no root needed); run it after
+rebuilding the APE if the error returns.
+
+
 ---
 
 ## Project Structure
