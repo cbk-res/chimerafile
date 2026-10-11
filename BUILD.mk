@@ -350,7 +350,8 @@ CHIMERAFILE_GPU_SOS := $(wildcard o/$(MODE)/ggml-cuda.so o/$(MODE)/ggml-vulkan.s
 
 # --allow-multiple-definition dedupes stb (llamafile's third_party/stb vs
 # stable-diffusion.cpp's bundled copy) and other benign overlaps.
-o/$(MODE)/chimerafile/chimerafile: $(CHIMERAFILE_ALL_OBJS) $(CHIMERAFILE_GPU_SOS)
+o/$(MODE)/chimerafile/chimerafile: $(CHIMERAFILE_ALL_OBJS) $(CHIMERAFILE_GPU_SOS) \
+	o/$(MODE)/third_party/zipalign/zipalign
 	@mkdir -p $(@D)
 	$(CXX) $(LDFLAGS) -o $@ $(filter %.o %.a,$^) $(LDLIBS) \
 			-Wl,--allow-multiple-definition
