@@ -221,28 +221,22 @@ o/$(MODE)/chimerafile/cosmo_compat.o: transcribefile/cosmo_compat.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-# Renamed copies of the upstream static lib (ggml*/gguf* -> trc_ggml* ...).
-# Cosmopolitan expects a .aarch64/ twin for every fat .a (derived from the
-# x86 path by inserting .aarch64/ before the basename), so both archives
-# get the same rename map.  The host binutils here has no aarch64 support,
-# so we use cosmocc's per-arch objcopy.
-CHIMERA_TRANSCRIBE_SYMS := o/$(MODE)/chimerafile/transcribe.cpp.a.syms
+# Renamed copies of the upstream static lib.  transcribe.cpp vendors its own
+# ggml (0.15.2) which overlaps llama.cpp's GGML (0.20) in both C symbols
+# (ggml_*, gguf_*) and mangled C++ symbols, so we rename the FULL collision
+# set (every symbol the archive also defines elsewhere in the link) to trc_*
+# — see scripts/transcribe-rename-map.sh.  Cosmopolitan expects a .aarch64/
+# twin for every fat .a (derived from the x86 path by inserting .aarch64/
+# before the basename), so both archives get the same map.  The host binutils
+# has no aarch64 support, so we use cosmocc's per-arch objcopy.
+CHIMERA_TRANSCRIBE_MAP := o/$(MODE)/chimerafile/transcribe.cpp.a.map
+CHIMERA_TRANSCRIBE_RENAMED := \
+	o/$(MODE)/chimerafile/transcribe.cpp.a \
+	o/$(MODE)/chimerafile/.aarch64/transcribe.cpp.a
 
-$(CHIMERA_TRANSCRIBE_SYMS): o/$(MODE)/transcribe.cpp/transcribe.cpp.a
-	@nm -g --defined-only $< | awk '$$2 ~ /^[TDB]/ && ($$3 ~ /^ggml/ || $$3 ~ /^gguf/) {print $$3 "\ttrc_" $$3}' | sort -u > $@
-
-# Depends on the .aarch64 twin so it gets built too (it is not on the link
-# line itself — cosmocc derives its path from the x86 archive's).
-o/$(MODE)/chimerafile/transcribe.cpp.a: o/$(MODE)/transcribe.cpp/transcribe.cpp.a \
-		o/$(MODE)/chimerafile/.aarch64/transcribe.cpp.a \
-		$(CHIMERA_TRANSCRIBE_SYMS)
-	@mkdir -p $(@D)
-	@$(COSMOCC)/bin/x86_64-linux-cosmo-objcopy --redefine-syms=$(CHIMERA_TRANSCRIBE_SYMS) $< $@
-
-o/$(MODE)/chimerafile/.aarch64/transcribe.cpp.a: o/$(MODE)/transcribe.cpp/.aarch64/transcribe.cpp.a \
-		$(CHIMERA_TRANSCRIBE_SYMS)
-	@mkdir -p $(@D)
-	@$(COSMOCC)/bin/aarch64-linux-cosmo-objcopy --redefine-syms=$(CHIMERA_TRANSCRIBE_SYMS) $< $@
+# The rename targets themselves live after CHIMERAFILE_ALL_OBJS is defined,
+# because the map's prerequisites are the rest of that list (prerequisites
+# expand at parse time).
 
 endif  # CHIMERAFILE_WITH_TRANSCRIBE
 
@@ -303,6 +297,28 @@ CHIMERAFILE_ALL_OBJS := \
 	$(LLAMAFILE_DEPS) \
 	$(CHIMERAFILE_DIFFUSION_OBJS) \
 	$(CHIMERAFILE_TRANSCRIBE_OBJS)
+
+ifeq ($(CHIMERAFILE_WITH_TRANSCRIBE),1)
+
+$(CHIMERA_TRANSCRIBE_MAP): o/$(MODE)/transcribe.cpp/transcribe.cpp.a \
+		$(filter-out $(CHIMERA_TRANSCRIBE_RENAMED),$(CHIMERAFILE_ALL_OBJS))
+	@sh $(CHIMERAFILE_DIR)/scripts/transcribe-rename-map.sh $@ \
+		$< $(filter-out $(CHIMERA_TRANSCRIBE_RENAMED),$(CHIMERAFILE_ALL_OBJS))
+
+# Depends on the .aarch64 twin so it gets built too (it is not on the link
+# line itself — cosmocc derives its path from the x86 archive's).
+o/$(MODE)/chimerafile/transcribe.cpp.a: o/$(MODE)/transcribe.cpp/transcribe.cpp.a \
+		o/$(MODE)/chimerafile/.aarch64/transcribe.cpp.a \
+		$(CHIMERA_TRANSCRIBE_MAP)
+	@mkdir -p $(@D)
+	@$(COSMOCC)/bin/x86_64-linux-cosmo-objcopy --redefine-syms=$(CHIMERA_TRANSCRIBE_MAP) $< $@
+
+o/$(MODE)/chimerafile/.aarch64/transcribe.cpp.a: o/$(MODE)/transcribe.cpp/.aarch64/transcribe.cpp.a \
+		$(CHIMERA_TRANSCRIBE_MAP)
+	@mkdir -p $(@D)
+	@$(COSMOCC)/bin/aarch64-linux-cosmo-objcopy --redefine-syms=$(CHIMERA_TRANSCRIBE_MAP) $< $@
+
+endif  # CHIMERAFILE_WITH_TRANSCRIBE
 
 # ==============================================================================
 # GPU backend shared libraries

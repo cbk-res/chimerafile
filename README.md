@@ -147,10 +147,12 @@ ROCm / Metal) for all three engines.
 
 `transcribe.cpp` is the exception: it vendors its own GGML (ggml-org/ggml
 0.15.2), a different version from llama.cpp's GGML (0.20). Rather than
-recompile the whole engine, the transcribe build renames every `ggml*`/
-`gguf*` symbol inside its static library (`objcopy --redefine-syms`,
-see BUILD.mk) so the binary carries one private, isolated copy for the
-transcribe engine. Consequences:
+recompile the whole engine, the transcribe build renames every symbol
+its static library shares with the rest of the binary — C `ggml*`/`gguf*`
+functions *and* the mangled C++ symbols they both define
+(`scripts/transcribe-rename-map.sh`, applied with `objcopy --redefine-syms`)
+— so the binary carries one private, isolated copy for the transcribe
+engine. Consequences:
 
 - no symbol collisions with the shared GGML;
 - the llamafile GPU loaders register with llama.cpp's GGML, so the
