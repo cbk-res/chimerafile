@@ -9,14 +9,309 @@
 // (chat, transcriptions, images) plus chimerafile extensions (/v1/status),
 // routes every request by model id, and keeps loaded models warm for a
 // configurable idle TTL.
+//
+// Config format:
+//
+//   {
+//     "listen": "127.0.0.1:8080",
+//     "key": "optional-bearer-token",
+//     "models": {
+//       "assistant": {
+//         "engine": "llama",
+//         "file": "qwen2.5-0.5b-q4_0.gguf",
+//         "ctx": 4096,
+//         "gpu_layers": -1,
+//         "ttl": 1800,
+//         "pin": false,
+//         "args": ["--temp", "0.7"]
+//       }
+//     }
+//   }
+//
+//   listen     host:port to bind (default 127.0.0.1:8080)
+//   key        optional bearer token; when set, required on all /v1/* routes
+//   engine     llama | whisper | diffusion | transcribe
+//   file       model path; relative paths resolve against the config file's dir
+//   ctx        llama only — context size (default 4096)
+//   gpu_layers llama only — layers on GPU, -1 = all, 0 = CPU (default -1)
+//   ttl        idle seconds before unload; omitted = engine default
+//              (30m llama, 5m others); 0 = never
+//   pin        true = never unload, never evict
+//   args       engine flags passed through verbatim (llama.cpp options for
+//              llama: --ctk, --ctv, --temp, ...)
 
+#include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <string>
+#include <vector>
+
+#include <nlohmann/json.hpp>
+
+namespace serve {
+
+enum class EngineKind { Llama, Whisper, Diffusion, Transcribe };
+
+inline const char *engine_name(EngineKind e) {
+    switch (e) {
+        case EngineKind::Llama:      return "llama";
+        case EngineKind::Whisper:    return "whisper";
+        case EngineKind::Diffusion:  return "diffusion";
+        case EngineKind::Transcribe: return "transcribe";
+    }
+    return "?";
+}
+
+// Engine defaults: the user-facing contract is 30 min for LLMs, 5 min for
+// everything else.
+inline int default_ttl(EngineKind e) {
+    return e == EngineKind::Llama ? 1800 : 300;
+}
+
+struct ModelEntry {
+    std::string id;
+    EngineKind engine = EngineKind::Llama;
+    std::string file;       // resolved
+    int ctx = 4096;         // llama
+    int gpu_layers = -1;    // llama
+    int ttl = -1;           // idle seconds; -1 = engine default, 0 = never
+    bool pinned = false;
+    std::vector<std::string> args;
+};
+
+struct Config {
+    std::string host = "127.0.0.1";
+    int port = 8080;
+    std::string key;                 // empty = no auth
+    std::vector<ModelEntry> models;
+
+    const ModelEntry *find(const std::string &id) const {
+        for (const auto &m : models)
+            if (m.id == id) return &m;
+        return nullptr;
+    }
+};
+
+// ── Helpers ──────────────────────────────────────────────────────────────
+
+static std::string to_lower(std::string s) {
+    for (char &c : s) c = (char)tolower((unsigned char)c);
+    return s;
+}
+
+static bool parse_engine(const std::string &s, EngineKind &out) {
+    std::string e = to_lower(s);
+    if (e == "llama")      { out = EngineKind::Llama;      return true; }
+    if (e == "whisper")    { out = EngineKind::Whisper;    return true; }
+    if (e == "diffusion")  { out = EngineKind::Diffusion;  return true; }
+    if (e == "transcribe") { out = EngineKind::Transcribe; return true; }
+    return false;
+}
+
+static std::string fmt_ttl(int secs, EngineKind e) {
+    if (secs < 0) secs = default_ttl(e);
+    if (secs == 0) return "never";
+    char buf[32];
+    if (secs < 60)                snprintf(buf, sizeof buf, "%ds", secs);
+    else if (secs % 3600 == 0)    snprintf(buf, sizeof buf, "%dh", secs / 3600);
+    else if (secs % 60 == 0)      snprintf(buf, sizeof buf, "%dm", secs / 60);
+    else                          snprintf(buf, sizeof buf, "%ds", secs);
+    return buf;
+}
+
+static bool parse_listen(const std::string &s, Config &cfg, std::string &err) {
+    size_t colon = s.rfind(':');
+    std::string host = "127.0.0.1", port_s = "8080";
+    if (colon == std::string::npos) {
+        port_s = s;
+    } else {
+        host = s.substr(0, colon);
+        port_s = s.substr(colon + 1);
+        if (host.empty()) host = "127.0.0.1";
+    }
+    if (port_s.empty()) {
+        err = "listen: missing port in '" + s + "'";
+        return false;
+    }
+    for (char c : port_s)
+        if (!isdigit((unsigned char)c)) {
+            err = "listen: bad port in '" + s + "'";
+            return false;
+        }
+    int port = atoi(port_s.c_str());
+    if (port <= 0 || port > 65535) {
+        err = "listen: port out of range in '" + s + "'";
+        return false;
+    }
+    cfg.host = host;
+    cfg.port = port;
+    return true;
+}
+
+// ── Config parsing ───────────────────────────────────────────────────────
+
+inline bool parse_config(const char *path, Config &cfg, std::string &err) {
+    std::ifstream f(path);
+    if (!f) {
+        err = std::string("cannot open config file '") + path + "'";
+        return false;
+    }
+
+    nlohmann::json j;
+    try {
+        j = nlohmann::json::parse(f);
+    } catch (const nlohmann::json::exception &e) {
+        err = std::string("config parse error: ") + e.what();
+        return false;
+    }
+    if (!j.is_object()) {
+        err = "config root must be a JSON object";
+        return false;
+    }
+
+    // Directory of the config file, for relative model paths.
+    std::string dir;
+    {
+        const char *slash = strrchr(path, '/');
+        if (slash)
+            dir = std::string(path, (size_t)(slash - path + 1));
+    }
+
+    if (j.contains("listen")) {
+        if (!j["listen"].is_string()) {
+            err = "listen must be a string (host:port)";
+            return false;
+        }
+        if (!parse_listen(j["listen"].get<std::string>(), cfg, err))
+            return false;
+    }
+
+    if (j.contains("key")) {
+        if (!j["key"].is_string()) {
+            err = "key must be a string";
+            return false;
+        }
+        cfg.key = j["key"].get<std::string>();
+    }
+
+    if (!j.contains("models") || !j["models"].is_object() || j["models"].empty()) {
+        err = "config must contain a non-empty 'models' object";
+        return false;
+    }
+
+    for (auto &el : j["models"].items()) {
+        const nlohmann::json &v = el.value();
+        if (!v.is_object()) {
+            err = "models." + el.key() + ": must be an object";
+            return false;
+        }
+
+        ModelEntry m;
+        m.id = el.key();
+
+        if (!v.contains("engine") || !v["engine"].is_string()) {
+            err = "models." + m.id + ": missing 'engine' (llama|whisper|diffusion|transcribe)";
+            return false;
+        }
+        if (!parse_engine(v["engine"].get<std::string>(), m.engine)) {
+            err = "models." + m.id + ": unknown engine '" + v["engine"].get<std::string>() + "'";
+            return false;
+        }
+
+        if (!v.contains("file") || !v["file"].is_string() ||
+            v["file"].get<std::string>().empty()) {
+            err = "models." + m.id + ": missing 'file'";
+            return false;
+        }
+        m.file = v["file"].get<std::string>();
+        if (m.file[0] != '/')
+            m.file = dir + m.file;
+        FILE *mf = fopen(m.file.c_str(), "r");
+        if (!mf) {
+            err = "models." + m.id + ": cannot open model file '" + m.file + "'";
+            return false;
+        }
+        fclose(mf);
+
+        if (v.contains("ctx")) {
+            if (!v["ctx"].is_number_integer() || v["ctx"].get<int>() < 8) {
+                err = "models." + m.id + ": 'ctx' must be an integer >= 8";
+                return false;
+            }
+            m.ctx = v["ctx"].get<int>();
+        }
+        if (v.contains("gpu_layers")) {
+            if (!v["gpu_layers"].is_number_integer() ||
+                v["gpu_layers"].get<int>() < -1) {
+                err = "models." + m.id + ": 'gpu_layers' must be an integer >= -1";
+                return false;
+            }
+            m.gpu_layers = v["gpu_layers"].get<int>();
+        }
+        if (v.contains("ttl")) {
+            if (!v["ttl"].is_number_integer() || v["ttl"].get<int>() < 0) {
+                err = "models." + m.id + ": 'ttl' must be an integer >= 0 (seconds)";
+                return false;
+            }
+            m.ttl = v["ttl"].get<int>();
+        }
+        if (v.contains("pin")) {
+            if (!v["pin"].is_boolean()) {
+                err = "models." + m.id + ": 'pin' must be a boolean";
+                return false;
+            }
+            m.pinned = v["pin"].get<bool>();
+        }
+        if (v.contains("args")) {
+            if (!v["args"].is_array()) {
+                err = "models." + m.id + ": 'args' must be an array of strings";
+                return false;
+            }
+            for (const auto &a : v["args"]) {
+                if (!a.is_string()) {
+                    err = "models." + m.id + ": 'args' entries must be strings";
+                    return false;
+                }
+                m.args.push_back(a.get<std::string>());
+            }
+        }
+
+        cfg.models.push_back(std::move(m));
+    }
+
+    return true;
+}
+
+} // namespace serve
+
+// ── Entry point ──────────────────────────────────────────────────────────
 
 static void print_serve_usage(FILE *f, const char *prog) {
     fprintf(f, "usage: %s serve --config FILE\n\n", prog);
     fprintf(f, "  FILE    declarative server config (JSON)\n");
     fprintf(f, "          see README.md for the format\n");
+}
+
+static void print_config_summary(const serve::Config &cfg) {
+    fprintf(stderr, "serve: listen %s:%d\n", cfg.host.c_str(), cfg.port);
+    fprintf(stderr, "serve: key %s\n", cfg.key.empty() ? "(none)" : "(set)");
+    fprintf(stderr, "serve: models\n");
+    for (const auto &m : cfg.models) {
+        fprintf(stderr, "  %-14s %-10s %s",
+                m.id.c_str(), serve::engine_name(m.engine), m.file.c_str());
+        if (m.engine == serve::EngineKind::Llama) {
+            fprintf(stderr, "  ctx=%d", m.ctx);
+            if (m.gpu_layers != -1)
+                fprintf(stderr, " gpu_layers=%d", m.gpu_layers);
+        }
+        fprintf(stderr, "  ttl=%s", serve::fmt_ttl(m.ttl, m.engine).c_str());
+        if (m.pinned)
+            fprintf(stderr, " pinned");
+        if (!m.args.empty())
+            fprintf(stderr, " args(%zu)", m.args.size());
+        fprintf(stderr, "\n");
+    }
 }
 
 int serve_main(int argc, char **argv) {
@@ -43,13 +338,14 @@ int serve_main(int argc, char **argv) {
         return 1;
     }
 
-    FILE *f = fopen(config, "r");
-    if (!f) {
-        fprintf(stderr, "error: cannot open config file '%s'\n", config);
+    serve::Config cfg;
+    std::string err;
+    if (!serve::parse_config(config, cfg, err)) {
+        fprintf(stderr, "error: %s\n", err.c_str());
         return 1;
     }
-    fclose(f);
 
-    fprintf(stderr, "serve: config '%s' — engine routing lands in the next steps\n", config);
+    print_config_summary(cfg);
+    fprintf(stderr, "serve: config ok — engine routing lands in the next steps\n");
     return 0;
 }
