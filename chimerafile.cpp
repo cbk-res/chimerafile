@@ -54,6 +54,7 @@ static void print_engines(void) {
 #else
     fprintf(stderr, "    transcribe — (not built; set CHIMERAFILE_WITH_TRANSCRIBE=1)\n");
 #endif
+    fprintf(stderr, "    serve      — OpenAI-compatible server (registry, TTL, one port)\n");
     fprintf(stderr, "\n");
 }
 
@@ -99,6 +100,7 @@ extern int diffusionfile_main(int argc, char **argv);
 #ifndef CHIMERAFILE_NO_TRANSCRIBE
 extern int transcribefile_main(int argc, char **argv);
 #endif
+extern int serve_main(int argc, char **argv);
 
 // ── Usage ──────────────────────────────────────────────────────────────────
 
@@ -115,6 +117,7 @@ static void print_usage(FILE *f, const char *prog) {
 #ifndef CHIMERAFILE_NO_TRANSCRIBE
     fprintf(f, "  %s transcribe -m model.bin -f audio.wav\n", prog);
 #endif
+    fprintf(f, "  %s serve      --config serve.json\n", prog);
     fprintf(f, "  %s --version\n\n", prog);
     fprintf(f, "Pass --help after the engine name for engine-specific help:\n");
     fprintf(f, "  %s llama      --help\n", prog);
@@ -213,6 +216,9 @@ int main(int argc, char **argv) {
     if (strcmp(engine, "transcribe") == 0)
         return transcribefile_main(argc, argv);
 #endif
+
+    if (strcmp(engine, "serve") == 0)
+        return serve_main(argc, argv);
 
     fprintf(stderr, "chimerafile: unknown engine '%s'\n\n", engine);
     print_usage(stderr, argv[0]);
