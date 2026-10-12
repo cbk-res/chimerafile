@@ -11,6 +11,7 @@
 #include <cosmo.h>
 #include <stdio.h>
 #include <string.h>
+#include <dlfcn.h>
 
 #include "llamafile/llamafile.h"
 
@@ -128,6 +129,29 @@ static void print_usage(FILE *f, const char *prog) {
 #endif
 }
 
+// ── Host-glibc heap isolation ─────────────────────────────────────────────
+//
+// cosmo_dlopen() runs the host's ld-linux inside this APE. The host glibc then
+// initialises its brk-based heap from the process brk, which sits at the base
+// of this APE's own reserved heap arena (the ~30 GB region right after the
+// data segment). Under sustained allocation (e.g. diffusion + the Vulkan
+// driver) the two heap managers interleave in the same region and corrupt
+// each other, destroying the in-process loader's link_map and segfaulting in
+// _dl_fixup() on the next lazy PLT binding. Routing every host-glibc
+// allocation through mmap (M_MMAP_THRESHOLD = 0) keeps the host heap out of
+// the shared brk region and prevents the collision.
+static void isolate_host_glibc_heap(void) {
+#if defined(__linux__)
+    void *libc = cosmo_dlopen("libc.so.6", RTLD_LAZY);
+    if (libc) {
+        typedef int (*mallopt_fn)(int, int);
+        mallopt_fn host_mallopt = (mallopt_fn)cosmo_dlsym(libc, "mallopt");
+        if (host_mallopt)
+            host_mallopt(1 /* M_MMAP_THRESHOLD */, 0);
+    }
+#endif
+}
+
 // ── Entry point ────────────────────────────────────────────────────────────
 
 int main(int argc, char **argv) {
@@ -150,8 +174,8 @@ int main(int argc, char **argv) {
     }
 
     // ── GPU backend loading ──────────────────────────────────────────
-    if (FLAG_gpu != LLAMAFILE_GPU_DISABLE)
-        llamafile_has_gpu();
+    if (FLAG_gpu != LLAMAFILE_GPU_DISABLE && llamafile_has_gpu())
+        isolate_host_glibc_heap();
 
     // ── Banner (skip for --version, show for everything else) ────────
     print_banner();
