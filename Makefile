@@ -43,8 +43,36 @@ SUBMAKE = $(MAKE) -C $(LLAMAFILE) \
 	CHIMERAFILE_WITH_DIFFUSION=$(CHIMERAFILE_WITH_DIFFUSION) \
 	CHIMERAFILE_WITH_TRANSCRIBE=$(CHIMERAFILE_WITH_TRANSCRIBE)
 
+# ── Setup-state verification ────────────────────────────────────
+# 'make setup' patches the pinned submodule trees in place, so a correctly
+# set up tree is dirty by design.  setup-baseline/ records exactly what that
+# dirt looks like (content-hashed); verify-setup.sh runs before every build
+# and fails loudly on any drift (stray edits, stray files, moved checkouts).
+
+.PHONY: verify-setup
+verify-setup:
+	@$(CHIMERAFILE_REPO)/scripts/verify-setup.sh
+
+.PHONY: record-baselines
+record-baselines:
+	@$(CHIMERAFILE_REPO)/scripts/record-setup-baseline.sh
+
+.PHONY: fresh
+fresh: # Reset the submodule trees to the pinned state, re-apply setup, rebuild
+	@echo "==> Resetting submodule trees to the pinned state..."
+	@$(CHIMERAFILE_REPO)/scripts/reset-submodules.sh
+	@echo "==> Removing build output..."
+	$(MAKE) -C $(LLAMAFILE) clean
+	@echo "==> Re-applying setup (copied files, patches)..."
+	$(MAKE) -C $(LLAMAFILE) setup
+	@echo "==> Recording setup baselines..."
+	@$(CHIMERAFILE_REPO)/scripts/record-setup-baseline.sh
+	@echo "==> Building from the known state..."
+	$(MAKE) all
+
 .PHONY: all
 all:
+	@$(CHIMERAFILE_REPO)/scripts/verify-setup.sh
 	@echo "==> Attempting GPU backend builds (optional)..."
 	@if [ "$(CHIMERAFILE_WITH_CUDA)" = "1" ]; then \
 		cd $(LLAMAFILE) && OUTPUT="$(LLAMAFILE)/o/$(MODE)/ggml-cuda.so" \
@@ -81,6 +109,8 @@ setup:
 		fi
 	@echo "==> Running llamafile setup (cosmocc, patches, nested submodules)..."
 	$(MAKE) -C $(LLAMAFILE) setup
+	@echo "==> Recording setup baselines..."
+	@$(CHIMERAFILE_REPO)/scripts/record-setup-baseline.sh
 	@echo ""
 	@echo "==> Setup complete. Run: make"
 
@@ -94,6 +124,7 @@ install: all
 
 .PHONY: bundle
 bundle:
+	@$(CHIMERAFILE_REPO)/scripts/verify-setup.sh
 	@echo "==> Bundle build: GPU backends + chimerafile"
 	@if [ "$(CHIMERAFILE_WITH_CUDA)" = "1" ]; then \
 		cd $(LLAMAFILE) && OUTPUT="$(LLAMAFILE)/o/$(MODE)/ggml-cuda.so" \
@@ -115,4 +146,5 @@ distclean:
 	$(MAKE) -C $(LLAMAFILE) distclean
 
 %:
+	@$(CHIMERAFILE_REPO)/scripts/verify-setup.sh
 	$(SUBMAKE) $@

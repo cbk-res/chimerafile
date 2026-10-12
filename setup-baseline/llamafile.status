@@ -1,0 +1,4 @@
+gitlink 0177dcc7300bad8914bb838baabce87899812491	llama.cpp
+gitlink 2eeeba56e9edd762b4b38467bab96c2517163158	whisper.cpp
+gitlink baf7eda1e4eeeefb87a2ca4ad0257977b95cf538	stable-diffusion.cpp
+gitlink df1a4adfb1aec59e399a20dd992f93925eb09f25	transcribe.cpp

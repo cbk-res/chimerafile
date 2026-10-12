@@ -112,6 +112,13 @@ make MODE=rel rocm && make MODE=rel
 
 Each produces a `.so` that gets zipaligned into the APE automatically.
 
+**Vulkan gotcha:** the shader compiler `glslc` must be on your `PATH` (or set
+`GLSLC=/path/to/glslc`) — with neither available, `vulkan.sh` fails *silently*
+and the build continues with a CPU-only APE. If you installed the SDK to a
+non-standard prefix, also export `VULKAN_SDK=/prefix/usr` so the SPIR-V
+headers are found (e.g. from unpacked F44 RPMs:
+`VULKAN_SDK=/tmp/vulksdk/root/usr GLSLC=/tmp/vulksdk/root/usr/bin/glslc`).
+
 ### Troubleshooting: "Vulkan is not usable" on SELinux Fedora
 
 On SELinux-enforcing Fedora you may see:
@@ -218,6 +225,25 @@ make MODE=rel CHIMERAFILE_WITH_WHISPER=0 CHIMERAFILE_WITH_DIFFUSION=0 CHIMERAFIL
 # Disable specific GPU backends:
 make MODE=rel CHIMERAFILE_WITH_VULKAN=0                # skip Vulkan
 make MODE=rel CHIMERAFILE_WITH_CUDA=0 CHIMERAFILE_WITH_ROCM=0  # skip CUDA + ROCm
+
+### Submodule state — baselines and `make fresh`
+
+The llamafile submodule is pinned to an upstream commit and `make setup`
+patches its nested submodules **in place** (the `.patches` apply as
+working-tree changes), so a correctly set up tree is *dirty by design*.
+`setup-baseline/` records exactly what that dirt looks like — content-hashed
+per file — and every build first runs `scripts/verify-setup.sh`, which fails
+loudly on any drift: stray edits (even to files setup already patches), stray
+files, or moved checkouts.
+
+```sh
+make verify-setup   # check the submodule state only
+make fresh          # reset trees to the pins, re-apply setup, wipe o/, full rebuild
+```
+
+`make setup` and `make fresh` re-record the baselines automatically. If you
+deliberately change the pinned state (new llamafile commit, new patches),
+re-run setup and commit the updated `setup-baseline/`.
 
 ## Bundling a model (optional)
 

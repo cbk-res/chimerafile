@@ -1,0 +1,9 @@
+0e33ca7d00d558cda59e5efccab8cf494f372818	ggml/src/ggml-backend-meta.cpp
+11256cb5f035a86880be83fe4f867a1ed63aed8b	ggml/src/ggml-backend-impl.h
+45a46e4ffb5ead4b193a2315279a4aadacc0ae2e	ggml/src/ggml-cpu/repack.cpp
+6b8be63b1243c595ca53bf02c89fcbe09ca0744a	examples/cli/main.cpp
+6ef15f5cd6d8c43f01f0e9293bb7780b314312e3	BUILD.mk
+ae385493117a9ad5e430c899dffe99826a66f02e	ggml/src/ggml-backend.cpp
+cbab5465210d4e0c2ead919d9d3c4c043d83fb86	ggml/src/ggml-cpu/ggml-cpu.cpp
+d28a68fa5e65cce753fca870545dbea1cb67eaa1	ggml/include/ggml-backend.h
+de73579d95cefd10200b3ec23543ad289be66dc5	ggml/include/ggml-cpu.h

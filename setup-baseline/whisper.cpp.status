@@ -1,0 +1,7 @@
+4683dba40c10e8b8b5658fc50538b91a110588f8	ggml/src/ggml-backend-reg.cpp
+54258aa39028bf1117667780e1fcf28b68391978	examples/server/server.cpp
+6a61425d1bd8f432273cf81c12734b4de99a1c9b	examples/cli/cli.cpp
+898f35e79ded2ab3aef7e63b7cd72592aed1f226	BUILD.mk
+d53409d7c969af087fc78229eb872bf35038e191	examples/miniaudio.h
+deleted	Makefile
+f7a4eb8ab948111f3e46b1e71d3e4402b466ddd1	examples/common.cpp
