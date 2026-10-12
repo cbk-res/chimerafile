@@ -138,6 +138,19 @@ than the binary. This repo ships the fixer at
 `scripts/fix-cosmo-dlopen-selinux.sh` (no root needed); run it after
 rebuilding the APE if the error returns.
 
+### Diffusion (Vulkan) segfault at image save — fixed in the APE
+
+A `--gpu vulkan` diffusion run used to complete generation ("generate_image
+completed") then segfault in the host loader's `_dl_fixup` while writing the
+PNG. Cause: `cosmo_dlopen` runs the host `ld-linux` in-process, and the host
+glibc initialises its **brk-based** heap from the process brk — which sits at
+the base of this APE's own reserved heap arena. Under sustained allocation
+(the 2.7 GB SD model + Vulkan driver) the two heap managers interleave in the
+same region and corrupt each other, destroying the loader's `link_map`. The
+dispatcher now calls the host `mallopt(M_MMAP_THRESHOLD, 0)` right after a GPU
+backend loads, routing every host-glibc allocation through `mmap` and keeping
+it out of the shared brk region. Nothing to do — it's built in.
+
 
 ---
 
