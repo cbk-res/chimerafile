@@ -11,7 +11,7 @@ A unified inference binary that combines **llamafile** (LLM), **whisperfile** (s
 ./chimerafile transcribe [transcribefile args...]
 ```
 
-All engines share one **llama.cpp GGML runtime** (whisper and stable-diffusion.cpp are compiled against it; transcribe.cpp keeps its own private copy — see below), reducing duplication for projects that would otherwise bundle several standalone 'llamafiles'. GPU backends (Vulkan, CUDA, ROCm, Metal) are bundled as `.so` files inside the APE and loaded at runtime.
+All engines share one **llama.cpp GGML runtime** (whisper, stable-diffusion.cpp and transcribe.cpp are all compiled against it), reducing duplication for projects that would otherwise bundle several standalone 'llamafiles'. GPU backends (Vulkan, CUDA, ROCm, Metal) are bundled as `.so` files inside the APE and loaded at runtime.
 
 ---
 
@@ -77,15 +77,13 @@ Modes (`-M`): `img_gen` (default), `vid_gen`, `upscale`, `convert`, `metadata`.
 ./chimerafile transcribe -m model.gguf -l en audio.wav
 ./chimerafile transcribe --help
 ```
-Note: the transcribe engine runs on its own private GGML copy (see below)
-and is therefore CPU-only.
 
 ---
 
 ## GPU Backends
 
-GPU acceleration for the llama/whisper/diffusion engines is automatic — no
-flags needed. Use `--gpu` to override:
+GPU acceleration for all engines (llama, whisper, diffusion, transcribe) is
+automatic — no flags needed. Use `--gpu` to override:
 
 ```sh
 # Central flag (applies to all engines):
@@ -175,26 +173,22 @@ chimerafile/                    ← this repo (chimerafile layer only)
     └── transcribe.cpp/         ← ASR backend (nested submodule)
 ```
 
-### Single GGML — mostly
+### Single GGML
 
-`llamafile`, `whisperfile` and `diffusionfile` share **llama.cpp's GGML**:
-whisper.cpp's core/common sources are recompiled against llama.cpp's GGML
-headers, and stable-diffusion.cpp is built by the upstream diffusionfile
-package against the same GGML — one GPU-capable runtime (Vulkan / CUDA /
-ROCm / Metal) for all three engines.
+All four engines share **llama.cpp's GGML** — one GPU-capable runtime
+(Vulkan / CUDA / ROCm / Metal) for everything:
 
-`transcribe.cpp` is the exception: it vendors its own GGML (ggml-org/ggml
-0.15.2), a different version from llama.cpp's GGML (0.20). Rather than
-recompile the whole engine, the transcribe build renames every symbol
-its static library shares with the rest of the binary — C `ggml*`/`gguf*`
-functions *and* the mangled C++ symbols they both define
-(`scripts/transcribe-rename-map.sh`, applied with `objcopy --redefine-syms`)
-— so the binary carries one private, isolated copy for the transcribe
-engine. Consequences:
-
-- no symbol collisions with the shared GGML;
-- the llamafile GPU loaders register with llama.cpp's GGML, so the
-  transcribe engine stays CPU-only in this build.
+- `whisperfile`: whisper.cpp's core/common sources are recompiled against
+  llama.cpp's GGML headers.
+- `diffusionfile`: stable-diffusion.cpp is built by the upstream
+  diffusionfile package against the same GGML.
+- `transcribefile`: transcribe.cpp vendors its own GGML (ggml-org/ggml
+  0.15.2), a different version from llama.cpp's (0.20), so chimerafile
+  builds transcribe's library sources directly against llama.cpp's GGML
+  (`BUILD.mk`) instead of using the upstream `transcribe.cpp.a` (which
+  bundles the private copy). The llamafile submodule stays untouched —
+  its transcribe build is never run or linked — and the transcribe
+  engine uses the same bundled GPU backends as the rest.
 
 ### Dispatch model
 
@@ -246,6 +240,7 @@ However, this has not yet been tested within chimerafile itself.
 
 - **v0.1** — llama + whisper dispatch
 - **v0.2** — diffusion image generation (custom stable-diffusion.cpp backend, GPU compat shim)
+- **v0.2.99** — diffusion Vulkan save-crash fix (host glibc heap routed via mmap); transcribe ported onto the shared GGML — all four engines GPU-capable from one backend
 - **v0.3** — aligned with llamafile v0.10.6: upstream diffusionfile pattern, transcribe engine, CI builds the pinned submodule
 
 ## License

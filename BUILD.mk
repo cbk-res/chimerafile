@@ -173,13 +173,12 @@ endif  # CHIMERAFILE_WITH_DIFFUSION
 # ==============================================================================
 # Transcribe (transcribe.cpp) backend
 # ==============================================================================
-# transcribe.cpp ships its OWN vendored ggml (ggml-org/ggml 0.15.2), a
-# different version from llama.cpp's GGML (0.20).  To keep one shared GGML
-# for the llama/whisper/diffusion engines, we rename every ggml*/gguf*
-# symbol in transcribe.cpp.a (objcopy --redefine-syms) so the transcribe
-# engine runs on its own private copy instead.  As in upstream transcribefile,
-# it stays CPU-only: llamafile's runtime GPU loaders register with
-# llama.cpp's GGML, not with this one.
+# transcribe.cpp ships its OWN vendored ggml, a different version from
+# llama.cpp's shared GGML.  To keep a single shared GGML — and therefore one
+# set of bundled GPU backends — for every engine, we build transcribe's
+# library sources here against llama.cpp's GGML instead of using upstream's
+# transcribe.cpp.a (which bundles the private, CPU-only copy).  The llamafile
+# submodule stays untouched: its transcribe.cpp.a is never built or linked.
 
 ifeq ($(CHIMERAFILE_WITH_TRANSCRIBE),1)
 
@@ -221,22 +220,61 @@ o/$(MODE)/chimerafile/cosmo_compat.o: transcribefile/cosmo_compat.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-# Renamed copies of the upstream static lib.  transcribe.cpp vendors its own
-# ggml (0.15.2) which overlaps llama.cpp's GGML (0.20) in both C symbols
-# (ggml_*, gguf_*) and mangled C++ symbols, so we rename the FULL collision
-# set (every symbol the archive also defines elsewhere in the link) to trc_*
-# — see scripts/transcribe-rename-map.sh.  Cosmopolitan expects a .aarch64/
-# twin for every fat .a (derived from the x86 path by inserting .aarch64/
-# before the basename), so both archives get the same map.  The host binutils
-# has no aarch64 support, so we use cosmocc's per-arch objcopy.
-CHIMERA_TRANSCRIBE_MAP := o/$(MODE)/chimerafile/transcribe.cpp.a.map
-CHIMERA_TRANSCRIBE_RENAMED := \
-	o/$(MODE)/chimerafile/transcribe.cpp.a \
-	o/$(MODE)/chimerafile/.aarch64/transcribe.cpp.a
+# transcribe.cpp's library sources, built against the SHARED llama.cpp GGML
+# (llama.cpp/ggml) rather than via upstream's transcribe.cpp.a, which bundles
+# a private vendored ggml that cannot use the bundled GPU backends.  The source
+# set is exactly upstream's TRANSCRIBE_LIB_SRCS (all of transcribe.cpp/src,
+# including the vendored miniz).  The ggml_* / ggml_backend_* references resolve
+# against the shared GGML already in the link, so transcribe can use the same
+# bundled backends (Vulkan et al.) as the other engines.
+CHIMERA_TRANSCRIBE_SRCS := $(shell find transcribe.cpp/src -name '*.cpp' -o -name '*.c' | sort)
+CHIMERA_TRANSCRIBE_SRCS_CPP := $(filter %.cpp, $(CHIMERA_TRANSCRIBE_SRCS))
+CHIMERA_TRANSCRIBE_SRCS_C := $(filter %.c, $(CHIMERA_TRANSCRIBE_SRCS))
+CHIMERA_TRANSCRIBE_OBJS := \
+	$(CHIMERA_TRANSCRIBE_SRCS_CPP:transcribe.cpp/%.cpp=o/$(MODE)/chimerafile/transcribe/%.cpp.o) \
+	$(CHIMERA_TRANSCRIBE_SRCS_C:transcribe.cpp/%.c=o/$(MODE)/chimerafile/transcribe/%.c.o)
 
-# The rename targets themselves live after CHIMERAFILE_ALL_OBJS is defined,
-# because the map's prerequisites are the rest of that list (prerequisites
-# expand at parse time).
+CHIMERA_TRANSCRIBE_INCS := \
+	-iquote transcribe.cpp/include \
+	-iquote transcribe.cpp/src \
+	-iquote llama.cpp/ggml/include \
+	-iquote llama.cpp/ggml/src \
+	-isystem $(COSMOCC)/include/third_party/zlib
+
+# Mirrors upstream's TRANSCRIBE_LIB_CPPFLAGS (see
+# transcribe.cpp.patches/llamafile-files/BUILD.mk).  -DGGML_MULTIPLATFORM keeps
+# the GGML_CALL backend-interface ABI identical to the shared GGML and the GPU
+# dylibs; MINIZ_NO_* trims the vendored miniz to the compress-only path.
+CHIMERA_TRANSCRIBE_CPPFLAGS := \
+	-DCOSMOCC=1 \
+	-DGGML_MULTIPLATFORM \
+	-DTRANSCRIBE_BUILD \
+	-DGGML_SCHED_MAX_COPIES=4 \
+	-DMINIZ_NO_INFLATE_APIS \
+	-DMINIZ_NO_STDIO \
+	-DMINIZ_NO_TIME \
+	-DMINIZ_NO_ZLIB_COMPATIBLE_NAMES
+
+# Static pattern rules (same idiom as the submodule BUILD.mk): the explicit
+# per-target rules win over the global o/$(MODE)/%.cpp.o pattern in
+# build/rules.mk, which would compile these with the default include paths.
+$(CHIMERA_TRANSCRIBE_SRCS_CPP:transcribe.cpp/%.cpp=o/$(MODE)/chimerafile/transcribe/%.cpp.o): \
+		o/$(MODE)/chimerafile/transcribe/%.cpp.o: transcribe.cpp/%.cpp
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) \
+		$(CHIMERA_TRANSCRIBE_INCS) \
+		$(CHIMERA_TRANSCRIBE_CPPFLAGS) \
+		-c -o $@ $<
+
+# Vendored miniz.c uses third-party style that trips strict warnings;
+# silence them for this one file (upstream does the same via -w).
+$(CHIMERA_TRANSCRIBE_SRCS_C:transcribe.cpp/%.c=o/$(MODE)/chimerafile/transcribe/%.c.o): \
+		o/$(MODE)/chimerafile/transcribe/%.c.o: transcribe.cpp/%.c
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) \
+		$(CHIMERA_TRANSCRIBE_INCS) \
+		$(CHIMERA_TRANSCRIBE_CPPFLAGS) \
+		-w -c -o $@ $<
 
 endif  # CHIMERAFILE_WITH_TRANSCRIBE
 
@@ -281,13 +319,14 @@ endif
 
 CHIMERAFILE_TRANSCRIBE_OBJS :=
 ifeq ($(CHIMERAFILE_WITH_TRANSCRIBE),1)
-# The .o files come before the .a so the renamed ggml members get pulled in.
+# The lib objects are built here against the shared GGML (rules above) rather
+# than via upstream's transcribe.cpp.a (which bundles a private ggml).
 CHIMERAFILE_TRANSCRIBE_OBJS := \
 	o/$(MODE)/chimerafile/transcribefile_main.o \
 	o/$(MODE)/chimerafile/cli.transcribe.cpp.o \
 	o/$(MODE)/chimerafile/wav.cpp.o \
 	o/$(MODE)/chimerafile/cosmo_compat.o \
-	o/$(MODE)/chimerafile/transcribe.cpp.a
+	$(CHIMERA_TRANSCRIBE_OBJS)
 endif
 
 CHIMERAFILE_ALL_OBJS := \
@@ -298,27 +337,6 @@ CHIMERAFILE_ALL_OBJS := \
 	$(CHIMERAFILE_DIFFUSION_OBJS) \
 	$(CHIMERAFILE_TRANSCRIBE_OBJS)
 
-ifeq ($(CHIMERAFILE_WITH_TRANSCRIBE),1)
-
-$(CHIMERA_TRANSCRIBE_MAP): o/$(MODE)/transcribe.cpp/transcribe.cpp.a \
-		$(filter-out $(CHIMERA_TRANSCRIBE_RENAMED),$(CHIMERAFILE_ALL_OBJS))
-	@sh $(CHIMERAFILE_DIR)/scripts/transcribe-rename-map.sh $@ \
-		$< $(filter-out $(CHIMERA_TRANSCRIBE_RENAMED),$(CHIMERAFILE_ALL_OBJS))
-
-# Depends on the .aarch64 twin so it gets built too (it is not on the link
-# line itself — cosmocc derives its path from the x86 archive's).
-o/$(MODE)/chimerafile/transcribe.cpp.a: o/$(MODE)/transcribe.cpp/transcribe.cpp.a \
-		o/$(MODE)/chimerafile/.aarch64/transcribe.cpp.a \
-		$(CHIMERA_TRANSCRIBE_MAP)
-	@mkdir -p $(@D)
-	@$(COSMOCC)/bin/x86_64-linux-cosmo-objcopy --redefine-syms=$(CHIMERA_TRANSCRIBE_MAP) $< $@
-
-o/$(MODE)/chimerafile/.aarch64/transcribe.cpp.a: o/$(MODE)/transcribe.cpp/.aarch64/transcribe.cpp.a \
-		$(CHIMERA_TRANSCRIBE_MAP)
-	@mkdir -p $(@D)
-	@$(COSMOCC)/bin/aarch64-linux-cosmo-objcopy --redefine-syms=$(CHIMERA_TRANSCRIBE_MAP) $< $@
-
-endif  # CHIMERAFILE_WITH_TRANSCRIBE
 
 # ==============================================================================
 # GPU backend shared libraries
