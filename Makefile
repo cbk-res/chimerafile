@@ -25,6 +25,9 @@ endif
 
 MODE ?=
 
+# 'all' stays the default goal even though verify-setup is defined first.
+.DEFAULT_GOAL := all
+
 # ── Build-time toggles (forwarded to submake) ───────────────────────
 CHIMERAFILE_WITH_WHISPER    ?= 1
 CHIMERAFILE_WITH_DIFFUSION  ?= 1

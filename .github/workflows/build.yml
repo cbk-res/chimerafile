@@ -175,9 +175,11 @@ jobs:
       image: rocm/dev-ubuntu-24.04:latest
     steps:
       - name: Install prerequisites
+        # hipblas-dev dropped: rocm.sh links no extra libs (hipcc runtime only),
+        # and the package was removed from newer rocm/dev images anyway.
         run: |
           apt-get update -qq
-          apt-get install -y -qq git unzip hipblas-dev
+          apt-get install -y -qq git unzip
       - uses: actions/checkout@v4
         with:
           submodules: recursive
