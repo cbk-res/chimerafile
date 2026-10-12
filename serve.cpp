@@ -29,7 +29,8 @@
 //   }
 //
 //   listen     host:port to bind (default 127.0.0.1:8080)
-//   key        optional bearer token; when set, required on all /v1/* routes
+//   key        optional bearer token; when set, required on all routes
+//              except /health
 //   engine     llama | whisper | diffusion | transcribe
 //   file       model path; relative paths resolve against the config file's dir
 //   ctx        llama only — context size (default 4096)
@@ -40,14 +41,19 @@
 //   args       engine flags passed through verbatim (llama.cpp options for
 //              llama: --ctk, --ctv, --temp, ...)
 
+#include <atomic>
 #include <cctype>
+#include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <string>
 #include <vector>
+#include <sys/socket.h>
 
 #include <nlohmann/json.hpp>
+#include <cpp-httplib/httplib.h>
 
 namespace serve {
 
@@ -78,6 +84,8 @@ struct ModelEntry {
     int ttl = -1;           // idle seconds; -1 = engine default, 0 = never
     bool pinned = false;
     std::vector<std::string> args;
+
+    int effective_ttl() const { return ttl < 0 ? default_ttl(engine) : ttl; }
 };
 
 struct Config {
@@ -109,8 +117,8 @@ static bool parse_engine(const std::string &s, EngineKind &out) {
     return false;
 }
 
-static std::string fmt_ttl(int secs, EngineKind e) {
-    if (secs < 0) secs = default_ttl(e);
+static std::string fmt_ttl(const ModelEntry &m) {
+    int secs = m.effective_ttl();
     if (secs == 0) return "never";
     char buf[32];
     if (secs < 60)                snprintf(buf, sizeof buf, "%ds", secs);
@@ -283,6 +291,121 @@ inline bool parse_config(const char *path, Config &cfg, std::string &err) {
     return true;
 }
 
+// ── HTTP server ──────────────────────────────────────────────────────────
+
+struct Server {
+    Config cfg;
+    httplib::Server http;
+    time_t start_at = 0;
+
+    explicit Server(Config c) : cfg(std::move(c)) {}
+
+    void register_routes() {
+        // httplib's default socket options set SO_REUSEPORT, which would let
+        // two chimerafile serve instances coexist on one port and silently
+        // split connections between them.  Use SO_REUSEADDR instead: the
+        // kernel then refuses the second bind (our single-instance guard),
+        // while still allowing an immediate re-bind after a restart.
+        http.set_socket_options([](socket_t sock) {
+            int yes = 1;
+            setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
+        });
+
+        // Auth gate: /health stays open (liveness for shell wrappers and the
+        // GUI later); everything else needs the bearer key when one is set.
+        http.set_pre_routing_handler([this](const httplib::Request &req,
+                                            httplib::Response &res)
+                                            -> httplib::Server::HandlerResponse {
+            if (req.path == "/health")
+                return httplib::Server::HandlerResponse::Unhandled;
+            if (!cfg.key.empty()) {
+                const std::string auth = req.get_header_value("Authorization");
+                if (auth != "Bearer " + cfg.key) {
+                    res.status = 401;
+                    res.set_content(
+                        "{\"error\":{\"message\":\"invalid or missing API key "
+                        "(send Authorization: Bearer <key>)\","
+                        "\"type\":\"authentication_error\",\"code\":null}}",
+                        "application/json");
+                    return httplib::Server::HandlerResponse::Handled;
+                }
+            }
+            return httplib::Server::HandlerResponse::Unhandled;
+        });
+
+        http.Get("/health", [](const httplib::Request &, httplib::Response &res) {
+            res.set_content("{\"status\":\"ok\"}", "application/json");
+        });
+
+        // OpenAI-shaped model list, extended with the engine each id routes to.
+        http.Get("/v1/models", [this](const httplib::Request &,
+                                      httplib::Response &res) {
+            nlohmann::json data = nlohmann::json::array();
+            for (const auto &m : cfg.models) {
+                data.push_back({
+                    {"id", m.id},
+                    {"object", "model"},
+                    {"created", 0},
+                    {"owned_by", "chimerafile"},
+                    {"engine", engine_name(m.engine)},
+                });
+            }
+            nlohmann::json out = {{"object", "list"}, {"data", data}};
+            res.set_content(out.dump(), "application/json");
+        });
+
+        // Chimerafile extension: what is loaded, what is queued, how long
+        // the server has been up.  The residency manager fills this in with
+        // live state in a later step.
+        http.Get("/v1/status", [this](const httplib::Request &,
+                                      httplib::Response &res) {
+            nlohmann::json resident = nlohmann::json::array();
+            for (const auto &m : cfg.models) {
+                nlohmann::json r;
+                r["id"] = m.id;
+                r["engine"] = engine_name(m.engine);
+                r["state"] = "unloaded";
+                r["ttl_s"] = m.effective_ttl();
+                r["pinned"] = m.pinned;
+                resident.push_back(r);
+            }
+            nlohmann::json out;
+            out["listen"] = cfg.host + ":" + std::to_string(cfg.port);
+            out["key"] = !cfg.key.empty();
+            out["uptime_s"] = (long)(time(nullptr) - start_at);
+            out["queue"] = {{"pending", 0}, {"active", nullptr}};
+            out["resident"] = resident;
+            res.set_content(out.dump(), "application/json");
+        });
+
+        http.set_error_handler([](const httplib::Request &,
+                                  httplib::Response &res) {
+            if (res.status == 404 || res.status == 405) {
+                res.set_content(
+                    "{\"error\":{\"message\":\"no such route "
+                    "(engine routing lands in the next steps)\","
+                    "\"type\":\"invalid_request_error\",\"code\":null}}",
+                    "application/json");
+            }
+        });
+    }
+
+    // Blocks until stop() (from a signal).  Returns false if the port could
+    // not be bound — our single-instance guard.
+    bool start(std::string &err) {
+        register_routes();
+        start_at = time(nullptr);
+        fprintf(stderr, "serve: listening on http://%s:%d\n",
+                cfg.host.c_str(), cfg.port);
+        if (!http.listen(cfg.host.c_str(), cfg.port)) {
+            err = "cannot bind " + cfg.host + ":" + std::to_string(cfg.port) +
+                  " (is another chimerafile serve running?)";
+            return false;
+        }
+        return true;
+    }
+};
+
 } // namespace serve
 
 // ── Entry point ──────────────────────────────────────────────────────────
@@ -305,13 +428,19 @@ static void print_config_summary(const serve::Config &cfg) {
             if (m.gpu_layers != -1)
                 fprintf(stderr, " gpu_layers=%d", m.gpu_layers);
         }
-        fprintf(stderr, "  ttl=%s", serve::fmt_ttl(m.ttl, m.engine).c_str());
+        fprintf(stderr, "  ttl=%s", serve::fmt_ttl(m).c_str());
         if (m.pinned)
             fprintf(stderr, " pinned");
         if (!m.args.empty())
             fprintf(stderr, " args(%zu)", m.args.size());
         fprintf(stderr, "\n");
     }
+}
+
+static serve::Server *g_server = nullptr;
+static void on_signal(int) {
+    if (g_server)
+        g_server->http.stop();
 }
 
 int serve_main(int argc, char **argv) {
@@ -344,8 +473,19 @@ int serve_main(int argc, char **argv) {
         fprintf(stderr, "error: %s\n", err.c_str());
         return 1;
     }
-
     print_config_summary(cfg);
-    fprintf(stderr, "serve: config ok — engine routing lands in the next steps\n");
+
+    serve::Server server(cfg);
+    g_server = &server;
+    std::signal(SIGINT, on_signal);
+    std::signal(SIGTERM, on_signal);
+
+    if (!server.start(err)) {
+        fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
+
+    // listen() blocks here until SIGINT/SIGTERM.
+    fprintf(stderr, "serve: stopped\n");
     return 0;
 }
