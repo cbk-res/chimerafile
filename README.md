@@ -80,6 +80,74 @@ Modes (`-M`): `img_gen` (default), `vid_gen`, `upscale`, `convert`, `metadata`.
 
 ---
 
+## Serve — OpenAI-compatible server
+
+All four engines behind one port, driven by a declarative config file:
+
+```sh
+./chimerafile serve --config config.json
+```
+
+### Config
+
+```json
+{
+  "listen": "127.0.0.1:8080",
+  "key": "optional-bearer-token",
+  "models": {
+    "assistant": {
+      "engine": "llama", "file": "gemma.gguf",
+      "ctx": 4096, "gpu_layers": -1,
+      "args": ["--temp", "0.7"]
+    },
+    "scribe":    { "engine": "whisper", "file": "ggml-tiny.bin" },
+    "subtitles": { "engine": "transcribe", "file": "qwen3-asr.gguf" },
+    "artist":    { "engine": "diffusion", "file": "sd15.gguf", "ttl": 0 }
+  }
+}
+```
+
+- `listen` — `host:port`. The port must be free; the server refuses to start if it is taken.
+- `key` — optional. When set, every request needs `Authorization: Bearer <key>` (401 without it).
+- `engine` — `llama`, `whisper`, `diffusion` or `transcribe`. `file` is resolved relative to the config file's directory.
+- `ctx`, `gpu_layers` — llama only (defaults 4096, `-1` = all layers on GPU).
+- `ttl` — seconds to stay in RAM when idle. Omitted = engine default (30 min llama, 5 min everything else); `0` = never.
+- `pin` — never unload, never evict.
+- `args` — CLI flags passed through verbatim, **llama only**: they go through llama.cpp's own CLI parser (`--temp`, `--ctk`, `--no-mmap`, ...). The other engines have no flag passthrough; their behaviour is steered by the request fields instead.
+
+### Endpoints
+
+| Endpoint | Engine | Notes |
+|---|---|---|
+| `GET /health` | — | liveness |
+| `GET /v1/models` | — | the configured model ids |
+| `POST /v1/chat/completions` | llama | non-stream and SSE streaming; `temperature`, `top_p`, `max_tokens`, `stop`; `n > 1` is rejected |
+| `POST /v1/audio/transcriptions` | whisper, transcribe | multipart `file` + `model`; `response_format` = `json` (default) \| `text` \| `srt` \| `vtt` \| `verbose_json`; `language` |
+| `POST /v1/images/generations` | diffusion | JSON; see extensions below |
+| `POST /v1/images/edits` | diffusion | multipart `image` + `prompt` (img2img); optional `size`, defaults to the input image's |
+| `GET /v1/status` | — | what is loaded, what is queued, uptime |
+| `POST /v1/residency/<id>` | — | preload / keep warm (starts the TTL clock) |
+| `POST /v1/residency/<id>/unload` | — | explicit unload (409 while in use) |
+
+### How it runs
+
+- Models load on first use and stay in RAM for `ttl` seconds of idleness. Execution is serial — one engine job at a time, and all engine work (loads, inference, unloads) runs on the process' main thread: in this APE only the thread that dlopen'd the host engine libraries has a working host-glibc TLS state. So the first request for a model waits for its load, and concurrent requests queue behind it. Interactive work (chat, transcription) takes a fast lane ahead of queued image generations.
+- Diffusion models get a fresh engine context per request: the pinned stable-diffusion.cpp cannot run a second generation on the same context, so each image request pays a few seconds of model load.
+- Streaming caveat: `stop` strings are checked by llama.cpp at token boundaries, so a stream can overshoot a stop string by the rest of the token the match landed inside.
+- `temperature` and `prompt` on `/v1/audio/transcriptions` are whisper-only: whisper.cpp has both, transcribe.cpp has neither, and the server passes down only what the engine supports.
+- Image generation takes the OpenAI fields `prompt`, `size` (`WxH`), `n` (1–4), `seed`, `response_format` (`b64_json` default | `url`, returned as a `data:` URL) plus the chimerafile extensions `negative_prompt`, `steps` and `cfg_scale` — all optional.
+
+An end-to-end smoke test of the whole surface lives at `scripts/serve-smoke-test.py` (standard library only):
+
+```sh
+python3 scripts/serve-smoke-test.py \
+    --bin llamafile/o/rel/chimerafile/chimerafile \
+    --llama gemma.gguf --whisper ggml-tiny.bin \
+    --transcribe qwen3-asr.gguf --diffusion sd15.gguf --audio jfk.wav
+```
+
+---
+
 ## GPU Backends
 
 GPU acceleration for all engines (llama, whisper, diffusion, transcribe) is
@@ -268,6 +336,7 @@ However, this has not yet been tested within chimerafile itself.
 - **v0.2** — diffusion image generation (custom stable-diffusion.cpp backend, GPU compat shim)
 - **v0.2.99** — diffusion Vulkan save-crash fix (host glibc heap routed via mmap); transcribe ported onto the shared GGML — all four engines GPU-capable from one backend
 - **v0.3** — aligned with llamafile v0.10.6: upstream diffusionfile pattern, transcribe engine, CI builds the pinned submodule
+- **v0.4** — `chimerafile serve`: OpenAI-compatible server over all four engines (declarative config, TTL residency, serial execution)
 
 ## License
 
