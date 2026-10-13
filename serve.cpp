@@ -1062,10 +1062,23 @@ class Residency {
         bool is_load;
         std::shared_ptr<std::promise<std::string>> result;  // null = fire and forget
         std::shared_ptr<EngineJob> engine;                  // non-null: engine work
+        int priority = 0;  // 0 = normal lane, 1 = fast lane
     };
     mutable std::mutex queue_mu;
     std::condition_variable queue_cv;
-    std::deque<LifeTask> tasks;
+    // Two lanes, both FIFO: the normal one, and a fast lane that jumps
+    // it.  Loads take the fast lane (their callers block on them and the
+    // eviction-retry loop needs them promptly), and so do the
+    // interactive engine jobs (chat, transcription); long diffusion
+    // generations stay in the normal lane, so a fresh chat or
+    // transcription request jumps ahead of queued image work.  Whatever
+    // is running always runs to completion -- no preemption in v1.
+    std::deque<LifeTask> lo, hi;
+
+    // Call with queue_mu held.
+    void push_task(LifeTask t) {
+        (t.priority ? hi : lo).push_back(std::move(t));
+    }
     std::atomic<bool> pump_running{false};
     std::atomic<bool> task_running{false};   // the pump is handling a task
 
@@ -1149,7 +1162,7 @@ class Residency {
                 if (now - p->last_used.load() <= p->ttl) continue;
                 // the actual unload happens on the main thread
                 std::lock_guard<std::mutex> qk(queue_mu);
-                tasks.push_back(LifeTask{p, false, nullptr});
+                push_task(LifeTask{p, false, nullptr});
                 queue_cv.notify_one();
             }
         }
@@ -1252,7 +1265,7 @@ public:
                 if (p->state.compare_exchange_strong(expected, 1)) {
                     p->last_err.clear();
                     std::lock_guard<std::mutex> qk(queue_mu);
-                    tasks.push_back(LifeTask{p, true, nullptr});
+                    push_task(LifeTask{p, true, nullptr, nullptr, 1});
                     queue_cv.notify_one();
                 }
             }
@@ -1276,7 +1289,10 @@ public:
         if (!pump_running.load())
             return false;
         std::lock_guard<std::mutex> qk(queue_mu);
-        tasks.push_back(LifeTask{job->p, false, nullptr, job});
+        LifeTask t{job->p, false, nullptr, job};
+        if (job->p->engine != EngineKind::Diffusion)
+            t.priority = 1;  // interactive work jumps queued image jobs
+        push_task(std::move(t));
         queue_cv.notify_one();
         return true;
     }
@@ -1284,7 +1300,7 @@ public:
     nlohmann::json queue_json() const {
         std::lock_guard<std::mutex> qk(queue_mu);
         nlohmann::json q;
-        q["pending"] = (int)tasks.size();
+        q["pending"] = (int)(hi.size() + lo.size());
         q["active"] = task_running.load();
         return q;
     }
@@ -1300,7 +1316,7 @@ public:
         auto result = std::make_shared<std::promise<std::string>>();
         {
             std::lock_guard<std::mutex> qk(queue_mu);
-            tasks.push_back(LifeTask{p, false, result});
+            push_task(LifeTask{p, false, result});
             queue_cv.notify_one();
         }
         err = result->get_future().get();
@@ -1356,15 +1372,16 @@ public:
                 // a timeout (not a pure wait) so the pump notices
                 // stop_pump() even if the signal handler cannot notify
                 queue_cv.wait_for(qk, std::chrono::milliseconds(500), [&] {
-                    return !tasks.empty() || !pump_running.load();
+                    return !hi.empty() || !lo.empty() || !pump_running.load();
                 });
-                if (tasks.empty()) {
+                if (hi.empty() && lo.empty()) {
                     if (!pump_running.load())
                         break;
                     continue;
                 }
-                t = tasks.front();
-                tasks.pop_front();
+                auto &q = hi.empty() ? lo : hi;
+                t = q.front();
+                q.pop_front();
             }
             task_running = true;
             if (t.engine)
