@@ -77,6 +77,13 @@
 #include "stable-diffusion.h"
 #include "transcribe.h"
 
+// stb_image (decode uploads for /v1/images/edits) and stb_image_write
+// (encode generated images to PNG).  Only the declarations are pulled in
+// here: the implementations already live in the linked binary via
+// llamafile's stb.a (see BUILD.mk).
+#include "stb_image.h"
+#include "stb_image_write.h"
+
 // Audio decoding for /v1/audio/transcriptions uses miniaudio, the
 // single-header decoder bundled with whisper.cpp's examples (the same one
 // its read_audio_data() uses); Vorbis support comes through stb_vorbis,
@@ -148,6 +155,25 @@ struct Config {
 static std::string to_lower(std::string s) {
     for (char &c : s) c = (char)tolower((unsigned char)c);
     return s;
+}
+
+// Standard base64 (RFC 4648), for OpenAI's b64_json image responses.
+static std::string b64_encode(const std::string &in) {
+    static const char *tbl =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(in.size() / 3 * 4 + 4);
+    for (size_t i = 0; i < in.size(); i += 3) {
+        uint32_t v = (uint8_t)in[i] << 16;
+        int left = (int)in.size() - (int)i - 1;
+        if (left > 0) v |= (uint8_t)in[i + 1] << 8;
+        if (left > 1) v |= (uint8_t)in[i + 2];
+        out += tbl[(v >> 18) & 63];
+        out += tbl[(v >> 12) & 63];
+        out += left > 0 ? tbl[(v >> 6) & 63] : '=';
+        out += left > 1 ? tbl[v & 63] : '=';
+    }
+    return out;
 }
 
 static bool parse_engine(const std::string &s, EngineKind &out) {
@@ -440,6 +466,17 @@ static void load_diffusion(PhysModel &p, std::string &err) {
     sd_ctx_params_t sp;
     sd_ctx_params_init(&sp);
     sp.model_path = p.file.c_str();
+    // One APE constraint: the engine's loader uploads tensors to the
+    // GPU from worker threads, and that path crashes (NULL buffer
+    // context) in this APE -- the native CLI has the same crash, so the
+    // CLI's own --params-backend cpu workaround is the fix here.
+    // Weights sit in RAM; the denoise compute still runs on the
+    // auto-selected GPU backend.
+    sp.params_backend = "cpu";
+    // The init default is a decode-only VAE, which trips an assert the
+    // first time /v1/images/edits needs to encode an input image; keep
+    // the encoder weights around so both endpoints work.
+    sp.vae_decode_only = false;
     p.sctx = new_sd_ctx(&sp);
     if (!p.sctx)
         err = "diffusion: failed to load '" + p.file + "' (out of memory?)";
@@ -845,6 +882,144 @@ static std::string build_vtt(const std::vector<TranscribeResult::Segment> &segs)
     return out;
 }
 
+// ── Image generation (diffusion) ─────────────────────────────────────────
+//
+// One OpenAI image request, built on stable-diffusion.cpp's own
+// generate_image(): an sd_img_gen_params_t carries the prompt, size,
+// batch and (for /v1/images/edits) the decoded input image, and the raw
+// pixels come straight back out of the engine.  As with the other engines,
+// the generation runs on the main thread through an EngineJob; the HTTP
+// worker only decodes/encodes image bytes, waits, and serializes.
+//
+// The engine context is one-shot: the pinned engine crashes on a second
+// generate_image() against the same context (reproduced outside this
+// server with a minimal harness against the engine alone), so each
+// request loads a fresh context and frees it again afterwards -- a few
+// seconds per request, in exchange for the rest of the design staying
+// identical to the other engines.
+
+struct ImageResult {
+    bool ok = false;
+    std::string err;
+    struct Img {
+        int w = 0, h = 0, ch = 0;
+        std::vector<uint8_t> px;  // row-major, ch bytes per pixel
+    };
+    std::vector<Img> images;
+};
+
+// Run one generation on a loaded model (main thread only, like run_chat).
+// edit is the decoded input image for image edits (nullptr = text-to-image).
+static ImageResult run_image(PhysModel &p, const std::string &prompt,
+                             const std::string &negative, int w, int h,
+                             int n, int steps, float cfg, long seed,
+                             const std::vector<uint8_t> *edit,
+                             int edit_w, int edit_h) {
+    ImageResult out;
+    // The pinned engine cannot run a second generation on the same
+    // context -- the second compute graph crashes, and a minimal
+    // harness against the engine alone reproduces it -- so every
+    // request gets a fresh context: load it if there is none, free it
+    // again once the pixels are out.  The pump serializes engine work,
+    // so at most one request touches p.sctx at a time.
+    std::string lerr;
+    {
+        std::lock_guard<std::mutex> lk(p.mu);
+        if (!p.sctx)
+            load_diffusion(p, lerr);
+    }
+    if (!p.sctx) {
+        out.err = lerr.empty() ? "model not loaded" : lerr;
+        return out;
+    }
+    if (!sd_ctx_supports_image_generation(p.sctx)) {
+        out.err = "this model does not support image generation";
+        std::lock_guard<std::mutex> lk(p.mu);
+        free_sd_ctx(p.sctx);  // never ran a generation, but don't hold it
+        p.sctx = nullptr;
+        return out;
+    }
+    sd_img_gen_params_t sp;
+    sd_img_gen_params_init(&sp);
+    sp.prompt = prompt.c_str();
+    if (!negative.empty())
+        sp.negative_prompt = negative.c_str();
+    sp.width = w;
+    sp.height = h;
+    sp.batch_count = n;
+    if (steps > 0)
+        sp.sample_params.sample_steps = steps;
+    if (cfg > 0.0f)
+        sp.sample_params.guidance.txt_cfg = cfg;
+    if (seed >= 0)
+        sp.seed = seed;
+    if (edit) {
+        sp.init_image.width = (uint32_t)edit_w;
+        sp.init_image.height = (uint32_t)edit_h;
+        sp.init_image.channel = 3;
+        // the engine only reads the input image's pixels
+        sp.init_image.data = const_cast<uint8_t *>(edit->data());
+    }
+    sd_image_t *imgs = generate_image(p.sctx, &sp);
+    if (!imgs) {
+        out.err = "generation failed (out of memory?)";
+        std::lock_guard<std::mutex> lk(p.mu);
+        free_sd_ctx(p.sctx);  // a failed run may leave it half-set-up
+        p.sctx = nullptr;
+        return out;
+    }
+    for (int i = 0; i < n; i++) {
+        ImageResult::Img img;
+        img.w = (int)imgs[i].width;
+        img.h = (int)imgs[i].height;
+        img.ch = (int)imgs[i].channel;
+        img.px.resize((size_t)img.w * img.h * img.ch);
+        if (imgs[i].data)
+            std::memcpy(img.px.data(), imgs[i].data, img.px.size());
+        free(imgs[i].data);
+        out.images.push_back(std::move(img));
+    }
+    free(imgs);  // the engine's array itself
+    {
+        // The context is one-shot (see the note at the top): drop it
+        // now that the pixels are safely copied out.
+        std::lock_guard<std::mutex> lk(p.mu);
+        free_sd_ctx(p.sctx);
+        p.sctx = nullptr;
+    }
+    out.ok = true;
+    return out;
+}
+
+// Encode one image to PNG with stb_image_write (linked in via stb.a).
+// The header only declares the _to_func variant, so collect the bytes
+// through a callback -- the same trick the engine's own media_io uses.
+static void png_mem_write(void *ctx, void *data, int size) {
+    auto *s = static_cast<std::string *>(ctx);
+    s->append((const char *)data, (size_t)size);
+}
+
+static bool encode_png(const ImageResult::Img &img, std::string &out) {
+    out.clear();
+    return stbi_write_png_to_func(png_mem_write, &out, img.w, img.h, img.ch,
+                                  img.px.data(), 0) != 0;
+}
+
+// Decode an uploaded image (PNG or JPEG) to 3-channel RGB with stb_image.
+static bool decode_image(const std::string &data, int &w, int &h,
+                         std::vector<uint8_t> &px) {
+    int pw = 0, ph = 0, pch = 0;
+    unsigned char *p = stbi_load_from_memory(
+        (const unsigned char *)data.data(), (int)data.size(), &pw, &ph, &pch, 3);
+    if (!p)
+        return false;
+    w = pw;
+    h = ph;
+    px.assign(p, p + (size_t)pw * ph * 3);
+    free(p);
+    return true;
+}
+
 // One unit of engine work submitted to the main thread's pump.  The pump
 // owns the run (in this APE only the main thread has a working host-glibc
 // malloc state, which the host-compiled engine libraries allocate
@@ -1244,6 +1419,131 @@ struct Server {
     std::thread http_thread;
 
     Server(Config c) : cfg(std::move(c)), residency(cfg) {}
+
+    // OpenAI image generation + edits share one core: validate the model
+    // (diffusion engine only), run the generation on the main thread
+    // through an EngineJob, and serialize the PNGs (b64_json or data: url).
+    // `edit` is the decoded input image for the img2img path (nullptr =
+    // text-to-image).  Runs on the HTTP worker thread; only the engine
+    // call is submitted to the pump.
+    void handle_image_request(const std::string &model_id,
+                              const std::string &prompt,
+                              const std::string &negative,
+                              const std::string &fmt,
+                              const std::string &size, int n, int steps,
+                              double cfg_scale, long seed,
+                              const std::vector<uint8_t> *edit,
+                              int edit_w, int edit_h,
+                              httplib::Response &res) {
+        auto send_err = [](httplib::Response &res, int status,
+                           const char *type, const char *code,
+                           const std::string &message) {
+            nlohmann::json out;
+            out["error"]["message"] = message;
+            out["error"]["type"] = type;
+            out["error"]["code"] = code;
+            res.status = status;
+            res.set_content(out.dump(), "application/json");
+        };
+        const ModelEntry *e = cfg.find(model_id);
+        if (!e) {
+            send_err(res, 404, "invalid_request_error", "model_not_found",
+                     "unknown model id");
+            return;
+        }
+        if (e->engine != EngineKind::Diffusion) {
+            send_err(res, 400, "invalid_request_error", "unsupported_model",
+                     std::string("model '") + e->id +
+                     "' runs on the " + engine_name(e->engine) +
+                     " engine, not diffusion");
+            return;
+        }
+        if (fmt != "b64_json" && fmt != "url") {
+            send_err(res, 400, "invalid_request_error", "invalid_request",
+                     "response_format must be b64_json or url");
+            return;
+        }
+        int w = 512, h = 512;
+        if (!size.empty()) {
+            const size_t x = size.find('x');
+            if (x == std::string::npos ||
+                !(w = atoi(size.substr(0, x).c_str())) ||
+                !(h = atoi(size.substr(x + 1).c_str()))) {
+                send_err(res, 400, "invalid_request_error",
+                         "invalid_request",
+                         "size must be WxH (for example 512x512)");
+                return;
+            }
+            if (w <= 0 || h <= 0 || w > 2048 || h > 2048) {
+                send_err(res, 400, "invalid_request_error",
+                         "invalid_request",
+                         "size must be between 1x1 and 2048x2048");
+                return;
+            }
+        } else if (edit) {
+            // edits without an explicit size keep the input's
+            w = edit_w;
+            h = edit_h;
+        }
+        if (n < 1 || n > 4) {
+            send_err(res, 400, "invalid_request_error", "invalid_request",
+                     "'n' must be between 1 and 4");
+            return;
+        }
+
+        std::string err;
+        auto p = residency.acquire(*e, err);
+        if (!p) {
+            send_err(res, 503, "server_error", "model_load_failed", err);
+            return;
+        }
+
+        auto job = std::make_shared<EngineJob>();
+        job->p = p;
+        ImageResult ir;
+        job->run = [p, prompt, negative, w, h, n, steps,
+                    cfg_f = cfg_scale > 0 ? (float)cfg_scale : -1.0f, seed,
+                    edit, edit_w, edit_h, &ir] {
+            ir = run_image(*p, prompt, negative, w, h, n, steps, cfg_f, seed,
+                           edit, edit_w, edit_h);
+        };
+        if (!residency.submit_engine(job)) {
+            residency.release(*p);
+            send_err(res, 503, "server_error", "server_busy",
+                     "server is shutting down");
+            return;
+        }
+        {
+            std::unique_lock<std::mutex> lk(job->mu);
+            job->cv.wait(lk, [&] { return job->finished; });
+        }
+        if (!ir.ok) {
+            send_err(res, 500, "server_error", "generation_failed", ir.err);
+            return;
+        }
+
+        nlohmann::json data = nlohmann::json::array();
+        for (const auto &img : ir.images) {
+            std::string png;
+            if (!encode_png(img, png)) {
+                send_err(res, 500, "server_error", "generation_failed",
+                         "failed to encode the generated image");
+                return;
+            }
+            nlohmann::json d;
+            if (fmt == "url")
+                d["url"] = "data:image/png;base64," + b64_encode(png);
+            else
+                d["b64_json"] = b64_encode(png);
+            d["revised_prompt"] = prompt;
+            data.push_back(std::move(d));
+        }
+        nlohmann::json out;
+        out["created"] = (long)time(nullptr);
+        out["model"] = e->id;
+        out["data"] = data;
+        res.set_content(out.dump(), "application/json");
+    }
 
     void register_routes() {
         // httplib's default socket options set SO_REUSEPORT, which would let
@@ -1684,6 +1984,145 @@ struct Server {
             res.set_content(out.dump(), "application/json");
         });
 
+        // OpenAI: image generation (diffusion engine models).
+        http.Post("/v1/images/generations",
+                  [this](const httplib::Request &req, httplib::Response &res) {
+            auto send_err = [](httplib::Response &res, int status,
+                               const char *type, const char *code,
+                               const std::string &message) {
+                nlohmann::json out;
+                out["error"]["message"] = message;
+                out["error"]["type"] = type;
+                out["error"]["code"] = code;
+                res.status = status;
+                res.set_content(out.dump(), "application/json");
+            };
+            nlohmann::json body;
+            try {
+                body = nlohmann::json::parse(req.body);
+            } catch (...) {
+                send_err(res, 400, "invalid_request_error", "invalid_json",
+                         "request body is not valid JSON");
+                return;
+            }
+            if (!body.contains("model") || !body["model"].is_string()) {
+                send_err(res, 400, "invalid_request_error",
+                         "invalid_request", "'model' is required");
+                return;
+            }
+            if (!body.contains("prompt") || !body["prompt"].is_string() ||
+                body["prompt"].get<std::string>().empty()) {
+                send_err(res, 400, "invalid_request_error",
+                         "invalid_request", "'prompt' is required");
+                return;
+            }
+            // negative_prompt, steps, cfg_scale and seed are chimerafile
+            // extensions (OpenAI's API has none of them); the rest is
+            // OpenAI-shaped.
+            handle_image_request(
+                body["model"].get<std::string>(),
+                body["prompt"].get<std::string>(),
+                body.value("negative_prompt", std::string()),
+                body.value("response_format", std::string("b64_json")),
+                body.value("size", std::string()),
+                body.value("n", 1), body.value("steps", 0),
+                body.value("cfg_scale", -1.0),
+                body.contains("seed") && body["seed"].is_number()
+                    ? body["seed"].get<long>()
+                    : -1,
+                nullptr, 0, 0, res);
+        });
+
+        // OpenAI: image edits (diffusion engine models, img2img path).
+        http.Post("/v1/images/edits",
+                  [this](const httplib::Request &req, httplib::Response &res,
+                         const httplib::ContentReader &content_reader) {
+            auto send_err = [](httplib::Response &res, int status,
+                               const char *type, const char *code,
+                               const std::string &message) {
+                nlohmann::json out;
+                out["error"]["message"] = message;
+                out["error"]["type"] = type;
+                out["error"]["code"] = code;
+                res.status = status;
+                res.set_content(out.dump(), "application/json");
+            };
+            if (!req.is_multipart_form_data()) {
+                send_err(res, 400, "invalid_request_error",
+                         "invalid_request",
+                         "Content-Type must be multipart/form-data");
+                return;
+            }
+            std::map<std::string, std::string> fields;
+            std::string file;
+            bool got_file = false;
+            const httplib::FormData *part = nullptr;
+            bool parsed = content_reader(
+                [&](const httplib::FormData &fd) -> bool {
+                    part = &fd;
+                    return true;
+                },
+                [&](const char *d, size_t n) -> bool {
+                    if (part->filename.empty())
+                        fields[part->name] += std::string(d, n);
+                    else {
+                        file += std::string(d, n);
+                        got_file = true;
+                    }
+                    return true;
+                });
+            if (!parsed) {
+                send_err(res, 400, "invalid_request_error",
+                         "invalid_request",
+                         "could not parse the multipart form");
+                return;
+            }
+            auto field = [&fields](const char *name) -> std::string {
+                auto it = fields.find(name);
+                return it == fields.end() ? std::string() : it->second;
+            };
+            if (field("model").empty()) {
+                send_err(res, 400, "invalid_request_error",
+                         "invalid_request", "'model' is required");
+                return;
+            }
+            if (field("prompt").empty()) {
+                send_err(res, 400, "invalid_request_error",
+                         "invalid_request", "'prompt' is required");
+                return;
+            }
+            if (!got_file) {
+                send_err(res, 400, "invalid_request_error",
+                         "invalid_request",
+                         "'image' (the input image) is required");
+                return;
+            }
+            int iw = 0, ih = 0;
+            std::vector<uint8_t> ipp;
+            if (!decode_image(file, iw, ih, ipp)) {
+                send_err(res, 400, "invalid_request_error",
+                         "invalid_request",
+                         "could not decode the input image (PNG or JPEG)");
+                return;
+            }
+            handle_image_request(
+                field("model"), field("prompt"), field("negative_prompt"),
+                field("response_format").empty() ? "b64_json"
+                                                 : field("response_format"),
+                field("size"),
+                (int)atol(field("n").empty() ? "1" : field("n").c_str()),
+                (int)atol(field("steps").empty()
+                             ? "0"
+                             : field("steps").c_str()),
+                field("cfg_scale").empty()
+                    ? -1.0
+                    : atof(field("cfg_scale").c_str()),
+                field("seed").empty() ? -1 : atoll(field("seed").c_str()),
+                &ipp, iw, ih, res);
+        });
+
+        // Chimerafile extension: what is loaded, what is queued, how long
+        // the server has been up.
         // Chimerafile extension: what is loaded, what is queued, how long
         // the server has been up.
         http.Get("/v1/status", [this](const httplib::Request &,

@@ -35,6 +35,7 @@ CHIMERAFILE_INCLUDES := \
 	-iquote whisper.cpp/examples \
 	-iquote whisperfile \
 	-iquote stable-diffusion.cpp/include \
+	-iquote third_party/stb \
 	-iquote transcribe.cpp/include
 
 CHIMERAFILE_WHISPER_INCLUDES := \
