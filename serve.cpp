@@ -48,6 +48,7 @@
 #include <condition_variable>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <deque>
@@ -75,6 +76,24 @@
 #include "whisper.h"
 #include "stable-diffusion.h"
 #include "transcribe.h"
+
+// Audio decoding for /v1/audio/transcriptions uses miniaudio, the
+// single-header decoder bundled with whisper.cpp's examples (the same one
+// its read_audio_data() uses); Vorbis support comes through stb_vorbis,
+// included exactly like whisper's own examples do it.  Both
+// implementations compile into this one translation unit.
+#define STB_VORBIS_HEADER_ONLY
+#include "stb_vorbis.c"
+// We only decode; keep the rest of miniaudio (device I/O, playback, ...)
+// out of the binary, exactly like whisper's own examples do.
+#define MA_NO_DEVICE_IO
+#define MA_NO_THREADING
+#define MA_NO_ENCODING
+#define MA_NO_GENERATION
+#define MA_NO_RESOURCE_MANAGER
+#define MA_NO_NODE_GRAPH
+#define MINIAUDIO_IMPLEMENTATION
+#include "miniaudio.h"
 
 namespace serve {
 
@@ -366,6 +385,7 @@ struct PhysModel {
     whisper_context * wctx = nullptr;
     sd_ctx_t * sctx = nullptr;
     struct transcribe_model * tmodel = nullptr;
+    struct transcribe_session * tsess = nullptr;  // borrows tmodel
 
     std::atomic<int> state{0};    // 0 unloaded, 1 loading, 2 loaded
     std::atomic<long> last_used{0};
@@ -433,8 +453,21 @@ static void load_transcribe(PhysModel &p, std::string &err) {
     p.tmodel = nullptr;
     transcribe_status st = transcribe_model_load_file(p.file.c_str(), nullptr,
                                                       &p.tmodel);
-    if (st != TRANSCRIBE_OK)
+    if (st != TRANSCRIBE_OK) {
         err = std::string("transcribe: ") + transcribe_status_string(st);
+        return;
+    }
+    // One session per loaded model: it borrows the model and is only ever
+    // used from the main thread (see Residency), so the engine's "one
+    // thread per session" rule holds by construction.
+    transcribe_status ss = transcribe_session_init(p.tmodel, nullptr,
+                                                   &p.tsess);
+    if (ss != TRANSCRIBE_OK) {
+        err = std::string("transcribe: session: ") +
+              transcribe_status_string(ss);
+        transcribe_model_free(p.tmodel);
+        p.tmodel = nullptr;
+    }
 }
 
 static void load_engine(PhysModel &p, std::string &err) {
@@ -453,6 +486,7 @@ static void unload_engine(PhysModel &p) {
         p.init.reset();
     if (p.wctx) { whisper_free(p.wctx); p.wctx = nullptr; }
     if (p.sctx) { free_sd_ctx(p.sctx); p.sctx = nullptr; }
+    if (p.tsess) { transcribe_session_free(p.tsess); p.tsess = nullptr; }
     if (p.tmodel) { transcribe_model_free(p.tmodel); p.tmodel = nullptr; }
 }
 
@@ -641,21 +675,199 @@ static GenResult run_chat(PhysModel &p, const ChatRequest &req,
     return out;
 }
 
-// One chat generation submitted to the main thread's pump.  The pump
-// owns the run (in this APE only the main thread has a working
-// host-glibc malloc state, which the host-compiled GPU backend
-// allocates through); the submitting HTTP worker waits for `finished`
-// (non-streaming) or drains `pieces` as they arrive (streaming).
-struct InferJob {
+// ── Audio transcription (whisper + transcribe) ───────────────────────────
+//
+// One OpenAI transcription request.  The uploaded audio is decoded to
+// 16 kHz mono float32 PCM -- the input format both speech engines accept
+// -- with miniaudio, then handed to the engine's own full-pass API
+// (whisper_full / transcribe_run); the segments come straight back out of
+// the engine and are reshaped into the requested response format.  As
+// with run_chat, the engine work runs on the main thread through an
+// EngineJob; the HTTP worker only decodes the upload, waits, and
+// serializes the response.
+
+struct TranscribeResult {
+    bool ok = false;
+    std::string err;
+    std::string text;
+    std::string language;
+    double duration_s = 0.0;
+    struct Segment {
+        double t0 = 0.0;  // seconds
+        double t1 = 0.0;
+        std::string text;
+    };
+    std::vector<Segment> segments;
+};
+
+// Decode an uploaded audio file to 16 kHz mono float32 PCM (WAV, MP3,
+// FLAC and Vorbis containers; resampled and mixed down as needed).
+// Same pattern as whisper.cpp's read_audio_data: ask for the length, then
+// read it all in one shot (reading past the end of a miniaudio decoder
+// reports an error, so the exact-length read is the safe one).
+static bool decode_audio(const std::string &data, std::vector<float> &pcm) {
+    if (data.size() < 12)
+        return false;
+    ma_decoder_config cfg = ma_decoder_config_init(ma_format_f32, 1, 16000);
+    ma_decoder dec;
+    if (ma_decoder_init_memory(data.data(), data.size(), &cfg, &dec) !=
+        MA_SUCCESS)
+        return false;
+    ma_uint64 frame_count = 0;
+    if (ma_decoder_get_length_in_pcm_frames(&dec, &frame_count) != MA_SUCCESS ||
+        frame_count == 0) {
+        ma_decoder_uninit(&dec);
+        return false;
+    }
+    pcm.resize(frame_count);
+    ma_uint64 frames_read = 0;
+    bool ok = ma_decoder_read_pcm_frames(&dec, pcm.data(), frame_count,
+                                         &frames_read) == MA_SUCCESS;
+    pcm.resize(frames_read);
+    ma_decoder_uninit(&dec);
+    return ok && frames_read > 0;
+}
+
+// Run one transcription on a loaded model (main thread only, like
+// run_chat).  pcm is 16 kHz mono float32, as decode_audio produces.
+static TranscribeResult run_transcribe(PhysModel &p,
+                                       const std::vector<float> &pcm,
+                                       const std::string &language,
+                                       const std::string &prompt,
+                                       float temperature) {
+    TranscribeResult out;
+    if (pcm.empty()) {
+        out.err = "no audio samples to transcribe";
+        return out;
+    }
+    out.duration_s = (double)pcm.size() / 16000.0;
+
+    if (p.engine == EngineKind::Whisper) {
+        whisper_full_params wp =
+            whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+        if (!language.empty())
+            wp.language = language.c_str();
+        if (!prompt.empty())
+            wp.initial_prompt = prompt.c_str();
+        if (temperature >= 0.0f)
+            wp.temperature = temperature;
+        if (whisper_full(p.wctx, wp, pcm.data(), (int)pcm.size()) != 0) {
+            out.err = "whisper: transcription failed";
+            return out;
+        }
+        int lid = whisper_full_lang_id(p.wctx);
+        if (lid >= 0)
+            out.language = whisper_lang_str(lid);
+        int n = whisper_full_n_segments(p.wctx);
+        for (int i = 0; i < n; i++) {
+            const char *t = whisper_full_get_segment_text(p.wctx, i);
+            std::string s = t ? t : "";
+            // whisper pads segment text with a leading space
+            size_t b = s.find_first_not_of(' ');
+            if (b == std::string::npos)
+                continue;
+            s.erase(0, b);
+            out.segments.push_back(
+                {whisper_full_get_segment_t0(p.wctx, i) / 1000.0,
+                 whisper_full_get_segment_t1(p.wctx, i) / 1000.0, s});
+            if (!out.text.empty())
+                out.text += ' ';
+            out.text += s;
+        }
+    } else {  // EngineKind::Transcribe
+        transcribe_run_params rp;
+        transcribe_run_params_init(&rp);
+        rp.task = TRANSCRIBE_TASK_TRANSCRIBE;
+        rp.timestamps = TRANSCRIBE_TIMESTAMPS_AUTO;
+        if (!language.empty())
+            rp.language = language.c_str();
+        transcribe_status st =
+            transcribe_run(p.tsess, pcm.data(), (int)pcm.size(), &rp);
+        if (st != TRANSCRIBE_OK) {
+            out.err = std::string("transcribe: ") +
+                      transcribe_status_string(st);
+            return out;
+        }
+        const char *ft = transcribe_full_text(p.tsess);
+        if (ft)
+            out.text = ft;
+        const char *lang = transcribe_detected_language(p.tsess);
+        if (lang)
+            out.language = lang;
+        int n = transcribe_n_segments(p.tsess);
+        for (int i = 0; i < n; i++) {
+            transcribe_segment seg;
+            transcribe_segment_init(&seg);
+            if (transcribe_get_segment(p.tsess, i, &seg) != TRANSCRIBE_OK ||
+                !seg.text)
+                continue;
+            out.segments.push_back({seg.t0_ms / 1000.0, seg.t1_ms / 1000.0,
+                                    seg.text});
+        }
+    }
+    out.ok = true;
+    return out;
+}
+
+static std::string fmt_srt_time(double s) {
+    long ms = (long)(s * 1000.0 + 0.5);
+    char b[32];
+    snprintf(b, sizeof b, "%02ld:%02ld:%02ld,%03ld", ms / 3600000,
+             (ms / 60000) % 60, (ms / 1000) % 60, ms % 1000);
+    return b;
+}
+
+static std::string fmt_vtt_time(double s) {
+    long ms = (long)(s * 1000.0 + 0.5);
+    char b[32];
+    snprintf(b, sizeof b, "%02ld:%02ld:%02ld.%03ld", ms / 3600000,
+             (ms / 60000) % 60, (ms / 1000) % 60, ms % 1000);
+    return b;
+}
+
+static std::string build_srt(const std::vector<TranscribeResult::Segment> &segs) {
+    std::string out;
+    int n = 1;
+    for (const auto &s : segs) {
+        out += std::to_string(n++) + "\n";
+        out += fmt_srt_time(s.t0) + " --> " + fmt_srt_time(s.t1) + "\n";
+        out += s.text + "\n\n";
+    }
+    return out;
+}
+
+static std::string build_vtt(const std::vector<TranscribeResult::Segment> &segs) {
+    std::string out = "WEBVTT\n\n";
+    for (const auto &s : segs) {
+        out += fmt_vtt_time(s.t0) + " --> " + fmt_vtt_time(s.t1) + "\n";
+        out += s.text + "\n\n";
+    }
+    return out;
+}
+
+// One unit of engine work submitted to the main thread's pump.  The pump
+// owns the run (in this APE only the main thread has a working host-glibc
+// malloc state, which the host-compiled engine libraries allocate
+// through); the submitting HTTP worker waits for `finished` before
+// reading the result its run closure captured.
+struct EngineJob {
     std::shared_ptr<PhysModel> p;
-    ChatRequest req;
+    std::function<void()> run;  // executed on the main thread
 
     std::mutex mu;
     std::condition_variable cv;
-    std::deque<std::string> pieces;  // pump -> streaming provider
+    bool finished = false;  // run() returned
+};
+
+// Per-streaming-chat state shared between the pump (producing pieces)
+// and the content provider (draining them to the client).
+struct StreamState {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<std::string> pieces;  // pump -> provider
     bool consumer_gone = false;      // the provider gave up (client gone)
-    GenResult result;                // valid once `finished`
-    bool finished = false;           // run_chat returned
+    bool run_finished = false;       // run_chat returned
+    GenResult result;                // valid once `run_finished`
 };
 
 class Residency {
@@ -674,7 +886,7 @@ class Residency {
         std::shared_ptr<PhysModel> p;
         bool is_load;
         std::shared_ptr<std::promise<std::string>> result;  // null = fire and forget
-        std::shared_ptr<InferJob> infer;                    // non-null: run a generation
+        std::shared_ptr<EngineJob> engine;                  // non-null: engine work
     };
     mutable std::mutex queue_mu;
     std::condition_variable queue_cv;
@@ -830,34 +1042,11 @@ class Residency {
             result->set_value(res);
     }
 
-    void handle_infer(std::shared_ptr<InferJob> job) {
-        {
-            std::lock_guard<std::mutex> lk(job->mu);
-            if (job->consumer_gone) {
-                // the client went away before the run could even start
-                job->result.err = "client disconnected";
-                job->finished = true;
-                job->cv.notify_all();
-            }
-        }
-        if (job->finished) {
-            release(*job->p);
-            return;
-        }
-        auto on_piece = [&job](const char *s, size_t n) -> bool {
-            if (n == 0)
-                return true;
-            std::unique_lock<std::mutex> lk(job->mu);
-            // bounded queue: backpressure on the pump if the provider is slow
-            while (job->pieces.size() >= 256 && !job->consumer_gone)
-                job->cv.wait(lk);
-            if (job->consumer_gone)
-                return false;
-            job->pieces.emplace_back(s, n);
-            job->cv.notify_all();
-            return true;
-        };
-        job->result = run_chat(*job->p, job->req, on_piece);
+    // The engine work itself (chat generation, transcription, ...) lives
+    // in the job's run closure, which each route builds; the pump only
+    // executes it on the main thread and reports back.
+    void handle_engine(std::shared_ptr<EngineJob> job) {
+        job->run();
         {
             std::lock_guard<std::mutex> lk(job->mu);
             job->finished = true;
@@ -905,20 +1094,16 @@ public:
         p.in_use.fetch_sub(1);
     }
 
-    // Submit a generation to the main thread (worker thread).  The model
-    // must already be acquired; the pump releases it when the run finishes.
-    // Returns null if the pump is shutting down.
-    std::shared_ptr<InferJob> submit_infer(std::shared_ptr<PhysModel> p,
-                                           const ChatRequest &req) {
+    // Submit engine work to the main thread (worker thread).  The model
+    // must already be acquired; the pump releases it when the run
+    // finishes.  Returns false if the pump is shutting down.
+    bool submit_engine(std::shared_ptr<EngineJob> job) {
         if (!pump_running.load())
-            return nullptr;
-        auto job = std::make_shared<InferJob>();
-        job->p = p;
-        job->req = req;
+            return false;
         std::lock_guard<std::mutex> qk(queue_mu);
-        tasks.push_back(LifeTask{p, false, nullptr, job});
+        tasks.push_back(LifeTask{job->p, false, nullptr, job});
         queue_cv.notify_one();
-        return job;
+        return true;
     }
 
     nlohmann::json queue_json() const {
@@ -1007,8 +1192,8 @@ public:
                 tasks.pop_front();
             }
             task_running = true;
-            if (t.infer)
-                handle_infer(t.infer);
+            if (t.engine)
+                handle_engine(t.engine);
             else if (t.p) {
                 if (t.is_load)
                     handle_load(t.p);
@@ -1173,19 +1358,24 @@ struct Server {
             long created = (long)time(nullptr);
 
             if (!cr.stream) {
-                auto job = residency.submit_infer(p, cr);
-                if (!job) {
+                auto job = std::make_shared<EngineJob>();
+                job->p = p;
+                GenResult g;
+                job->run = [p, &cr, &g] {
+                    g = run_chat(*p, cr, [](const char *, size_t) {
+                        return true;
+                    });
+                };
+                if (!residency.submit_engine(job)) {
                     residency.release(*p);
                     send_err(res, 503, "server_error", "server_busy",
                              "server is shutting down");
                     return;
                 }
-                GenResult g;
                 {
                     std::unique_lock<std::mutex> lk(job->mu);
                     job->cv.wait(lk, [&] { return job->finished; });
                 }
-                g = job->result;
                 if (!g.ok) {
                     send_err(res, 500, "server_error", "generation_failed",
                              g.err);
@@ -1213,8 +1403,42 @@ struct Server {
             // Streaming: Server-Sent Events via a chunked content provider.
             // The generation itself runs on the main thread (pump); the
             // provider only copies pieces to the client as they arrive.
-            auto job = residency.submit_infer(p, cr);
-            if (!job) {
+            auto st = std::make_shared<StreamState>();
+            auto job = std::make_shared<EngineJob>();
+            job->p = p;
+            job->run = [st, p, cr] {
+                {
+                    std::lock_guard<std::mutex> lk(st->mu);
+                    if (st->consumer_gone) {
+                        // the client went away before the run could start
+                        st->result.err = "client disconnected";
+                        st->run_finished = true;
+                        st->cv.notify_all();
+                        return;
+                    }
+                }
+                auto on_piece = [st](const char *s, size_t n) -> bool {
+                    if (n == 0)
+                        return true;
+                    std::unique_lock<std::mutex> lk(st->mu);
+                    // bounded queue: backpressure on the pump if the provider
+                    // is slow
+                    while (st->pieces.size() >= 256 && !st->consumer_gone)
+                        st->cv.wait(lk);
+                    if (st->consumer_gone)
+                        return false;
+                    st->pieces.emplace_back(s, n);
+                    st->cv.notify_all();
+                    return true;
+                };
+                st->result = run_chat(*p, cr, on_piece);
+                {
+                    std::lock_guard<std::mutex> lk(st->mu);
+                    st->run_finished = true;
+                    st->cv.notify_all();
+                }
+            };
+            if (!residency.submit_engine(job)) {
                 residency.release(*p);
                 send_err(res, 503, "server_error", "server_busy",
                          "server is shutting down");
@@ -1222,7 +1446,7 @@ struct Server {
             }
             res.set_chunked_content_provider(
                 "text/event-stream",
-                [job, id, created, model_id = e->id](
+                [st, id, created, model_id = e->id](
                     size_t, httplib::DataSink &sink) -> bool {
                     auto chunk = [&](const nlohmann::json &delta,
                                      const char *finish) {
@@ -1241,10 +1465,10 @@ struct Server {
                         std::string frame = "data: " + c.dump() + "\n\n";
                         return sink.write(frame.data(), frame.size());
                     };
-                    auto gone = [&job] {
-                        std::lock_guard<std::mutex> lk(job->mu);
-                        job->consumer_gone = true;
-                        job->cv.notify_all();
+                    auto gone = [&st] {
+                        std::lock_guard<std::mutex> lk(st->mu);
+                        st->consumer_gone = true;
+                        st->cv.notify_all();
                     };
                     if (!chunk({{"role", "assistant"}}, nullptr)) {
                         gone();
@@ -1253,12 +1477,12 @@ struct Server {
                     bool ok = false;
                     std::string finish;
                     {
-                        std::unique_lock<std::mutex> lk(job->mu);
+                        std::unique_lock<std::mutex> lk(st->mu);
                         for (;;) {
-                            if (!job->pieces.empty()) {
+                            if (!st->pieces.empty()) {
                                 std::string piece =
-                                    std::move(job->pieces.front());
-                                job->pieces.pop_front();
+                                    std::move(st->pieces.front());
+                                st->pieces.pop_front();
                                 lk.unlock();
                                 nlohmann::json d;
                                 d["content"] = std::move(piece);
@@ -1269,15 +1493,15 @@ struct Server {
                                 lk.lock();
                                 continue;
                             }
-                            if (job->finished) {
-                                ok = job->result.ok;
-                                finish = job->result.finish;
+                            if (st->run_finished) {
+                                ok = st->result.ok;
+                                finish = st->result.finish;
                                 break;
                             }
                             // a timeout so a stuck job cannot hang the
                             // provider forever
-                            job->cv.wait_for(lk,
-                                             std::chrono::milliseconds(200));
+                            st->cv.wait_for(lk,
+                                            std::chrono::milliseconds(200));
                         }
                     }
                     if (ok) {
@@ -1288,6 +1512,176 @@ struct Server {
                     sink.done();
                     return true;
                 });
+        });
+
+        // OpenAI: audio transcriptions (whisper + transcribe engines).
+        // Multipart form: model, file, and optionally language, prompt,
+        // response_format (json | verbose_json | text | srt | vtt), and
+        // temperature (applied to whisper; transcribe has no such knob).
+        http.Post("/v1/audio/transcriptions",
+                  [this](const httplib::Request &req, httplib::Response &res,
+                         const httplib::ContentReader &content_reader) {
+            auto send_err = [](httplib::Response &res, int status,
+                               const char *type, const char *code,
+                               const std::string &message) {
+                nlohmann::json out;
+                out["error"]["message"] = message;
+                out["error"]["type"] = type;
+                out["error"]["code"] = code;
+                res.status = status;
+                res.set_content(out.dump(), "application/json");
+            };
+
+            if (!req.is_multipart_form_data()) {
+                send_err(res, 400, "invalid_request_error",
+                         "invalid_request",
+                         "Content-Type must be multipart/form-data");
+                return;
+            }
+            // Collect the form: the header callback fires at the start of
+            // each part (a file part is recognised by its filename); the
+            // receiver then gets that part's bytes.
+            std::map<std::string, std::string> fields;
+            std::string audio;
+            bool got_file = false;
+            const httplib::FormData *part = nullptr;
+            bool parsed = content_reader(
+                [&](const httplib::FormData &fd) -> bool {
+                    part = &fd;
+                    return true;
+                },
+                [&](const char *d, size_t n) -> bool {
+                    if (part->filename.empty())
+                        fields[part->name] += std::string(d, n);
+                    else {
+                        audio += std::string(d, n);
+                        got_file = true;
+                    }
+                    return true;
+                });
+            if (!parsed) {
+                send_err(res, 400, "invalid_request_error", "invalid_request",
+                         "could not parse the multipart form");
+                return;
+            }
+            auto field = [&fields](const char *name) -> std::string {
+                auto it = fields.find(name);
+                return it == fields.end() ? std::string() : it->second;
+            };
+            const std::string model = field("model");
+            if (model.empty()) {
+                send_err(res, 400, "invalid_request_error",
+                         "invalid_request", "'model' is required");
+                return;
+            }
+            const ModelEntry *e = cfg.find(model);
+            if (!e) {
+                send_err(res, 404, "invalid_request_error", "model_not_found",
+                         "unknown model id");
+                return;
+            }
+            if (e->engine != EngineKind::Whisper &&
+                e->engine != EngineKind::Transcribe) {
+                send_err(res, 400, "invalid_request_error",
+                         "unsupported_model",
+                         std::string("model '") + e->id +
+                         "' runs on the " + engine_name(e->engine) +
+                         " engine, not a speech engine");
+                return;
+            }
+            if (!got_file) {
+                send_err(res, 400, "invalid_request_error",
+                         "invalid_request",
+                         "'file' (the audio) is required");
+                return;
+            }
+            std::string language = field("language");
+            std::string prompt = field("prompt");
+            std::string fmt = field("response_format");
+            if (fmt.empty())
+                fmt = "json";
+            if (fmt != "json" && fmt != "verbose_json" && fmt != "text" &&
+                fmt != "srt" && fmt != "vtt") {
+                send_err(res, 400, "invalid_request_error",
+                         "invalid_request",
+                         "response_format must be json, verbose_json, "
+                         "text, srt or vtt");
+                return;
+            }
+            float temperature = -1.0f;  // < 0 = not set in the request
+            const std::string t = field("temperature");
+            if (!t.empty())
+                temperature = (float)strtod(t.c_str(), nullptr);
+
+            std::vector<float> pcm;
+            if (!decode_audio(audio, pcm)) {
+                send_err(res, 400, "invalid_request_error",
+                         "invalid_request",
+                         "could not decode the audio file (WAV, MP3, FLAC "
+                         "or OGG)");
+                return;
+            }
+
+            std::string err;
+            auto p = residency.acquire(*e, err);
+            if (!p) {
+                send_err(res, 503, "server_error", "model_load_failed", err);
+                return;
+            }
+
+            auto job = std::make_shared<EngineJob>();
+            job->p = p;
+            TranscribeResult tr;
+            job->run = [p, pcm = std::move(pcm), language, prompt,
+                        temperature, &tr] {
+                tr = run_transcribe(*p, pcm, language, prompt, temperature);
+            };
+            if (!residency.submit_engine(job)) {
+                residency.release(*p);
+                send_err(res, 503, "server_error", "server_busy",
+                         "server is shutting down");
+                return;
+            }
+            {
+                std::unique_lock<std::mutex> lk(job->mu);
+                job->cv.wait(lk, [&] { return job->finished; });
+            }
+            if (!tr.ok) {
+                send_err(res, 500, "server_error", "transcription_failed",
+                         tr.err);
+                return;
+            }
+
+            if (fmt == "text") {
+                res.set_content(tr.text, "text/plain");
+                return;
+            }
+            if (fmt == "srt") {
+                res.set_content(build_srt(tr.segments),
+                                "application/x-subrip");
+                return;
+            }
+            if (fmt == "vtt") {
+                res.set_content(build_vtt(tr.segments), "text/vtt");
+                return;
+            }
+            nlohmann::json out;
+            out["text"] = tr.text;
+            if (fmt == "verbose_json") {
+                out["language"] =
+                    tr.language.empty() ? std::string("en") : tr.language;
+                out["duration"] = tr.duration_s;
+                nlohmann::json segs = nlohmann::json::array();
+                for (size_t i = 0; i < tr.segments.size(); i++) {
+                    segs.push_back(
+                        {{"id", (int)i},
+                         {"start", tr.segments[i].t0},
+                         {"end", tr.segments[i].t1},
+                         {"text", tr.segments[i].text}});
+                }
+                out["segments"] = segs;
+            }
+            res.set_content(out.dump(), "application/json");
         });
 
         // Chimerafile extension: what is loaded, what is queued, how long
