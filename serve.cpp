@@ -41,6 +41,7 @@
 //   args       engine flags passed through verbatim (llama.cpp options for
 //              llama: --ctk, --ctv, --temp, ...)
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <cstdarg>
@@ -68,6 +69,7 @@
 #include "common.h"
 #include "arg.h"
 #include "sampling.h"
+#include "chat.h"
 #include <nlohmann/json.hpp>
 #include <cpp-httplib/httplib.h>
 #include "whisper.h"
@@ -359,6 +361,7 @@ struct PhysModel {
     // llama.cpp handles; cparams must outlive the init result
     common_params cparams;
     common_init_result_ptr init;
+    common_chat_templates_ptr chat_tmpl;  // llama: the model's chat template
     // the other engines' handles
     whisper_context * wctx = nullptr;
     sd_ctx_t * sctx = nullptr;
@@ -375,6 +378,9 @@ struct PhysModel {
 
 static void load_llama(PhysModel &p, std::string &err) {
     const ModelEntry &e = *p.entries.front();
+    // A re-load after TTL eviction starts from fresh defaults: the parser
+    // asserts on stale values a previous load of this handle left behind.
+    p.cparams = common_params();
     std::vector<std::string> strs = {"chimerafile serve", "-m", e.file};
     for (const auto &a : e.args)
         strs.push_back(a);
@@ -397,8 +403,11 @@ static void load_llama(PhysModel &p, std::string &err) {
         p.cparams.n_gpu_layers = e.gpu_layers;
 
     p.init = common_init_from_params(p.cparams, false);
-    if (!p.init)
+    if (!p.init) {
         err = "llama: failed to load '" + e.file + "' (out of memory?)";
+        return;
+    }
+    p.chat_tmpl = common_chat_templates_init(p.init->model(), "");
 }
 
 static void load_whisper(PhysModel &p, std::string &err) {
@@ -438,6 +447,8 @@ static void load_engine(PhysModel &p, std::string &err) {
 }
 
 static void unload_engine(PhysModel &p) {
+    // the chat template may reference the model; drop it first
+    p.chat_tmpl.reset();
     if (p.init)
         p.init.reset();
     if (p.wctx) { whisper_free(p.wctx); p.wctx = nullptr; }
@@ -445,24 +456,231 @@ static void unload_engine(PhysModel &p) {
     if (p.tmodel) { transcribe_model_free(p.tmodel); p.tmodel = nullptr; }
 }
 
+// ── Chat generation (llama) ──────────────────────────────────────────────
+//
+// One OpenAI chat completion, built entirely from official llama.cpp
+// client machinery: OpenAI messages in through
+// common_chat_msgs_parse_oaicompat, the model's chat template applied
+// through common_chat_templates_apply, sampling through a common_sampler
+// built from the config's engine args (which llama.cpp's own CLI parser
+// interpreted at load time) with the request's sampling fields applied
+// on top.  In this APE the generation must run on the process' main
+// thread (see Residency below), so run_chat is executed by the pump
+// through an InferJob; the HTTP workers only parse the request, wait,
+// and serialize the response.
+
+struct ChatRequest {
+    nlohmann::ordered_json messages;
+    float temperature = -1.0f;  // < 0 = not set in the request
+    float top_p = -1.0f;
+    int top_k = -1;
+    int max_tokens = 0;         // 0 = as many as the context allows
+    bool stream = false;
+    bool seed_set = false;
+    uint32_t seed = 0;
+    std::vector<std::string> stop;
+};
+
+static bool parse_chat_request(const nlohmann::ordered_json &body,
+                               ChatRequest &out, std::string &err) {
+    if (!body.contains("messages") || !body["messages"].is_array() ||
+        body["messages"].empty()) {
+        err = "'messages' must be a non-empty array";
+        return false;
+    }
+    out.messages = body["messages"];
+    if (body.contains("temperature") && body["temperature"].is_number())
+        out.temperature = body["temperature"].get<float>();
+    if (body.contains("top_p") && body["top_p"].is_number())
+        out.top_p = body["top_p"].get<float>();
+    if (body.contains("top_k") && body["top_k"].is_number())
+        out.top_k = body["top_k"].get<int>();
+    if (body.contains("max_tokens") && body["max_tokens"].is_number())
+        out.max_tokens = body["max_tokens"].get<int>();
+    if (body.contains("max_completion_tokens") &&
+        body["max_completion_tokens"].is_number())
+        out.max_tokens = body["max_completion_tokens"].get<int>();
+    if (body.contains("stream") && body["stream"].is_boolean())
+        out.stream = body["stream"].get<bool>();
+    if (body.contains("seed") && body["seed"].is_number()) {
+        out.seed = body["seed"].get<uint32_t>();
+        out.seed_set = true;
+    }
+    if (body.contains("stop")) {
+        if (body["stop"].is_string())
+            out.stop.push_back(body["stop"].get<std::string>());
+        else if (body["stop"].is_array())
+            for (const auto &s : body["stop"])
+                if (s.is_string())
+                    out.stop.push_back(s.get<std::string>());
+    }
+    if (body.contains("n") && body["n"].is_number() && body["n"].get<int>() != 1) {
+        err = "'n' > 1 is not supported";
+        return false;
+    }
+    return true;
+}
+
+struct GenResult {
+    bool ok = false;
+    std::string err;
+    std::string text;
+    int prompt_tokens = 0;
+    int completion_tokens = 0;
+    std::string finish;  // "stop" | "length"
+};
+
+// Run one chat generation on a loaded model.  Must run on the process'
+// main thread (the host-compiled GPU backend only has working
+// host-glibc malloc state there).  on_piece is called for every decoded
+// response piece; returning false aborts the generation early (e.g. the
+// client went away).
+static GenResult run_chat(PhysModel &p, const ChatRequest &req,
+                          const std::function<bool(const char *, size_t)> &on_piece) {
+    GenResult out;
+    auto *model = p.init->model();
+    auto *ctx = p.init->context();
+    auto *vocab = llama_model_get_vocab(model);
+    if (!p.chat_tmpl) {
+        out.err = "model has no chat template";
+        return out;
+    }
+
+    // Per-request sampler: the config's engine args with the OpenAI
+    // sampling fields applied on top.
+    common_params_sampling sp = p.cparams.sampling;
+    if (req.temperature >= 0.0f) sp.temp = req.temperature;
+    if (req.top_p >= 0.0f) sp.top_p = req.top_p;
+    if (req.top_k >= 0) sp.top_k = req.top_k;
+    if (req.seed_set) sp.seed = req.seed;
+    auto *gs = common_sampler_init(model, sp);
+    if (!gs) {
+        out.err = "failed to initialize the sampler";
+        return out;
+    }
+
+    // OpenAI messages -> the model's chat template -> prompt
+    common_chat_templates_inputs in;
+    in.messages = common_chat_msgs_parse_oaicompat(req.messages);
+    auto chat = common_chat_templates_apply(p.chat_tmpl.get(), in);
+
+    int32_t n_prompt = llama_tokenize(vocab, chat.prompt.data(),
+                                      (int32_t)chat.prompt.size(), nullptr, 0,
+                                      true, false);
+    if (n_prompt < 0)
+        n_prompt = -n_prompt;
+    if (n_prompt > (int32_t)llama_n_ctx(ctx)) {
+        out.err = "prompt is longer than the context (" +
+                  std::to_string(llama_n_ctx(ctx)) + " tokens)";
+        common_sampler_free(gs);
+        return out;
+    }
+    std::vector<llama_token> prompt_tokens(n_prompt);
+    llama_tokenize(vocab, chat.prompt.data(), (int32_t)chat.prompt.size(),
+                   prompt_tokens.data(), n_prompt, true, false);
+    out.prompt_tokens = n_prompt;
+
+    // Decode the prompt in batches (token positions track themselves).
+    int n_batch = llama_n_batch(ctx);
+    for (int i = 0; i < n_prompt; i += n_batch) {
+        int n = std::min(n_batch, n_prompt - i);
+        if (llama_decode(ctx, llama_batch_get_one(prompt_tokens.data() + i, n)) != 0) {
+            out.err = "failed to decode the prompt";
+            common_sampler_free(gs);
+            return out;
+        }
+    }
+
+    // Generate: sample, accept, emit, decode, repeat.  The sampler takes the
+    // batch-token index of the last decoded token; -1 is the last output row,
+    // which is the right one both after the prompt batch (only its final
+    // token has logits) and after each 1-token generation batch.
+    int max_tokens = req.max_tokens > 0 ? req.max_tokens
+                                        : (int)llama_n_ctx(ctx) - n_prompt;
+    for (int i = 0; i < max_tokens; i++) {
+        llama_token tok = common_sampler_sample(gs, ctx, -1);
+        common_sampler_accept(gs, tok, true);
+        if (llama_vocab_is_eog(vocab, tok)) {
+            out.finish = "stop";
+            break;
+        }
+        char buf[1024];
+        int n = llama_token_to_piece(vocab, tok, buf, (int32_t)sizeof buf, 0, false);
+        if (n < 0) {
+            out.err = "failed to decode a response token";
+            common_sampler_free(gs);
+            return out;
+        }
+        out.text.append(buf, n);
+        out.completion_tokens++;
+        if (!on_piece(buf, n))
+            break;  // client went away
+        bool stopped = false;
+        for (const auto &s : req.stop) {
+            if (!s.empty() && out.text.size() >= s.size() &&
+                out.text.compare(out.text.size() - s.size(), s.size(), s) == 0) {
+                out.text.erase(out.text.size() - s.size());
+                stopped = true;
+                break;
+            }
+        }
+        if (stopped) {
+            out.finish = "stop";
+            break;
+        }
+        if (llama_decode(ctx, llama_batch_get_one(&tok, 1)) != 0) {
+            out.err = "failed to decode a response token";
+            common_sampler_free(gs);
+            return out;
+        }
+    }
+    if (out.finish.empty())
+        out.finish = "length";
+    out.ok = true;
+    common_sampler_free(gs);
+    return out;
+}
+
+// One chat generation submitted to the main thread's pump.  The pump
+// owns the run (in this APE only the main thread has a working
+// host-glibc malloc state, which the host-compiled GPU backend
+// allocates through); the submitting HTTP worker waits for `finished`
+// (non-streaming) or drains `pieces` as they arrive (streaming).
+struct InferJob {
+    std::shared_ptr<PhysModel> p;
+    ChatRequest req;
+
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<std::string> pieces;  // pump -> streaming provider
+    bool consumer_gone = false;      // the provider gave up (client gone)
+    GenResult result;                // valid once `finished`
+    bool finished = false;           // run_chat returned
+};
+
 class Residency {
     Config &cfg;
     mutable std::mutex mu;
     std::map<std::string, std::shared_ptr<PhysModel>> phys;
 
-    // In this APE, engine model load and unload only work on the process'
-    // main thread; inference works on any thread.  So every load/unload is
-    // posted to this queue and executed by the main thread's pump(), while
-    // the HTTP workers run the actual inference.
+    // In this APE, every engine call that touches the host-compiled
+    // libraries (model load, unload, and inference alike) must run on the
+    // process' main thread -- the only thread with a working host-glibc
+    // malloc state (the host libraries' TLS is set up at dlopen time, for
+    // the dlopening thread only).  So everything engine-side is posted to
+    // this queue and executed by the main thread's pump(); the HTTP workers
+    // only do HTTP and JSON.
     struct LifeTask {
         std::shared_ptr<PhysModel> p;
         bool is_load;
         std::shared_ptr<std::promise<std::string>> result;  // null = fire and forget
+        std::shared_ptr<InferJob> infer;                    // non-null: run a generation
     };
-    std::mutex queue_mu;
+    mutable std::mutex queue_mu;
     std::condition_variable queue_cv;
     std::deque<LifeTask> tasks;
     std::atomic<bool> pump_running{false};
+    std::atomic<bool> task_running{false};   // the pump is handling a task
 
     std::thread sweeper;
     std::atomic<bool> running{false};
@@ -612,6 +830,42 @@ class Residency {
             result->set_value(res);
     }
 
+    void handle_infer(std::shared_ptr<InferJob> job) {
+        {
+            std::lock_guard<std::mutex> lk(job->mu);
+            if (job->consumer_gone) {
+                // the client went away before the run could even start
+                job->result.err = "client disconnected";
+                job->finished = true;
+                job->cv.notify_all();
+            }
+        }
+        if (job->finished) {
+            release(*job->p);
+            return;
+        }
+        auto on_piece = [&job](const char *s, size_t n) -> bool {
+            if (n == 0)
+                return true;
+            std::unique_lock<std::mutex> lk(job->mu);
+            // bounded queue: backpressure on the pump if the provider is slow
+            while (job->pieces.size() >= 256 && !job->consumer_gone)
+                job->cv.wait(lk);
+            if (job->consumer_gone)
+                return false;
+            job->pieces.emplace_back(s, n);
+            job->cv.notify_all();
+            return true;
+        };
+        job->result = run_chat(*job->p, job->req, on_piece);
+        {
+            std::lock_guard<std::mutex> lk(job->mu);
+            job->finished = true;
+            job->cv.notify_all();
+        }
+        release(*job->p);  // the model can now be TTL-evicted
+    }
+
 public:
     explicit Residency(Config &c) : cfg(c) {}
     ~Residency() { stop(); }
@@ -649,6 +903,30 @@ public:
     void release(PhysModel &p) {
         p.last_used = (long)time(nullptr);
         p.in_use.fetch_sub(1);
+    }
+
+    // Submit a generation to the main thread (worker thread).  The model
+    // must already be acquired; the pump releases it when the run finishes.
+    // Returns null if the pump is shutting down.
+    std::shared_ptr<InferJob> submit_infer(std::shared_ptr<PhysModel> p,
+                                           const ChatRequest &req) {
+        if (!pump_running.load())
+            return nullptr;
+        auto job = std::make_shared<InferJob>();
+        job->p = p;
+        job->req = req;
+        std::lock_guard<std::mutex> qk(queue_mu);
+        tasks.push_back(LifeTask{p, false, nullptr, job});
+        queue_cv.notify_one();
+        return job;
+    }
+
+    nlohmann::json queue_json() const {
+        std::lock_guard<std::mutex> qk(queue_mu);
+        nlohmann::json q;
+        q["pending"] = (int)tasks.size();
+        q["active"] = task_running.load();
+        return q;
     }
 
     // Explicit unload (preload / free-the-GPU control): dispatched to the
@@ -728,12 +1006,16 @@ public:
                 t = tasks.front();
                 tasks.pop_front();
             }
-            if (t.p) {
+            task_running = true;
+            if (t.infer)
+                handle_infer(t.infer);
+            else if (t.p) {
                 if (t.is_load)
                     handle_load(t.p);
                 else
                     handle_unload(t.p, t.result);
             }
+            task_running = false;
         }
     }
 
@@ -832,6 +1114,182 @@ struct Server {
             res.set_content(out.dump(), "application/json");
         });
 
+        // OpenAI: chat completions (llama engine models).
+        http.Post("/v1/chat/completions",
+                  [this](const httplib::Request &req, httplib::Response &res) {
+            auto send_err = [](httplib::Response &res, int status,
+                               const char *type, const char *code,
+                               const std::string &message) {
+                nlohmann::json out;
+                out["error"]["message"] = message;
+                out["error"]["type"] = type;
+                out["error"]["code"] = code;
+                res.status = status;
+                res.set_content(out.dump(), "application/json");
+            };
+
+            nlohmann::ordered_json body;
+            try {
+                body = nlohmann::ordered_json::parse(req.body);
+            } catch (...) {
+                send_err(res, 400, "invalid_request_error", "invalid_json",
+                         "request body is not valid JSON");
+                return;
+            }
+            if (!body.contains("model") || !body["model"].is_string()) {
+                send_err(res, 400, "invalid_request_error", "invalid_request",
+                         "'model' is required");
+                return;
+            }
+            ChatRequest cr;
+            std::string perr;
+            if (!parse_chat_request(body, cr, perr)) {
+                send_err(res, 400, "invalid_request_error", "invalid_request",
+                         perr);
+                return;
+            }
+            const ModelEntry *e = cfg.find(body["model"].get<std::string>());
+            if (!e) {
+                send_err(res, 404, "invalid_request_error", "model_not_found",
+                         "unknown model id");
+                return;
+            }
+            if (e->engine != EngineKind::Llama) {
+                send_err(res, 400, "invalid_request_error",
+                         "unsupported_model",
+                         std::string("model '") + e->id +
+                         "' runs on the " + engine_name(e->engine) +
+                         " engine, not llama");
+                return;
+            }
+            std::string err;
+            auto p = residency.acquire(*e, err);
+            if (!p) {
+                send_err(res, 503, "server_error", "model_load_failed", err);
+                return;
+            }
+
+            std::string id = "chatcmpl-" + std::to_string(time(nullptr));
+            long created = (long)time(nullptr);
+
+            if (!cr.stream) {
+                auto job = residency.submit_infer(p, cr);
+                if (!job) {
+                    residency.release(*p);
+                    send_err(res, 503, "server_error", "server_busy",
+                             "server is shutting down");
+                    return;
+                }
+                GenResult g;
+                {
+                    std::unique_lock<std::mutex> lk(job->mu);
+                    job->cv.wait(lk, [&] { return job->finished; });
+                }
+                g = job->result;
+                if (!g.ok) {
+                    send_err(res, 500, "server_error", "generation_failed",
+                             g.err);
+                    return;
+                }
+                nlohmann::json out;
+                out["id"] = id;
+                out["object"] = "chat.completion";
+                out["created"] = created;
+                out["model"] = e->id;
+                nlohmann::json choice;
+                choice["index"] = 0;
+                choice["message"]["role"] = "assistant";
+                choice["message"]["content"] = g.text;
+                choice["finish_reason"] = g.finish;
+                out["choices"] = {choice};
+                out["usage"]["prompt_tokens"] = g.prompt_tokens;
+                out["usage"]["completion_tokens"] = g.completion_tokens;
+                out["usage"]["total_tokens"] =
+                    g.prompt_tokens + g.completion_tokens;
+                res.set_content(out.dump(), "application/json");
+                return;
+            }
+
+            // Streaming: Server-Sent Events via a chunked content provider.
+            // The generation itself runs on the main thread (pump); the
+            // provider only copies pieces to the client as they arrive.
+            auto job = residency.submit_infer(p, cr);
+            if (!job) {
+                residency.release(*p);
+                send_err(res, 503, "server_error", "server_busy",
+                         "server is shutting down");
+                return;
+            }
+            res.set_chunked_content_provider(
+                "text/event-stream",
+                [job, id, created, model_id = e->id](
+                    size_t, httplib::DataSink &sink) -> bool {
+                    auto chunk = [&](const nlohmann::json &delta,
+                                     const char *finish) {
+                        nlohmann::json c;
+                        c["id"] = id;
+                        c["object"] = "chat.completion.chunk";
+                        c["created"] = created;
+                        c["model"] = model_id;
+                        nlohmann::json ch;
+                        ch["index"] = 0;
+                        ch["delta"] = delta;
+                        ch["finish_reason"] = finish
+                            ? nlohmann::json(finish)
+                            : nlohmann::json(nullptr);
+                        c["choices"] = {ch};
+                        std::string frame = "data: " + c.dump() + "\n\n";
+                        return sink.write(frame.data(), frame.size());
+                    };
+                    auto gone = [&job] {
+                        std::lock_guard<std::mutex> lk(job->mu);
+                        job->consumer_gone = true;
+                        job->cv.notify_all();
+                    };
+                    if (!chunk({{"role", "assistant"}}, nullptr)) {
+                        gone();
+                        return true;  // client gone
+                    }
+                    bool ok = false;
+                    std::string finish;
+                    {
+                        std::unique_lock<std::mutex> lk(job->mu);
+                        for (;;) {
+                            if (!job->pieces.empty()) {
+                                std::string piece =
+                                    std::move(job->pieces.front());
+                                job->pieces.pop_front();
+                                lk.unlock();
+                                nlohmann::json d;
+                                d["content"] = std::move(piece);
+                                if (!chunk(d, nullptr)) {
+                                    gone();
+                                    return true;  // client gone
+                                }
+                                lk.lock();
+                                continue;
+                            }
+                            if (job->finished) {
+                                ok = job->result.ok;
+                                finish = job->result.finish;
+                                break;
+                            }
+                            // a timeout so a stuck job cannot hang the
+                            // provider forever
+                            job->cv.wait_for(lk,
+                                             std::chrono::milliseconds(200));
+                        }
+                    }
+                    if (ok) {
+                        chunk(nlohmann::json::object(), finish.c_str());
+                        std::string done = "data: [DONE]\n\n";
+                        sink.write(done.data(), done.size());
+                    }
+                    sink.done();
+                    return true;
+                });
+        });
+
         // Chimerafile extension: what is loaded, what is queued, how long
         // the server has been up.
         http.Get("/v1/status", [this](const httplib::Request &,
@@ -840,7 +1298,7 @@ struct Server {
             out["listen"] = cfg.host + ":" + std::to_string(cfg.port);
             out["key"] = !cfg.key.empty();
             out["uptime_s"] = (long)(time(nullptr) - start_at);
-            out["queue"] = {{"pending", 0}, {"active", nullptr}};
+            out["queue"] = residency.queue_json();
             out["resident"] = residency.resident_json();
             res.set_content(out.dump(), "application/json");
         });
@@ -899,9 +1357,13 @@ struct Server {
             res.set_content(out.dump(), "application/json");
         });
 
+        // In this httplib fork the error handler runs for every response
+        // with status >= 400, including the JSON errors our own handlers
+        // send; only rewrite the body of truly unrouted requests, which
+        // arrive with an empty body.
         http.set_error_handler([](const httplib::Request &,
                                   httplib::Response &res) {
-            if (res.status == 404 || res.status == 405) {
+            if ((res.status == 404 || res.status == 405) && res.body.empty()) {
                 res.set_content(
                     "{\"error\":{\"message\":\"no such route "
                     "(engine routing lands in the next steps)\","
@@ -1022,9 +1484,10 @@ int serve_main(int argc, char **argv) {
         return 1;
     }
 
-    // The main thread owns the model lifecycle (in this APE, load and unload
-    // only work on the main thread); the HTTP workers run the inference.
-    // pump() returns when a signal asks for shutdown.
+    // The main thread owns every engine call (load, unload, inference -- in
+    // this APE only the main thread has a working host-glibc malloc state,
+    // which the host-compiled GPU backend depends on); the HTTP workers only
+    // do HTTP and JSON.  pump() returns when a signal asks for shutdown.
     server.residency.pump();
     server.shutdown();
     fprintf(stderr, "serve: stopped\n");
