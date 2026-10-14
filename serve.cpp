@@ -407,6 +407,13 @@ struct PhysModel {
     common_params cparams;
     common_init_result_ptr init;
     common_chat_templates_ptr chat_tmpl;  // llama: the model's chat template
+    // llama: the conversation currently resident in the context's KV cache
+    // (the last chat request's prompt plus its generated tokens).  The
+    // next request that starts with exactly these tokens only decodes its
+    // tail -- clients like opencode resend the whole conversation each
+    // turn.  One conversation per model; a mismatched prefix clears the
+    // cache and prefills from scratch.  Main thread only.
+    std::vector<llama_token> chat_cache;
     // the other engines' handles
     whisper_context * wctx = nullptr;
     sd_ctx_t * sctx = nullptr;
@@ -436,7 +443,11 @@ static void load_llama(PhysModel &p, std::string &err) {
     argv.push_back(nullptr);
 
     // The engine's own CLI parser fills the params, so the config 'args'
-    // are genuine llama.cpp options (--temp, --ctk, --ctv, ...).
+    // are genuine llama.cpp options (--temp, --ctk, --ctv, ...).  Parsed
+    // with the common example: exactly the options common_init and the
+    // sampler consume here; server-tool-only options (like --cache-prompt,
+    // whose matching logic lives in llama-server's slot code) are rejected
+    // rather than silently ignored.
     if (!common_params_parse((int)argv.size() - 1, argv.data(), p.cparams,
                              LLAMA_EXAMPLE_COMMON, serve_parse_usage)) {
         err = "llama: invalid engine args for model '" + e.id + "'";
@@ -454,6 +465,7 @@ static void load_llama(PhysModel &p, std::string &err) {
         return;
     }
     p.chat_tmpl = common_chat_templates_init(p.init->model(), "");
+    p.chat_cache.clear();  // fresh context, empty cache
 }
 
 static void load_whisper(PhysModel &p, std::string &err) {
@@ -519,6 +531,7 @@ static void load_engine(PhysModel &p, std::string &err) {
 static void unload_engine(PhysModel &p) {
     // the chat template may reference the model; drop it first
     p.chat_tmpl.reset();
+    p.chat_cache.clear();
     if (p.init)
         p.init.reset();
     if (p.wctx) { whisper_free(p.wctx); p.wctx = nullptr; }
@@ -651,16 +664,33 @@ static GenResult run_chat(PhysModel &p, const ChatRequest &req,
                    prompt_tokens.data(), n_prompt, true, false);
     out.prompt_tokens = n_prompt;
 
-    // Decode the prompt in batches (token positions track themselves).
+    // Warm continuation: the context's KV cache still holds the previous
+    // request's conversation, and clients like opencode resend it in full
+    // every turn.  If this prompt starts with exactly the cached tokens,
+    // only the new tail needs prefiling; anything else gets a cleared
+    // cache and a full prefill.
+    int n_warm = (int)p.chat_cache.size() <= n_prompt &&
+                         std::equal(p.chat_cache.begin(), p.chat_cache.end(),
+                                    prompt_tokens.begin())
+                     ? (int)p.chat_cache.size()
+                     : 0;
+    if (n_warm == 0)
+        llama_memory_clear(llama_get_memory(ctx), false);
+
+    // Decode the prompt tail in batches (token positions track
+    // themselves: a nullptr pos appends at the cache's end).
     int n_batch = llama_n_batch(ctx);
-    for (int i = 0; i < n_prompt; i += n_batch) {
+    for (int i = n_warm; i < n_prompt; i += n_batch) {
         int n = std::min(n_batch, n_prompt - i);
         if (llama_decode(ctx, llama_batch_get_one(prompt_tokens.data() + i, n)) != 0) {
             out.err = "failed to decode the prompt";
+            llama_memory_clear(llama_get_memory(ctx), false);
+            p.chat_cache.clear();
             common_sampler_free(gs);
             return out;
         }
     }
+    std::vector<llama_token> gen_tokens;  // what this request appends
 
     // Generate: sample, accept, emit, decode, repeat.  The sampler takes the
     // batch-token index of the last decoded token; -1 is the last output row,
@@ -679,13 +709,20 @@ static GenResult run_chat(PhysModel &p, const ChatRequest &req,
         int n = llama_token_to_piece(vocab, tok, buf, (int32_t)sizeof buf, 0, false);
         if (n < 0) {
             out.err = "failed to decode a response token";
+            p.chat_cache = prompt_tokens;
+            p.chat_cache.insert(p.chat_cache.end(), gen_tokens.begin(),
+                                gen_tokens.end());
             common_sampler_free(gs);
             return out;
         }
         out.text.append(buf, n);
         out.completion_tokens++;
-        if (!on_piece(buf, n))
+        if (!on_piece(buf, n)) {
+            p.chat_cache = prompt_tokens;
+            p.chat_cache.insert(p.chat_cache.end(), gen_tokens.begin(),
+                                gen_tokens.end());
             break;  // client went away
+        }
         bool stopped = false;
         for (const auto &s : req.stop) {
             if (!s.empty() && out.text.size() >= s.size() &&
@@ -697,10 +734,16 @@ static GenResult run_chat(PhysModel &p, const ChatRequest &req,
         }
         if (stopped) {
             out.finish = "stop";
+            p.chat_cache = prompt_tokens;
+            p.chat_cache.insert(p.chat_cache.end(), gen_tokens.begin(),
+                                gen_tokens.end());
             break;
         }
+        gen_tokens.push_back(tok);
         if (llama_decode(ctx, llama_batch_get_one(&tok, 1)) != 0) {
             out.err = "failed to decode a response token";
+            llama_memory_clear(llama_get_memory(ctx), false);
+            p.chat_cache.clear();
             common_sampler_free(gs);
             return out;
         }
@@ -708,6 +751,8 @@ static GenResult run_chat(PhysModel &p, const ChatRequest &req,
     if (out.finish.empty())
         out.finish = "length";
     out.ok = true;
+    p.chat_cache = prompt_tokens;
+    p.chat_cache.insert(p.chat_cache.end(), gen_tokens.begin(), gen_tokens.end());
     common_sampler_free(gs);
     return out;
 }

@@ -113,7 +113,7 @@ All four engines behind one port, driven by a declarative config file:
 - `ctx`, `gpu_layers` — llama only (defaults 4096, `-1` = all layers on GPU).
 - `ttl` — seconds to stay in RAM when idle. Omitted = engine default (30 min llama, 5 min everything else); `0` = never.
 - `pin` — never unload, never evict.
-- `args` — CLI flags passed through verbatim, **llama only**: they go through llama.cpp's own CLI parser (`--temp`, `--ctk`, `--no-mmap`, ...). The other engines have no flag passthrough; their behaviour is steered by the request fields instead.
+- `args` — CLI flags passed through verbatim, **llama only**: they go through llama.cpp's own CLI parser (`--temp`, `--ctk`, `--no-mmap`, `--flash-attn on`, `--cache-type-k q8_0`, ...). Server-tool-only flags (like `--cache-prompt`, whose matching logic lives in llama-server's slot code) are rejected rather than silently ignored. The other engines have no flag passthrough; their behaviour is steered by the request fields instead.
 
 ### Endpoints
 
@@ -132,6 +132,7 @@ All four engines behind one port, driven by a declarative config file:
 ### How it runs
 
 - Models load on first use and stay in RAM for `ttl` seconds of idleness. Execution is serial — one engine job at a time, and all engine work (loads, inference, unloads) runs on the process' main thread: in this APE only the thread that dlopen'd the host engine libraries has a working host-glibc TLS state. So the first request for a model waits for its load, and concurrent requests queue behind it. Interactive work (chat, transcription) takes a fast lane ahead of queued image generations.
+- Chat requests continue the previous conversation: the context's KV cache is kept between requests, so a new prompt that starts with exactly the cached conversation (clients like opencode resend the whole conversation each turn) only prefills the new tail; a mismatched prefix clears the cache and prefills from scratch. One conversation per model entry — different clients on the same model evict each other's cache.
 - Diffusion models get a fresh engine context per request: the pinned stable-diffusion.cpp cannot run a second generation on the same context, so each image request pays a few seconds of model load.
 - Streaming caveat: `stop` strings are checked by llama.cpp at token boundaries, so a stream can overshoot a stop string by the rest of the token the match landed inside.
 - `temperature` and `prompt` on `/v1/audio/transcriptions` are whisper-only: whisper.cpp has both, transcribe.cpp has neither, and the server passes down only what the engine supports.
