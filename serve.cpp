@@ -1764,7 +1764,7 @@ struct Server {
             out["error"]["type"] = type;
             out["error"]["code"] = code;
             res.status = status;
-            res.set_content(out.dump(), "application/json");
+            res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
         };
         const ModelEntry *e = cfg.find(model_id);
         if (!e) {
@@ -1863,7 +1863,7 @@ struct Server {
         out["created"] = (long)time(nullptr);
         out["model"] = e->id;
         out["data"] = data;
-        res.set_content(out.dump(), "application/json");
+        res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
     }
 
     void register_routes() {
@@ -1917,7 +1917,7 @@ struct Server {
                 });
             }
             nlohmann::json out = {{"object", "list"}, {"data", data}};
-            res.set_content(out.dump(), "application/json");
+            res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
         });
 
         // OpenAI: chat completions (llama engine models).
@@ -1931,7 +1931,7 @@ struct Server {
                 out["error"]["type"] = type;
                 out["error"]["code"] = code;
                 res.status = status;
-                res.set_content(out.dump(), "application/json");
+                res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
             };
 
             nlohmann::ordered_json body;
@@ -2024,7 +2024,7 @@ struct Server {
                 out["usage"]["completion_tokens"] = g.completion_tokens;
                 out["usage"]["total_tokens"] =
                     g.prompt_tokens + g.completion_tokens;
-                res.set_content(out.dump(), "application/json");
+                res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
                 return;
             }
 
@@ -2088,7 +2088,7 @@ struct Server {
                             ? nlohmann::json(finish)
                             : nlohmann::json(nullptr);
                         c["choices"] = {ch};
-                        std::string frame = "data: " + c.dump() + "\n\n";
+                        std::string frame = "data: " + c.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) + "\n\n";
                         return sink.write(frame.data(), frame.size());
                     };
                     auto gone = [&st] {
@@ -2137,6 +2137,23 @@ struct Server {
                         chunk(nlohmann::json::object(), finish.c_str());
                         std::string done = "data: [DONE]\n\n";
                         sink.write(done.data(), done.size());
+                    } else {
+                        // The generation failed after the stream had started
+                        // (e.g. a decode error).  Tell the client instead of
+                        // just closing: a bare close makes OpenAI clients
+                        // report "stream ended without finish_reason".
+                        nlohmann::json err;
+                        err["error"]["message"] = st->result.err.empty()
+                            ? "generation failed" : st->result.err;
+                        err["error"]["type"] = "server_error";
+                        std::string frame =
+                            "data: " +
+                            err.dump(-1, ' ', false,
+                                     nlohmann::json::error_handler_t::replace) +
+                            "\n\n";
+                        sink.write(frame.data(), frame.size());
+                        serve_log("stream: generation failed: %s\n",
+                                  st->result.err.c_str());
                     }
                     sink.done();
                     return true;
@@ -2158,7 +2175,7 @@ struct Server {
                 out["error"]["type"] = type;
                 out["error"]["code"] = code;
                 res.status = status;
-                res.set_content(out.dump(), "application/json");
+                res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
             };
 
             if (!req.is_multipart_form_data()) {
@@ -2310,7 +2327,7 @@ struct Server {
                 }
                 out["segments"] = segs;
             }
-            res.set_content(out.dump(), "application/json");
+            res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
         });
 
         // OpenAI: image generation (diffusion engine models).
@@ -2324,7 +2341,7 @@ struct Server {
                 out["error"]["type"] = type;
                 out["error"]["code"] = code;
                 res.status = status;
-                res.set_content(out.dump(), "application/json");
+                res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
             };
             nlohmann::json body;
             try {
@@ -2374,7 +2391,7 @@ struct Server {
                 out["error"]["type"] = type;
                 out["error"]["code"] = code;
                 res.status = status;
-                res.set_content(out.dump(), "application/json");
+                res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
             };
             if (!req.is_multipart_form_data()) {
                 send_err(res, 400, "invalid_request_error",
@@ -2462,7 +2479,7 @@ struct Server {
             out["uptime_s"] = (long)(time(nullptr) - start_at);
             out["queue"] = residency.queue_json();
             out["resident"] = residency.resident_json();
-            res.set_content(out.dump(), "application/json");
+            res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
         });
 
         // Chimerafile extensions: preload / explicit-unload controls.
@@ -2485,7 +2502,7 @@ struct Server {
                     nlohmann::json({{"error", {{"message", err},
                                                {"type", "server_error"},
                                                {"code", "model_load_failed"}}}})
-                        .dump(),
+                        .dump(-1, ' ', false, nlohmann::json::error_handler_t::replace),
                     "application/json");
                 return;
             }
@@ -2493,7 +2510,7 @@ struct Server {
             nlohmann::json out;
             out["id"] = e->id;
             out["state"] = "loaded";
-            res.set_content(out.dump(), "application/json");
+            res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
         });
 
         http.Post(R"(^/v1/residency/([A-Za-z0-9_-]+)/unload$)",
@@ -2504,7 +2521,7 @@ struct Server {
             if (!e) {
                 res.status = 404;
                 out["state"] = "unknown";
-                res.set_content(out.dump(), "application/json");
+                res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
                 return;
             }
             std::string err;
@@ -2512,11 +2529,11 @@ struct Server {
                 res.status = 409;
                 out["state"] = "busy";
                 out["error"] = err;
-                res.set_content(out.dump(), "application/json");
+                res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
                 return;
             }
             out["state"] = "unloaded";
-            res.set_content(out.dump(), "application/json");
+            res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
         });
 
         // In this httplib fork the error handler runs for every response
