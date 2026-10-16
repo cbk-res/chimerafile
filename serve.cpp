@@ -1028,22 +1028,41 @@ static GenResult run_chat(PhysModel &p, const ChatRequest &req,
             reply = common_chat_parse(out.text, false, pp);
             strict_ok = true;
         } catch (const std::exception &) {
-            // The model spelled its turn-end role marker out as text after
-            // the tool-call markup.  The grammar ends right behind the
-            // closing call tag and then demands end of input, so the marker
-            // (and the newlines the model emitted before it) broke the
-            // parse: drop it and parse once more.
-            for (const auto &marker : turn_end_markers) {
-                std::string trimmed = out.text;
-                strip_assistant_turn_end(trimmed, marker);
-                if (trimmed == out.text)
-                    continue;  // marker was not there
+            // The model trailed the reply with whitespace the grammar
+            // (which ends at end-of-input) does not expect: drop it and
+            // parse once more.
+            std::string ws_trimmed = out.text;
+            while (!ws_trimmed.empty() &&
+                   std::isspace((unsigned char)ws_trimmed.back()))
+                ws_trimmed.pop_back();
+            if (!ws_trimmed.empty() && ws_trimmed != out.text) {
                 try {
-                    reply = common_chat_parse(trimmed, false, pp);
+                    reply = common_chat_parse(ws_trimmed, false, pp);
                     strict_ok = true;
-                    break;
                 } catch (const std::exception &) {
-                    // not this marker either; the fallback below still runs
+                    // the whitespace was not the problem
+                }
+            }
+            if (!strict_ok) {
+                // The model spelled its turn-end role marker out as text
+                // after the tool-call markup.  The grammar ends right
+                // behind the closing call tag and then demands end of
+                // input, so the marker (and the newlines the model
+                // emitted before it) broke the parse: drop it and parse
+                // once more.
+                for (const auto &marker : turn_end_markers) {
+                    std::string trimmed = out.text;
+                    strip_assistant_turn_end(trimmed, marker);
+                    if (trimmed == out.text)
+                        continue;  // marker was not there
+                    try {
+                        reply = common_chat_parse(trimmed, false, pp);
+                        strict_ok = true;
+                        break;
+                    } catch (const std::exception &) {
+                        // not this marker either; the fallback below still
+                        // runs
+                    }
                 }
             }
         }
