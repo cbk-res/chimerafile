@@ -57,6 +57,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <pthread.h>
 #include <string>
 #include <thread>
@@ -563,6 +564,10 @@ struct ChatRequest {
     bool seed_set = false;
     uint32_t seed = 0;
     std::vector<std::string> stop;
+    std::vector<common_chat_tool> tools;  // parsed by the engine's own parser
+    common_chat_tool_choice tool_choice = COMMON_CHAT_TOOL_CHOICE_AUTO;
+    bool parallel_tool_calls = false;
+    bool parallel_tool_calls_set = false;  // absent -> the template decides
 };
 
 static bool parse_chat_request(const nlohmann::ordered_json &body,
@@ -602,6 +607,50 @@ static bool parse_chat_request(const nlohmann::ordered_json &body,
         err = "'n' > 1 is not supported";
         return false;
     }
+    // Tools go through the engine's own parsers, so bad input fails here
+    // (400) instead of inside the model.
+    try {
+        if (body.contains("tools")) {
+            if (!body["tools"].is_array()) {
+                err = "'tools' must be an array";
+                return false;
+            }
+            out.tools = common_chat_tools_parse_oaicompat(body["tools"]);
+        }
+        if (body.contains("tool_choice")) {
+            const auto &tc = body["tool_choice"];
+            std::string choice;
+            if (tc.is_string()) {
+                choice = tc.get<std::string>();
+            } else if (tc.is_object()) {
+                // OpenAI's object form: {"type": "none"} or
+                // {"type": "function", ...}.  A named function maps to
+                // "required" -- the template parser cannot pin the name.
+                const auto type = tc.value("type", std::string());
+                if (type == "none")
+                    choice = "none";
+                else if (type == "function")
+                    choice = "required";
+                else {
+                    err = "'tool_choice' object must have type "
+                          "'none' or 'function'";
+                    return false;
+                }
+            } else {
+                err = "'tool_choice' must be a string or object";
+                return false;
+            }
+            out.tool_choice = common_chat_tool_choice_parse_oaicompat(choice);
+        }
+        if (body.contains("parallel_tool_calls") &&
+            body["parallel_tool_calls"].is_boolean()) {
+            out.parallel_tool_calls = body["parallel_tool_calls"].get<bool>();
+            out.parallel_tool_calls_set = true;
+        }
+    } catch (const std::exception &e) {
+        err = e.what();
+        return false;
+    }
     return true;
 }
 
@@ -611,16 +660,55 @@ struct GenResult {
     std::string text;
     int prompt_tokens = 0;
     int completion_tokens = 0;
-    std::string finish;  // "stop" | "length"
+    std::string finish;  // "stop" | "length" | "tool_calls"
+    nlohmann::ordered_json tool_calls;  // OpenAI format; null unless a tool was called
+    std::string tool_content;           // content with the tool-call markup stripped
 };
+
+// One piece of a streaming reply: clean content (thinking inline) and/or
+// one entry of the tool_calls delta.
+struct GenDelta {
+    std::string content;
+    nlohmann::ordered_json tool_call;  // null unless set
+};
+
+// OpenAI-style tool call id for calls the template parser left
+// anonymous (llama-server generates these the same way).
+static std::string gen_tool_call_id() {
+    static std::mt19937 rng(std::random_device{}());
+    static const char hex[] = "0123456789abcdef";
+    std::uniform_int_distribution<int> d(0, 15);
+    std::string id = "call_";
+    for (int i = 0; i < 24; i++)
+        id += hex[d(rng)];
+    return id;
+}
+
+// The model closes an assistant turn with the template's role marker
+// (ChatML: "<|im_end|>").  The tool-call PEG grammar ends right behind the
+// closing call tag and then demands end of input, so the marker and the
+// newlines the model emits before it are trailing junk to the non-partial
+// parse.  Remove one trailing marker, with the whitespace around it.
+static void strip_assistant_turn_end(std::string &s, const std::string &marker) {
+    auto ws = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
+    auto rtrim = [&] { while (!s.empty() && ws(s.back())) s.pop_back(); };
+    rtrim();
+    if (!marker.empty() && s.size() >= marker.size() &&
+        s.compare(s.size() - marker.size(), marker.size(), marker) == 0) {
+        s.erase(s.size() - marker.size());
+        rtrim();
+    }
+}
 
 // Run one chat generation on a loaded model.  Must run on the process'
 // main thread (the host-compiled GPU backend only has working
-// host-glibc malloc state there).  on_piece is called for every decoded
-// response piece; returning false aborts the generation early (e.g. the
-// client went away).
+// host-glibc malloc state there).  on_delta is called with each decoded
+// piece of the reply -- clean content (thinking inline) and structured
+// tool-call deltas, produced by the model's own chat template parser;
+// returning false aborts the generation early (e.g. the client went
+// away).
 static GenResult run_chat(PhysModel &p, const ChatRequest &req,
-                          const std::function<bool(const char *, size_t)> &on_piece) {
+                          const std::function<bool(const GenDelta &)> &on_delta) {
     GenResult out;
     auto *model = p.init->model();
     auto *ctx = p.init->context();
@@ -629,6 +717,23 @@ static GenResult run_chat(PhysModel &p, const ChatRequest &req,
         out.err = "model has no chat template";
         return out;
     }
+
+    // Candidate end-of-turn markers, most specific first: the model's own
+    // end-of-turn token, its end-of-sentence token, then the marker this
+    // ChatML template closes assistant turns with.
+    auto token_text = [&](llama_token t) -> std::string {
+        if (t < 0)
+            return {};
+        const char *text = llama_vocab_get_text(vocab, t);
+        return text ? std::string(text) : std::string();
+    };
+    std::vector<std::string> turn_end_markers;
+    for (llama_token t : { llama_vocab_eot(vocab), llama_vocab_eos(vocab) }) {
+        std::string m = token_text(t);
+        if (!m.empty())
+            turn_end_markers.push_back(m);
+    }
+    turn_end_markers.push_back("<|im_end|>");
 
     // Per-request sampler: the config's engine args with the OpenAI
     // sampling fields applied on top.
@@ -643,10 +748,28 @@ static GenResult run_chat(PhysModel &p, const ChatRequest &req,
         return out;
     }
 
-    // OpenAI messages -> the model's chat template -> prompt
+    // OpenAI messages + tools -> the model's chat template -> prompt.
+    // The template renders the tool schemas into the prompt and carries
+    // a PEG parser for the matching tool-call markup in the reply.
     common_chat_templates_inputs in;
     in.messages = common_chat_msgs_parse_oaicompat(req.messages);
-    auto chat = common_chat_templates_apply(p.chat_tmpl.get(), in);
+    in.tools = req.tools;
+    in.tool_choice = req.tool_choice;
+    // As in llama-server: when the client omits the field, the template's
+    // own capability decides (its grammar may allow only one call).
+    in.parallel_tool_calls =
+        req.parallel_tool_calls_set
+            ? req.parallel_tool_calls
+            : common_chat_templates_get_caps(p.chat_tmpl.get())
+                  .at("supports_parallel_tool_calls");
+    common_chat_params chat;
+    try {
+        chat = common_chat_templates_apply(p.chat_tmpl.get(), in);
+    } catch (const std::exception &e) {
+        out.err = std::string("chat template failed: ") + e.what();
+        common_sampler_free(gs);
+        return out;
+    }
 
     int32_t n_prompt = llama_tokenize(vocab, chat.prompt.data(),
                                       (int32_t)chat.prompt.size(), nullptr, 0,
@@ -692,6 +815,25 @@ static GenResult run_chat(PhysModel &p, const ChatRequest &req,
     }
     std::vector<llama_token> gen_tokens;  // what this request appends
 
+    // Incremental reply parse: the template's own PEG parser turns the
+    // raw output into clean content (thinking inline) and structured
+    // tool-call deltas as they complete.  If it ever fails to follow the
+    // output, the rest of the reply streams as raw text.
+    common_chat_parser_params pp(chat);
+    if (!chat.parser.empty())
+        pp.parser.load(chat.parser);
+    common_chat_msg msg_prv;
+    std::vector<std::string> tc_ids;
+    std::string gen_text;
+    bool parse_broken = false;
+    bool aborted = false;
+    auto emit = [&](const GenDelta &d) {
+        if (d.content.empty() && d.tool_call.is_null())
+            return;
+        if (!on_delta(d))
+            aborted = true;
+    };
+
     // Generate: sample, accept, emit, decode, repeat.  The sampler takes the
     // batch-token index of the last decoded token; -1 is the last output row,
     // which is the right one both after the prompt batch (only its final
@@ -717,7 +859,44 @@ static GenResult run_chat(PhysModel &p, const ChatRequest &req,
         }
         out.text.append(buf, n);
         out.completion_tokens++;
-        if (!on_piece(buf, n)) {
+        gen_text.append(buf, n);
+        if (parse_broken) {
+            GenDelta d;
+            d.content.assign(buf, n);
+            emit(d);
+        } else {
+            try {
+                auto msg_new = common_chat_parse(gen_text, true, pp);
+                msg_new.set_tool_call_ids(tc_ids, gen_tool_call_id);
+                auto diffs = common_chat_msg_diff::compute_diffs(msg_prv, msg_new);
+                msg_prv = std::move(msg_new);
+                for (const auto &d : diffs) {
+                    GenDelta piece;
+                    piece.content = d.reasoning_content_delta + d.content_delta;
+                    if (d.tool_call_index != std::string::npos) {
+                        piece.tool_call["index"] = d.tool_call_index;
+                        nlohmann::ordered_json fn;
+                        if (!d.tool_call_delta.id.empty())
+                            piece.tool_call["id"] = d.tool_call_delta.id;
+                        if (!d.tool_call_delta.name.empty()) {
+                            piece.tool_call["type"] = "function";
+                            fn["name"] = d.tool_call_delta.name;
+                        }
+                        if (!d.tool_call_delta.arguments.empty())
+                            fn["arguments"] = d.tool_call_delta.arguments;
+                        if (!fn.empty())
+                            piece.tool_call["function"] = fn;
+                    }
+                    emit(piece);
+                }
+            } catch (const std::exception &) {
+                parse_broken = true;  // stream raw text from here on
+                GenDelta d;
+                d.content.assign(buf, n);
+                emit(d);
+            }
+        }
+        if (aborted) {
             p.chat_cache = prompt_tokens;
             p.chat_cache.insert(p.chat_cache.end(), gen_tokens.begin(),
                                 gen_tokens.end());
@@ -746,6 +925,86 @@ static GenResult run_chat(PhysModel &p, const ChatRequest &req,
             p.chat_cache.clear();
             common_sampler_free(gs);
             return out;
+        }
+    }
+    // Final parse: the reply's tool-call markup becomes structured
+    // tool_calls, and the content keeps everything else (thinking inline).
+    // Two failure modes bracket this parse:
+    //   * parse_broken: the incremental parse already streamed raw markup
+    //     as content, but a successful strict parse here can still yield
+    //     structured tool_calls -- keep them, losing them would be worse.
+    //   * the reverse: the incremental parse already emitted complete
+    //     tool-call deltas (the client saw them) and the strict parse
+    //     then fails on trailing junk before EOG -- fall back to that last
+    //     good message rather than reporting "stop" with no tool_calls.
+    {
+        auto to_oai = [](const std::vector<common_chat_tool_call> &tcs) {
+            nlohmann::ordered_json arr = nlohmann::ordered_json::array();
+            for (const auto &tc : tcs)
+                arr.push_back({
+                    {"id", tc.id},
+                    {"type", "function"},
+                    {"function", {
+                        {"name", tc.name},
+                        {"arguments", tc.arguments},
+                    }},
+                });
+            return arr;
+        };
+        // Usable = a name, an id, and arguments that are a JSON object
+        // (or empty).  A call the stream cut off mid-arguments is not.
+        auto complete = [](const std::vector<common_chat_tool_call> &tcs) {
+            for (const auto &tc : tcs) {
+                if (tc.name.empty() || tc.id.empty())
+                    return false;
+                if (tc.arguments.empty())
+                    continue;
+                auto a = nlohmann::json::parse(tc.arguments, nullptr, false);
+                if (a.is_discarded() || !a.is_object())
+                    return false;
+            }
+            return true;
+        };
+        bool strict_ok = false;
+        common_chat_msg reply;
+        try {
+            reply = common_chat_parse(out.text, false, pp);
+            strict_ok = true;
+        } catch (const std::exception &) {
+            // The model spelled its turn-end role marker out as text after
+            // the tool-call markup.  The grammar ends right behind the
+            // closing call tag and then demands end of input, so the marker
+            // (and the newlines the model emitted before it) broke the
+            // parse: drop it and parse once more.
+            for (const auto &marker : turn_end_markers) {
+                std::string trimmed = out.text;
+                strip_assistant_turn_end(trimmed, marker);
+                if (trimmed == out.text)
+                    continue;  // marker was not there
+                try {
+                    reply = common_chat_parse(trimmed, false, pp);
+                    strict_ok = true;
+                    break;
+                } catch (const std::exception &) {
+                    // not this marker either; the fallback below still runs
+                }
+            }
+        }
+        if (strict_ok) {
+            // reuse the incremental id cache so the ids match the ones
+            // the streaming deltas already emitted
+            reply.set_tool_call_ids(tc_ids, gen_tool_call_id);
+            if (!reply.tool_calls.empty()) {
+                out.tool_calls = to_oai(reply.tool_calls);
+                out.tool_content = reply.reasoning_content + reply.content;
+                out.finish = "tool_calls";
+            }
+        }
+        if (!strict_ok && out.tool_calls.is_null() &&
+            !msg_prv.tool_calls.empty() && complete(msg_prv.tool_calls)) {
+            out.tool_calls = to_oai(msg_prv.tool_calls);
+            out.tool_content = msg_prv.reasoning_content + msg_prv.content;
+            out.finish = "tool_calls";
         }
     }
     if (out.finish.empty())
@@ -1084,7 +1343,7 @@ struct EngineJob {
 struct StreamState {
     std::mutex mu;
     std::condition_variable cv;
-    std::deque<std::string> pieces;  // pump -> provider
+    std::deque<GenDelta> pieces;     // pump -> provider
     bool consumer_gone = false;      // the provider gave up (client gone)
     bool run_finished = false;       // run_chat returned
     GenResult result;                // valid once `run_finished`
@@ -1724,7 +1983,7 @@ struct Server {
                 job->p = p;
                 GenResult g;
                 job->run = [p, &cr, &g] {
-                    g = run_chat(*p, cr, [](const char *, size_t) {
+                    g = run_chat(*p, cr, [](const GenDelta &) {
                         return true;
                     });
                 };
@@ -1751,7 +2010,14 @@ struct Server {
                 nlohmann::json choice;
                 choice["index"] = 0;
                 choice["message"]["role"] = "assistant";
-                choice["message"]["content"] = g.text;
+                if (g.tool_calls.is_null()) {
+                    choice["message"]["content"] = g.text;
+                } else {
+                    choice["message"]["content"] = g.tool_content.empty()
+                        ? nlohmann::json(nullptr)
+                        : nlohmann::json(g.tool_content);
+                    choice["message"]["tool_calls"] = g.tool_calls;
+                }
                 choice["finish_reason"] = g.finish;
                 out["choices"] = {choice};
                 out["usage"]["prompt_tokens"] = g.prompt_tokens;
@@ -1779,9 +2045,7 @@ struct Server {
                         return;
                     }
                 }
-                auto on_piece = [st](const char *s, size_t n) -> bool {
-                    if (n == 0)
-                        return true;
+                auto on_delta = [st](const GenDelta &d) -> bool {
                     std::unique_lock<std::mutex> lk(st->mu);
                     // bounded queue: backpressure on the pump if the provider
                     // is slow
@@ -1789,11 +2053,11 @@ struct Server {
                         st->cv.wait(lk);
                     if (st->consumer_gone)
                         return false;
-                    st->pieces.emplace_back(s, n);
+                    st->pieces.push_back(d);
                     st->cv.notify_all();
                     return true;
                 };
-                st->result = run_chat(*p, cr, on_piece);
+                st->result = run_chat(*p, cr, on_delta);
                 {
                     std::lock_guard<std::mutex> lk(st->mu);
                     st->run_finished = true;
@@ -1842,13 +2106,16 @@ struct Server {
                         std::unique_lock<std::mutex> lk(st->mu);
                         for (;;) {
                             if (!st->pieces.empty()) {
-                                std::string piece =
+                                GenDelta piece =
                                     std::move(st->pieces.front());
                                 st->pieces.pop_front();
                                 lk.unlock();
                                 nlohmann::json d;
-                                d["content"] = std::move(piece);
-                                if (!chunk(d, nullptr)) {
+                                if (!piece.content.empty())
+                                    d["content"] = std::move(piece.content);
+                                if (!piece.tool_call.is_null())
+                                    d["tool_calls"] = {piece.tool_call};
+                                if (!d.empty() && !chunk(d, nullptr)) {
                                     gone();
                                     return true;  // client gone
                                 }

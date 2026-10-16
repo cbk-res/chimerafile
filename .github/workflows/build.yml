@@ -179,7 +179,7 @@ jobs:
         # and the package was removed from newer rocm/dev images anyway.
         run: |
           apt-get update -qq
-          apt-get install -y -qq git unzip
+          apt-get install -y -qq git unzip patch
       - uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -189,6 +189,8 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: zipalign-tool
+      - name: Patch llama.cpp — TinyBLAS-only ROCm (no hipBLAS)
+        run: bash ci-patches/patch-rocm-tinyblas.sh
       - name: Build ggml-rocm.so
         run: |
           cd llamafile

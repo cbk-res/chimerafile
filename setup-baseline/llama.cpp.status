@@ -1,6 +1,7 @@
 02920fd1a1ae82dc72189620a2625d4b750755f5	src/models/eagle3.cpp
 05e5c63c24b2e76da9120065d9f4edca974eb98c	tools/server/server-http.cpp
 066450fc5713e20c02c5228390eea42ef1c79a99	ggml/include/ggml-backend.h
+09cb60b3e8390a03fc7ae7fbc6d35ae7b87dbc4b	ggml/src/ggml-cuda/vendors/hip.h
 11256cb5f035a86880be83fe4f867a1ed63aed8b	ggml/src/ggml-backend-impl.h
 1160b7dc1e957e42409199cc5b4d7a224ddfe044	ggml/src/ggml-backend-reg.cpp
 1c680c6061760e33fc3492498c6983845a562526	BUILD.mk
@@ -20,7 +21,6 @@
 72ff4027b948a111a611a9ff41c6f72c7c8a8a89	README.llamafile
 73931d6c9f6402da83e5ad11e6e7da020c44c29a	tools/server/server-models.cpp
 7576e3a39952df7196228f94f56f7558eb780154	tools/server/server.cpp
-77e83629efebf52388ffe51ef215148f0902f2ed	ggml/src/ggml-cuda/common.cuh
 7e9208a31c12c6e5a1af6f6e163697e3441a0706	vendor/sheredom/subprocess.h
 813aff7d906390cb58a859f58a3d5578c86c0789	ggml/src/ggml-cuda/ggml-cuda.cu
 85f5585f04cac448706a633246d17a6b8471de8e	tools/server/server-queue.cpp
@@ -31,6 +31,7 @@ a0840f53a72abd0c594448642c41b39ffc7d727d	ggml/src/ggml-cuda/mmq.cuh
 a3866a382aa1228581a861a3c9ae896dc57a2f89	ggml/src/ggml-cuda/mmq.cu
 a4ee5a23356610d9d1758f9f53ef3c6ae158d2d5	common/log.cpp
 b0300573b2ef34005724362eefab93c7469cf2e1	ggml/src/ggml-cpu/ggml-cpu.cpp
+ca2ea74df3f35454c45d79b91bfd435f689f46a6	ggml/src/ggml-cuda/common.cuh
 cc3d05d3fedccf983c6874780cf51bb391eea80b	ggml/src/ggml-cuda/cpy.cu
 d26a39b01c119baa2ba02259afdac09e98d7606a	common/common.cpp
 d711e218e770825b913f7ca19e82536117567af6	src/llama-mmap.cpp

@@ -1,0 +1,78 @@
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 77e8362..ca2ea74 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -191,7 +191,7 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
+ #define CUDA_CHECK(err) CUDA_CHECK_GEN(err, cudaSuccess, cudaGetErrorString)
+ 
+ 
+-#if CUDART_VERSION >= 12000 || defined(GGML_USE_MUSA)
++#if CUDART_VERSION >= 12000 || defined(GGML_USE_MUSA) || defined(GGML_USE_TINYBLAS)
+     static const char * cublas_get_error_str(const cublasStatus_t err) {
+         return cublasGetStatusString(err);
+     }
+diff --git a/ggml/src/ggml-cuda/vendors/hip.h b/ggml/src/ggml-cuda/vendors/hip.h
+index 9aa558f..09cb60b 100644
+--- a/ggml/src/ggml-cuda/vendors/hip.h
++++ b/ggml/src/ggml-cuda/vendors/hip.h
+@@ -2,7 +2,12 @@
+ 
+ #define HIP_DISABLE_WARP_SYNC_BUILTINS 1
+ #include <hip/hip_runtime.h>
++#ifdef GGML_USE_TINYBLAS
++#include "tinyblas.h"
++#include "tinyblas-compat.h"
++#else
+ #include <hipblas/hipblas.h>
++#endif // GGML_USE_TINYBLAS
+ #include <hip/hip_fp16.h>
+ #include <hip/hip_bf16.h>
+ 
+@@ -11,6 +16,7 @@
+ #endif // GGML_USE_NCCL
+ 
+ 
++#ifndef GGML_USE_TINYBLAS
+ #define CUBLAS_GEMM_DEFAULT HIPBLAS_GEMM_DEFAULT
+ #define CUBLAS_GEMM_DEFAULT_TENSOR_OP HIPBLAS_GEMM_DEFAULT
+ #define CUBLAS_OP_N HIPBLAS_OP_N
+@@ -23,6 +29,7 @@
+ #define CUBLAS_SIDE_RIGHT HIPBLAS_SIDE_RIGHT
+ #define CUBLAS_FILL_MODE_UPPER HIPBLAS_FILL_MODE_UPPER
+ #define CUBLAS_DIAG_NON_UNIT HIPBLAS_DIAG_NON_UNIT
++#endif // GGML_USE_TINYBLAS
+ #define CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED hipDeviceAttributeVirtualMemoryManagementSupported
+ #define CU_MEM_ALLOC_GRANULARITY_RECOMMENDED hipMemAllocationGranularityRecommended
+ #define CU_MEM_ALLOCATION_TYPE_PINNED hipMemAllocationTypePinned
+@@ -34,6 +41,7 @@
+ #define __shfl_xor_sync(mask, var, laneMask, width) __shfl_xor(var, laneMask, width)
+ #define __all_sync(mask, var) __all(var)
+ #define __any_sync(mask, var) __any(var)
++#ifndef GGML_USE_TINYBLAS
+ #define cublasStrsmBatched hipblasStrsmBatched
+ #define cublasCreate hipblasCreate
+ #define cublasDestroy hipblasDestroy
+@@ -48,6 +56,7 @@
+ #define cublasSgemmStridedBatched hipblasSgemmStridedBatched
+ #define cublasStatus_t hipblasStatus_t
+ #define cublasOperation_t hipblasOperation_t
++#endif // GGML_USE_TINYBLAS
+ #define cudaDevAttrCooperativeLaunch hipDeviceAttributeCooperativeLaunch
+ #define cudaDeviceCanAccessPeer hipDeviceCanAccessPeer
+ #define cudaDeviceDisablePeerAccess hipDeviceDisablePeerAccess
+@@ -146,6 +155,7 @@
+ #define cudaFuncSetAttribute hipFuncSetAttribute
+ #define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
+ #define __trap() do { abort(); __builtin_unreachable(); } while(0)
++#ifndef GGML_USE_TINYBLAS
+ #define CUBLAS_STATUS_SUCCESS HIPBLAS_STATUS_SUCCESS
+ #define CUBLAS_STATUS_NOT_INITIALIZED HIPBLAS_STATUS_NOT_INITIALIZED
+ #define CUBLAS_STATUS_ALLOC_FAILED HIPBLAS_STATUS_ALLOC_FAILED
+@@ -169,6 +179,7 @@
+ #define cublasComputeType_t hipblasDatatype_t
+ #define cudaDataType_t hipblasDatatype_t
+ #endif // HIP_VERSION >= 6050000
++#endif // GGML_USE_TINYBLAS
+ 
+ #if !defined(__HIP_PLATFORM_AMD__)
+ #error "The HIP backend supports only AMD targets"

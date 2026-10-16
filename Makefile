@@ -68,6 +68,8 @@ fresh: # Reset the submodule trees to the pinned state, re-apply setup, rebuild
 	$(MAKE) -C $(LLAMAFILE) clean
 	@echo "==> Re-applying setup (copied files, patches)..."
 	$(MAKE) -C $(LLAMAFILE) setup
+	@echo "==> Applying builder patches (llama.cpp ROCm/TinyBLAS)..."
+	@bash $(CHIMERAFILE_REPO)/ci-patches/patch-rocm-tinyblas.sh
 	@echo "==> Recording setup baselines..."
 	@$(CHIMERAFILE_REPO)/scripts/record-setup-baseline.sh
 	@echo "==> Building from the known state..."
@@ -112,6 +114,8 @@ setup:
 		fi
 	@echo "==> Running llamafile setup (cosmocc, patches, nested submodules)..."
 	$(MAKE) -C $(LLAMAFILE) setup
+	@echo "==> Applying builder patches (llama.cpp ROCm/TinyBLAS)..."
+	@bash $(CHIMERAFILE_REPO)/ci-patches/patch-rocm-tinyblas.sh
 	@echo "==> Recording setup baselines..."
 	@$(CHIMERAFILE_REPO)/scripts/record-setup-baseline.sh
 	@echo ""

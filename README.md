@@ -121,7 +121,7 @@ All four engines behind one port, driven by a declarative config file:
 |---|---|---|
 | `GET /health` | — | liveness |
 | `GET /v1/models` | — | the configured model ids |
-| `POST /v1/chat/completions` | llama | non-stream and SSE streaming; `temperature`, `top_p`, `max_tokens`, `stop`; `n > 1` is rejected |
+| `POST /v1/chat/completions` | llama | non-stream and SSE streaming; `temperature`, `top_p`, `max_tokens`, `stop`; `tools`, `tool_choice` (string and object forms), `parallel_tool_calls`; `n > 1` is rejected |
 | `POST /v1/audio/transcriptions` | whisper, transcribe | multipart `file` + `model`; `response_format` = `json` (default) \| `text` \| `srt` \| `vtt` \| `verbose_json`; `language` |
 | `POST /v1/images/generations` | diffusion | JSON; see extensions below |
 | `POST /v1/images/edits` | diffusion | multipart `image` + `prompt` (img2img); optional `size`, defaults to the input image's |
@@ -135,6 +135,7 @@ All four engines behind one port, driven by a declarative config file:
 - Chat requests continue the previous conversation: the context's KV cache is kept between requests, so a new prompt that starts with exactly the cached conversation (clients like opencode resend the whole conversation each turn) only prefills the new tail; a mismatched prefix clears the cache and prefills from scratch. One conversation per model entry — different clients on the same model evict each other's cache.
 - Diffusion models get a fresh engine context per request: the pinned stable-diffusion.cpp cannot run a second generation on the same context, so each image request pays a few seconds of model load.
 - Streaming caveat: `stop` strings are checked by llama.cpp at token boundaries, so a stream can overshoot a stop string by the rest of the token the match landed inside.
+- Tool calling rides the model's own chat template machinery: the template renders the tool schemas into the prompt and carries a PEG parser for its tool-call markup, so replies come back as structured `tool_calls` (in non-streaming responses and as streaming deltas alike) and the raw markup never leaks into `content`.
 - `temperature` and `prompt` on `/v1/audio/transcriptions` are whisper-only: whisper.cpp has both, transcribe.cpp has neither, and the server passes down only what the engine supports.
 - Image generation takes the OpenAI fields `prompt`, `size` (`WxH`), `n` (1–4), `seed`, `response_format` (`b64_json` default | `url`, returned as a `data:` URL) plus the chimerafile extensions `negative_prompt`, `steps` and `cfg_scale` — all optional.
 
@@ -145,6 +146,16 @@ python3 scripts/serve-smoke-test.py \
     --bin llamafile/o/rel/chimerafile/chimerafile \
     --llama gemma.gguf --whisper ggml-tiny.bin \
     --transcribe qwen3-asr.gguf --diffusion sd15.gguf --audio jfk.wav
+```
+
+A tools-focused companion test, `scripts/serve-tools-test.py`, spawns the
+server from a serve config with one llama model (or reuses one already
+listening) and checks the tool path: `tool_choice=none`, structured
+extraction, a tool-result round trip, streaming deltas and request-shape
+validation:
+
+```sh
+python3 scripts/serve-tools-test.py --config config.json
 ```
 
 ---
@@ -178,6 +189,11 @@ make MODE=rel cuda && make MODE=rel
 # ROCm (needs ROCm stack)
 make MODE=rel rocm && make MODE=rel
 ```
+
+ROCm builds are TinyBLAS-only: `rocm.sh` passes `-DGGML_USE_TINYBLAS=1`, and
+`make setup` applies `ci-patches/rocm-tinyblas.patch` to llama.cpp so that path
+is actually self-contained — no hipBLAS installation needed, and the resulting
+`ggml-rocm.so` has no `libhipblas` dependency.
 
 Each produces a `.so` that gets zipaligned into the APE automatically.
 
@@ -236,7 +252,7 @@ chimerafile/                    ← this repo (chimerafile layer only)
 ├── llama_dispatch.cpp          ← llamafile mode dispatch
 ├── BUILD.mk                    ← build rules (injected into llamafile's make)
 ├── Makefile                    ← thin wrapper, delegates to llamafile/Makefile
-├── ci-patches/                 ← CI-only patches (Pascal sm_61 for cuda.sh)
+├── ci-patches/                 ← builder patches (Pascal sm_61; ROCm TinyBLAS)
 ├── .github/workflows/build.yml ← CI: 6 variant builds
 └── llamafile/                  ← git submodule (stock, unmodified, v0.10.6)
     ├── llamafile/              ← LLM TUI + server
