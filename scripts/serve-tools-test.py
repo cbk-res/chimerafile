@@ -407,7 +407,9 @@ def main():
                  "content": "Thanks. Given that, what should I wear? "
                             "Answer in one short sentence."},
             ],
-            "max_tokens": 120,
+            # Generous budget: the thinking model can spend ~500 tokens
+            # on reasoning, and the answer must fit after them.
+            "max_tokens": 800,
         })
         msg = ((r.get("choices") or [{}])[0].get("message", {})
                if isinstance(r, dict) else {})
@@ -417,6 +419,13 @@ def main():
         check("C: non-empty string reply",
               isinstance(reply, str) and bool(reply.strip()),
               repr(reply)[:200])
+        # A reply whose content is empty must at least carry the
+        # reasoning the model spent its tokens on.
+        check("C: empty content implies reasoning_content",
+              bool((reply or "").strip()) or
+              bool((msg.get("reasoning_content") or "").strip()),
+              f"content={repr(reply)[:80]} "
+              f"reasoning={repr(msg.get('reasoning_content'))[:80]}")
         check("C: no markup leak in reply",
               isinstance(reply, str) and no_markup(reply),
               repr(reply)[:200])

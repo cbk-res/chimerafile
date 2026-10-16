@@ -663,12 +663,16 @@ struct GenResult {
     std::string finish;  // "stop" | "length" | "tool_calls"
     nlohmann::ordered_json tool_calls;  // OpenAI format; null unless a tool was called
     std::string tool_content;           // content with the tool-call markup stripped
+    std::string reasoning_content;      // thinking block extracted by the parser
+    std::string parsed_content;         // parsed content (no thinking, no markup)
+    bool parsed = false;                // true if a strict parse succeeded
 };
 
-// One piece of a streaming reply: clean content (thinking inline) and/or
-// one entry of the tool_calls delta.
+// One piece of a streaming reply: clean content, the reasoning delta,
+// and/or one entry of the tool_calls delta.
 struct GenDelta {
     std::string content;
+    std::string reasoning;
     nlohmann::ordered_json tool_call;  // null unless set
 };
 
@@ -800,6 +804,9 @@ static GenResult run_chat(PhysModel &p, const ChatRequest &req,
     in.messages = common_chat_msgs_parse_oaicompat(req.messages);
     in.tools = req.tools;
     in.tool_choice = req.tool_choice;
+    // Have the parser extract the model's thinking block into
+    // reasoning_content; the markers are derived from the template.
+    in.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
     // As in llama-server: when the client omits the field, the template's
     // own capability decides (its grammar may allow only one call).
     in.parallel_tool_calls =
@@ -865,7 +872,7 @@ static GenResult run_chat(PhysModel &p, const ChatRequest &req,
     std::vector<llama_token> gen_tokens;  // what this request appends
 
     // Incremental reply parse: the template's own PEG parser turns the
-    // raw output into clean content (thinking inline) and structured
+    // raw output into clean content, a reasoning delta, and structured
     // tool-call deltas as they complete.  If it ever fails to follow the
     // output, the rest of the reply streams as raw text.
     common_chat_parser_params pp(chat);
@@ -877,7 +884,7 @@ static GenResult run_chat(PhysModel &p, const ChatRequest &req,
     bool parse_broken = false;
     bool aborted = false;
     auto emit = [&](const GenDelta &d) {
-        if (d.content.empty() && d.tool_call.is_null())
+        if (d.content.empty() && d.reasoning.empty() && d.tool_call.is_null())
             return;
         if (!on_delta(d))
             aborted = true;
@@ -921,7 +928,8 @@ static GenResult run_chat(PhysModel &p, const ChatRequest &req,
                 msg_prv = std::move(msg_new);
                 for (const auto &d : diffs) {
                     GenDelta piece;
-                    piece.content = d.reasoning_content_delta + d.content_delta;
+                    piece.content = d.content_delta;
+                    piece.reasoning = d.reasoning_content_delta;
                     if (d.tool_call_index != std::string::npos) {
                         piece.tool_call["index"] = d.tool_call_index;
                         nlohmann::ordered_json fn;
@@ -1043,16 +1051,22 @@ static GenResult run_chat(PhysModel &p, const ChatRequest &req,
             // reuse the incremental id cache so the ids match the ones
             // the streaming deltas already emitted
             reply.set_tool_call_ids(tc_ids, gen_tool_call_id);
+            out.parsed = true;
+            out.parsed_content = reply.content;
+            out.reasoning_content = reply.reasoning_content;
             if (!reply.tool_calls.empty()) {
                 out.tool_calls = to_oai(reply.tool_calls);
-                out.tool_content = reply.reasoning_content + reply.content;
+                out.tool_content = reply.content;
                 out.finish = "tool_calls";
             }
         }
         if (!strict_ok && out.tool_calls.is_null() &&
             !msg_prv.tool_calls.empty() && complete(msg_prv.tool_calls)) {
             out.tool_calls = to_oai(msg_prv.tool_calls);
-            out.tool_content = msg_prv.reasoning_content + msg_prv.content;
+            out.tool_content = msg_prv.content;
+            out.parsed = true;
+            out.parsed_content = msg_prv.content;
+            out.reasoning_content = msg_prv.reasoning_content;
             out.finish = "tool_calls";
         }
     }
@@ -2060,13 +2074,17 @@ struct Server {
                 choice["index"] = 0;
                 choice["message"]["role"] = "assistant";
                 if (g.tool_calls.is_null()) {
-                    choice["message"]["content"] = g.text;
+                    choice["message"]["content"] =
+                        g.parsed ? g.parsed_content : g.text;
                 } else {
                     choice["message"]["content"] = g.tool_content.empty()
                         ? nlohmann::json(nullptr)
                         : nlohmann::json(g.tool_content);
                     choice["message"]["tool_calls"] = g.tool_calls;
                 }
+                if (!g.reasoning_content.empty())
+                    choice["message"]["reasoning_content"] =
+                        g.reasoning_content;
                 choice["finish_reason"] = g.finish;
                 out["choices"] = {choice};
                 out["usage"]["prompt_tokens"] = g.prompt_tokens;
@@ -2162,6 +2180,9 @@ struct Server {
                                 nlohmann::json d;
                                 if (!piece.content.empty())
                                     d["content"] = std::move(piece.content);
+                                if (!piece.reasoning.empty())
+                                    d["reasoning_content"] =
+                                        std::move(piece.reasoning);
                                 if (!piece.tool_call.is_null())
                                     d["tool_calls"] = {piece.tool_call};
                                 if (!d.empty() && !chunk(d, nullptr)) {
