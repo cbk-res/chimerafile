@@ -700,6 +700,51 @@ static void strip_assistant_turn_end(std::string &s, const std::string &marker) 
     }
 }
 
+// JSON-schema-to-grammar, which builds the template's output parser, rejects
+// a `pattern` unless it is anchored with ^...$.  Tool schemas from editors
+// and MCP servers often carry unanchored ones anyway, and a single bad
+// schema fails the whole request; drop the offending keys.  Returns how many
+// were removed.
+static int strip_unanchored_patterns(nlohmann::ordered_json &node) {
+    int n = 0;
+    if (node.is_object()) {
+        auto it = node.find("pattern");
+        if (it != node.end() && it->is_string()) {
+            const std::string &p = it->get_ref<const std::string &>();
+            if (p.size() < 2 || p.front() != '^' || p.back() != '$') {
+                node.erase(it);
+                n++;
+            }
+        }
+        for (auto &el : node)
+            n += strip_unanchored_patterns(el);
+    } else if (node.is_array()) {
+        for (auto &el : node)
+            n += strip_unanchored_patterns(el);
+    }
+    return n;
+}
+
+// Apply the fix-up above to each tool's parameter schema (a JSON string).
+static int sanitize_tool_schemas(std::vector<common_chat_tool> &tools) {
+    int n = 0;
+    for (auto &t : tools) {
+        if (t.parameters.empty())
+            continue;
+        nlohmann::ordered_json schema =
+            nlohmann::ordered_json::parse(t.parameters, nullptr, false);
+        if (schema.is_discarded())
+            continue;
+        int stripped = strip_unanchored_patterns(schema);
+        if (stripped) {
+            t.parameters = schema.dump(
+                -1, ' ', false, nlohmann::json::error_handler_t::replace);
+            n += stripped;
+        }
+    }
+    return n;
+}
+
 // Run one chat generation on a loaded model.  Must run on the process'
 // main thread (the host-compiled GPU backend only has working
 // host-glibc malloc state there).  on_delta is called with each decoded
@@ -762,6 +807,7 @@ static GenResult run_chat(PhysModel &p, const ChatRequest &req,
             ? req.parallel_tool_calls
             : common_chat_templates_get_caps(p.chat_tmpl.get())
                   .at("supports_parallel_tool_calls");
+    int patterns_stripped = sanitize_tool_schemas(in.tools);
     common_chat_params chat;
     try {
         chat = common_chat_templates_apply(p.chat_tmpl.get(), in);
@@ -770,6 +816,9 @@ static GenResult run_chat(PhysModel &p, const ChatRequest &req,
         common_sampler_free(gs);
         return out;
     }
+    if (patterns_stripped)
+        serve_log("tools: stripped %d unanchored schema pattern(s)\n",
+                  patterns_stripped);
 
     int32_t n_prompt = llama_tokenize(vocab, chat.prompt.data(),
                                       (int32_t)chat.prompt.size(), nullptr, 0,
