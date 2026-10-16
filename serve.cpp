@@ -666,6 +666,8 @@ struct GenResult {
     std::string reasoning_content;      // thinking block extracted by the parser
     std::string parsed_content;         // parsed content (no thinking, no markup)
     bool parsed = false;                // true if a strict parse succeeded
+    double prompt_seconds = 0.0;        // wall time of the prompt decode
+    double generation_seconds = 0.0;    // wall time of the token loop
 };
 
 // One piece of a streaming reply: clean content, the reasoning delta,
@@ -858,6 +860,7 @@ static GenResult run_chat(PhysModel &p, const ChatRequest &req,
 
     // Decode the prompt tail in batches (token positions track
     // themselves: a nullptr pos appends at the cache's end).
+    auto t_prompt = std::chrono::steady_clock::now();
     int n_batch = llama_n_batch(ctx);
     for (int i = n_warm; i < n_prompt; i += n_batch) {
         int n = std::min(n_batch, n_prompt - i);
@@ -869,6 +872,10 @@ static GenResult run_chat(PhysModel &p, const ChatRequest &req,
             return out;
         }
     }
+    out.prompt_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                      t_prompt)
+            .count();
     std::vector<llama_token> gen_tokens;  // what this request appends
 
     // Incremental reply parse: the template's own PEG parser turns the
@@ -896,6 +903,7 @@ static GenResult run_chat(PhysModel &p, const ChatRequest &req,
     // token has logits) and after each 1-token generation batch.
     int max_tokens = req.max_tokens > 0 ? req.max_tokens
                                         : (int)llama_n_ctx(ctx) - n_prompt;
+    auto t_gen = std::chrono::steady_clock::now();
     for (int i = 0; i < max_tokens; i++) {
         llama_token tok = common_sampler_sample(gs, ctx, -1);
         common_sampler_accept(gs, tok, true);
@@ -984,6 +992,9 @@ static GenResult run_chat(PhysModel &p, const ChatRequest &req,
             return out;
         }
     }
+    out.generation_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_gen)
+            .count();
     // Final parse: the reply's tool-call markup becomes structured
     // tool_calls, and the content keeps everything else (thinking inline).
     // Two failure modes bracket this parse:
@@ -1814,9 +1825,29 @@ public:
 
 // ── HTTP server ──────────────────────────────────────────────────────────
 
+// Process-wide counters for the /metrics endpoint.
+struct Metrics {
+    std::atomic<long> chat_requests{0};
+    std::atomic<long> transcribe_requests{0};
+    std::atomic<long> image_requests{0};
+    std::atomic<long> prompt_tokens{0};
+    std::atomic<long> generation_tokens{0};
+    std::atomic<long long> prompt_seconds_ms{0};
+    std::atomic<long long> generation_seconds_ms{0};
+
+    void record_chat(const GenResult &g) {
+        chat_requests++;
+        prompt_tokens += g.prompt_tokens;
+        generation_tokens += g.completion_tokens;
+        prompt_seconds_ms += (long long)(g.prompt_seconds * 1000.0);
+        generation_seconds_ms += (long long)(g.generation_seconds * 1000.0);
+    }
+};
+
 struct Server {
     Config cfg;
     Residency residency;
+    Metrics metrics;
     httplib::Server http;
     time_t start_at = 0;
     std::thread http_thread;
@@ -1941,6 +1972,7 @@ struct Server {
             d["revised_prompt"] = prompt;
             data.push_back(std::move(d));
         }
+        metrics.image_requests++;
         nlohmann::json out;
         out["created"] = (long)time(nullptr);
         out["model"] = e->id;
@@ -2110,6 +2142,15 @@ struct Server {
                 out["usage"]["completion_tokens"] = g.completion_tokens;
                 out["usage"]["total_tokens"] =
                     g.prompt_tokens + g.completion_tokens;
+                nlohmann::json timings;
+                timings["prompt_processing_s"] = g.prompt_seconds;
+                timings["generation_s"] = g.generation_seconds;
+                timings["total_s"] = g.prompt_seconds + g.generation_seconds;
+                if (g.completion_tokens > 0 && g.generation_seconds > 0.0)
+                    timings["tokens_per_second"] =
+                        g.completion_tokens / g.generation_seconds;
+                out["timings"] = timings;
+                metrics.record_chat(g);
                 res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
                 return;
             }
@@ -2158,10 +2199,12 @@ struct Server {
             }
             res.set_chunked_content_provider(
                 "text/event-stream",
-                [st, id, created, model_id = e->id](
+                [this, st, id, created, model_id = e->id](
                     size_t, httplib::DataSink &sink) -> bool {
                     auto chunk = [&](const nlohmann::json &delta,
-                                     const char *finish) {
+                                     const char *finish,
+                                     const nlohmann::json &extra =
+                                         nlohmann::json::object()) {
                         nlohmann::json c;
                         c["id"] = id;
                         c["object"] = "chat.completion.chunk";
@@ -2174,6 +2217,8 @@ struct Server {
                             ? nlohmann::json(finish)
                             : nlohmann::json(nullptr);
                         c["choices"] = {ch};
+                        if (!extra.empty())
+                            c.update(extra);
                         std::string frame = "data: " + c.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) + "\n\n";
                         return sink.write(frame.data(), frame.size());
                     };
@@ -2223,7 +2268,22 @@ struct Server {
                         }
                     }
                     if (ok) {
-                        chunk(nlohmann::json::object(), finish.c_str());
+                        metrics.record_chat(st->result);
+                        nlohmann::json timings;
+                        timings["prompt_processing_s"] =
+                            st->result.prompt_seconds;
+                        timings["generation_s"] =
+                            st->result.generation_seconds;
+                        timings["total_s"] =
+                            st->result.prompt_seconds +
+                            st->result.generation_seconds;
+                        if (st->result.completion_tokens > 0 &&
+                            st->result.generation_seconds > 0.0)
+                            timings["tokens_per_second"] =
+                                st->result.completion_tokens /
+                                st->result.generation_seconds;
+                        chunk(nlohmann::json::object(), finish.c_str(),
+                              timings);
                         std::string done = "data: [DONE]\n\n";
                         sink.write(done.data(), done.size());
                     } else {
@@ -2386,6 +2446,7 @@ struct Server {
                          tr.err);
                 return;
             }
+            metrics.transcribe_requests++;
 
             if (fmt == "text") {
                 res.set_content(tr.text, "text/plain");
@@ -2569,6 +2630,60 @@ struct Server {
             out["queue"] = residency.queue_json();
             out["resident"] = residency.resident_json();
             res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
+        });
+
+        // Prometheus-format metrics (like llama-server's /metrics): process
+        // counters, per-model residency, and the derived average throughput.
+        http.Get("/metrics", [this](const httplib::Request &,
+                                    httplib::Response &res) {
+            std::string m;
+            auto gauge = [&m](const std::string &name, const char *help,
+                              double v) {
+                m += "# HELP " + name + " " + help +
+                     "\n# TYPE " + name + " gauge\n" + name + " " +
+                     std::to_string(v) + "\n";
+            };
+            auto counter = [&m](const std::string &name, const char *help,
+                                double v) {
+                m += "# HELP " + name + " " + help +
+                     "\n# TYPE " + name + " counter\n" + name + " " +
+                     std::to_string(v) + "\n";
+            };
+            double gen_s = metrics.generation_seconds_ms.load() / 1000.0;
+            gauge("chimerafile_uptime_seconds",
+                  "Seconds since the server started.",
+                  (double)(time(nullptr) - start_at));
+            counter("chimerafile_chat_requests_total",
+                    "Chat completions served.", metrics.chat_requests);
+            counter("chimerafile_transcribe_requests_total",
+                    "Transcriptions served.", metrics.transcribe_requests);
+            counter("chimerafile_image_requests_total",
+                    "Image generations served.", metrics.image_requests);
+            counter("chimerafile_prompt_tokens_total",
+                    "Prompt tokens processed.", metrics.prompt_tokens);
+            counter("chimerafile_generation_tokens_total",
+                    "Generated tokens produced.", metrics.generation_tokens);
+            counter("chimerafile_prompt_processing_seconds_total",
+                    "Seconds spent decoding prompts.",
+                    metrics.prompt_seconds_ms / 1000.0);
+            counter("chimerafile_generation_seconds_total",
+                    "Seconds spent generating tokens.",
+                    metrics.generation_seconds_ms / 1000.0);
+            gauge("chimerafile_tokens_per_second",
+                  "Average generation throughput (process lifetime).",
+                  gen_s > 0.0 ? metrics.generation_tokens.load() / gen_s
+                              : 0.0);
+            for (const auto &r : residency.resident_json()) {
+                const std::string id = r["id"].get<std::string>();
+                gauge("chimerafile_model_state{model=\"" + id + "\"}",
+                      "Model residency state: 0 unloaded, 1 loading, 2 loaded.",
+                      r["state"] == "loaded" ? 2.0
+                      : r["state"] == "loading" ? 1.0 : 0.0);
+                gauge("chimerafile_model_in_use{model=\"" + id + "\"}",
+                      "In-flight requests on the model.",
+                      (double)r["in_use"].get<int>());
+            }
+            res.set_content(m, "text/plain; version=0.0.4; charset=utf-8");
         });
 
         // Chimerafile extensions: preload / explicit-unload controls.
