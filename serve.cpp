@@ -879,22 +879,69 @@ static GenResult run_chat(PhysModel &p, const ChatRequest &req,
     std::vector<llama_token> gen_tokens;  // what this request appends
 
     // Incremental reply parse: the template's own PEG parser turns the
-    // raw output into clean content, a reasoning delta, and structured
-    // tool-call deltas as they complete.  If it ever fails to follow the
-    // output, the rest of the reply streams as raw text.
+    // raw output into clean content, reasoning, and structured tool-call
+    // deltas as they arrive.  When the parser loses the output mid-reply
+    // (the model went off-format), it keeps returning what it has: the
+    // unparsed tail simply produces no deltas, and no raw markup ever
+    // reaches the client.  If it cannot follow the reply from the very
+    // first token, the generation is reported as failed.
     common_chat_parser_params pp(chat);
     if (!chat.parser.empty())
         pp.parser.load(chat.parser);
     common_chat_msg msg_prv;
     std::vector<std::string> tc_ids;
     std::string gen_text;
-    bool parse_broken = false;
     bool aborted = false;
     auto emit = [&](const GenDelta &d) {
         if (d.content.empty() && d.reasoning.empty() && d.tool_call.is_null())
             return;
         if (!on_delta(d))
             aborted = true;
+    };
+
+    // Tool-call deltas are not forwarded as they arrive: the incremental
+    // parser emits the arguments byte by byte, and a small model can cut
+    // a call off mid-arguments (an invalid escape in a shell command, a
+    // dropped "name" field).  A call whose arguments are not a complete
+    // JSON object is useless to the client -- and clients like opencode
+    // execute it anyway, surface the parse error, and feed the broken
+    // markup back into the next prompt.  Buffer each call and forward it
+    // only once complete and valid; drop it otherwise.
+    struct PendingCall {
+        std::string id;
+        std::string name;
+        std::string arguments;
+        bool done = false;  // forwarded or dropped
+    };
+    std::vector<PendingCall> pending_calls;
+    auto flush_calls = [&](size_t before_index) {
+        for (size_t i = 0; i < pending_calls.size() && i < before_index; ++i) {
+            auto &c = pending_calls[i];
+            if (c.done)
+                continue;
+            c.done = true;
+            bool valid = !c.id.empty() && !c.name.empty();
+            if (valid && !c.arguments.empty()) {
+                auto a = nlohmann::json::parse(c.arguments, nullptr, false);
+                valid = !a.is_discarded() && a.is_object();
+            }
+            if (!valid) {
+                serve_log("stream: dropped incomplete tool call %zu "
+                          "(%zu argument chars)\n",
+                          i, c.arguments.size());
+                continue;
+            }
+            GenDelta piece;
+            piece.tool_call["index"] = (int)i;
+            piece.tool_call["id"] = c.id;
+            piece.tool_call["type"] = "function";
+            nlohmann::ordered_json fn;
+            fn["name"] = c.name;
+            if (!c.arguments.empty())
+                fn["arguments"] = c.arguments;
+            piece.tool_call["function"] = fn;
+            emit(piece);
+        }
     };
 
     // Generate: sample, accept, emit, decode, repeat.  The sampler takes the
@@ -924,42 +971,44 @@ static GenResult run_chat(PhysModel &p, const ChatRequest &req,
         out.text.append(buf, n);
         out.completion_tokens++;
         gen_text.append(buf, n);
-        if (parse_broken) {
-            GenDelta d;
-            d.content.assign(buf, n);
-            emit(d);
-        } else {
-            try {
-                auto msg_new = common_chat_parse(gen_text, true, pp);
-                msg_new.set_tool_call_ids(tc_ids, gen_tool_call_id);
-                auto diffs = common_chat_msg_diff::compute_diffs(msg_prv, msg_new);
-                msg_prv = std::move(msg_new);
-                for (const auto &d : diffs) {
-                    GenDelta piece;
-                    piece.content = d.content_delta;
-                    piece.reasoning = d.reasoning_content_delta;
-                    if (d.tool_call_index != std::string::npos) {
-                        piece.tool_call["index"] = d.tool_call_index;
-                        nlohmann::ordered_json fn;
-                        if (!d.tool_call_delta.id.empty())
-                            piece.tool_call["id"] = d.tool_call_delta.id;
-                        if (!d.tool_call_delta.name.empty()) {
-                            piece.tool_call["type"] = "function";
-                            fn["name"] = d.tool_call_delta.name;
-                        }
-                        if (!d.tool_call_delta.arguments.empty())
-                            fn["arguments"] = d.tool_call_delta.arguments;
-                        if (!fn.empty())
-                            piece.tool_call["function"] = fn;
-                    }
-                    emit(piece);
+        try {
+            auto msg_new = common_chat_parse(gen_text, true, pp);
+            msg_new.set_tool_call_ids(tc_ids, gen_tool_call_id);
+            auto diffs = common_chat_msg_diff::compute_diffs(msg_prv, msg_new);
+            msg_prv = std::move(msg_new);
+            for (const auto &d : diffs) {
+                if (d.tool_call_index != std::string::npos) {
+                    size_t idx = d.tool_call_index;
+                    // A new call starts: forward the earlier ones
+                    // first (they are complete by now).
+                    flush_calls(idx);
+                    while (pending_calls.size() <= idx)
+                        pending_calls.emplace_back();
+                    auto &c = pending_calls[idx];
+                    if (!d.tool_call_delta.id.empty())
+                        c.id = d.tool_call_delta.id;
+                    if (!d.tool_call_delta.name.empty())
+                        c.name = d.tool_call_delta.name;
+                    c.arguments += d.tool_call_delta.arguments;
+                    continue;
                 }
-            } catch (const std::exception &) {
-                parse_broken = true;  // stream raw text from here on
-                GenDelta d;
-                d.content.assign(buf, n);
-                emit(d);
+                if (d.content_delta.empty() && d.reasoning_content_delta.empty())
+                    continue;
+                // Text after a call means the call is finished:
+                // forward it (if valid) before the text.
+                flush_calls(~size_t(0));
+                GenDelta piece;
+                piece.content = d.content_delta;
+                piece.reasoning = d.reasoning_content_delta;
+                emit(piece);
             }
+        } catch (const std::exception &e) {
+            // The reply deviates from the template's format from its very
+            // first token -- the parser could not follow any prefix.
+            // Report the failure instead of sending raw markup.
+            serve_log("parse: %s\n", e.what());
+            out.err = e.what();
+            break;
         }
         if (aborted) {
             p.chat_cache = prompt_tokens;
@@ -995,12 +1044,15 @@ static GenResult run_chat(PhysModel &p, const ChatRequest &req,
     out.generation_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t_gen)
             .count();
+    // Forward any complete buffered tool call before the final parse.
+    flush_calls(~size_t(0));
     // Final parse: the reply's tool-call markup becomes structured
     // tool_calls, and the content keeps everything else (thinking inline).
     // Two failure modes bracket this parse:
-    //   * parse_broken: the incremental parse already streamed raw markup
-    //     as content, but a successful strict parse here can still yield
-    //     structured tool_calls -- keep them, losing them would be worse.
+    //   * the incremental parse stalled mid-reply (the unparsed tail was
+    //     never streamed), but a successful strict parse here can still
+    //     yield structured tool_calls -- keep them, losing them would be
+    //     worse.
     //   * the reverse: the incremental parse already emitted complete
     //     tool-call deltas (the client saw them) and the strict parse
     //     then fails on trailing junk before EOG -- fall back to that last
@@ -1098,7 +1150,24 @@ static GenResult run_chat(PhysModel &p, const ChatRequest &req,
             out.parsed_content = msg_prv.content;
             out.reasoning_content = msg_prv.reasoning_content;
             out.finish = "tool_calls";
+        } else if (!strict_ok && out.tool_calls.is_null()) {
+            // The parser could not follow the reply (garbled role markers,
+            // a broken tool call) and no usable message was captured.
+            // Report the failure rather than sending raw markup as
+            // content.
+            if (out.err.empty())
+                out.err = "the model produced output that does not match "
+                          "the expected chat format";
         }
+    }
+    if (!out.err.empty()) {
+        // The turn is unusable and the context now holds off-format
+        // tokens: invalidate the warm cache so the next request prefills
+        // from scratch.
+        llama_memory_clear(llama_get_memory(ctx), false);
+        p.chat_cache.clear();
+        common_sampler_free(gs);
+        return out;
     }
     if (out.finish.empty())
         out.finish = "length";
