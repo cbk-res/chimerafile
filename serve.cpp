@@ -898,25 +898,36 @@ static GenResult run_chat(PhysModel &p, const ChatRequest &req,
                    prompt_tokens.data(), n_prompt, true, false);
     out.prompt_tokens = n_prompt;
 
-    // Warm continuation: the context's KV cache still holds the previous
-    // request's conversation, and clients like opencode resend it in full
-    // every turn.  If this prompt starts with exactly the cached tokens,
-    // only the new tail needs prefiling; anything else gets a cleared
-    // cache and a full prefill.
-    int n_warm = (int)p.chat_cache.size() <= n_prompt &&
-                         std::equal(p.chat_cache.begin(), p.chat_cache.end(),
-                                    prompt_tokens.begin())
-                     ? (int)p.chat_cache.size()
-                     : 0;
-    if (n_warm == 0)
+    // Warm continuation: the KV cache still holds the previous request's
+    // conversation -- its prompt plus the reply.  The longest prefix this
+    // prompt shares with it is already prefilled: a client like opencode
+    // resends the whole conversation every turn, a retry resends the same
+    // prompt, and a follow-up on the same context shares the start.  Only
+    // the rest needs decoding.  The stale tail (if any) is dropped so the
+    // new tokens land right after the shared prefix: positions track
+    // themselves, and a nullptr pos appends at the cache's end.
+    size_t n_warm = 0;
+    {
+        const size_t n_max = std::min(p.chat_cache.size(),
+                                      (size_t)n_prompt);
+        while (n_warm < n_max &&
+               p.chat_cache[n_warm] == prompt_tokens[n_warm]) {
+            n_warm++;
+        }
+    }
+    if (n_warm < p.chat_cache.size() &&
+        !llama_memory_seq_rm(llama_get_memory(ctx), 0,
+                             (llama_pos)n_warm, -1)) {
+        // The memory could not be truncated; cold start from scratch.
         llama_memory_clear(llama_get_memory(ctx), false);
+        n_warm = 0;
+    }
 
-    // Decode the prompt tail in batches (token positions track
-    // themselves: a nullptr pos appends at the cache's end).
+    // Decode the prompt tail in batches.
     auto t_prompt = std::chrono::steady_clock::now();
-    int n_batch = llama_n_batch(ctx);
-    for (int i = n_warm; i < n_prompt; i += n_batch) {
-        int n = std::min(n_batch, n_prompt - i);
+    const int n_batch = llama_n_batch(ctx);
+    for (size_t i = n_warm; i < (size_t)n_prompt; i += (size_t)n_batch) {
+        const int n = std::min(n_batch, (int)((size_t)n_prompt - i));
         if (llama_decode(ctx, llama_batch_get_one(prompt_tokens.data() + i, n)) != 0) {
             out.err = "failed to decode the prompt";
             llama_memory_clear(llama_get_memory(ctx), false);
