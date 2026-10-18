@@ -128,6 +128,13 @@ All four engines behind one port, driven by a declarative config file:
 | `GET /v1/status` | — | what is loaded, what is queued, uptime |
 | `POST /v1/residency/<id>` | — | preload / keep warm (starts the TTL clock) |
 | `POST /v1/residency/<id>/unload` | — | explicit unload (409 while in use) |
+| `GET /metrics` | — | Prometheus text format: request/token/second counters, derived average t/s, per-model residency |
+
+### Metrics and timing
+
+`GET /metrics` returns a Prometheus text-format document, like llama-server's: request counters per surface (`chimerafile_chat_requests_total`, `chimerafile_transcribe_requests_total`, `chimerafile_image_requests_total`), prompt and generation token totals, prompt-processing and generation seconds, the `chimerafile_tokens_per_second` average derived from them, uptime, and per-model residency gauges (`chimerafile_model_state`, `chimerafile_model_in_use`).
+
+Chat completions also carry a per-request `timings` object — `prompt_processing_s`, `generation_s`, `total_s`, and `tokens_per_second` when anything was generated — as a top-level field of the JSON response and in the final SSE chunk of a stream; clients that do not look for it ignore it.
 
 ### How it runs
 
@@ -362,4 +369,4 @@ This project is provided under the GNU General Public License version 3 (GPLv3),
 
 ## AI-Usage Disclosure
 
-Unfortunately, I was but the project manager, bullying Deepseek v4 into complying with my less than reasonable demands. I couldn't write code to save my life, but I hope it is of some use to you :)
+Chimerafile is highly experimental and largely a proof of concept. Substantial portions of the codebase have been written with the assistance of large language models (including Deepseek V4 and Qwen 3.8), and as such, bugs or instabilities should be expected for the moment. If you have any problems, please feel free to open an issue!
