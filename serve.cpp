@@ -801,8 +801,24 @@ static std::string ctx_overflow_msg(int n_prompt, int max_tokens, int n_ctx) {
 // returning false aborts the generation early (e.g. the client went
 // away).
 static GenResult run_chat(PhysModel &p, const ChatRequest &req,
-                          const std::function<bool(const GenDelta &)> &on_delta) {
+                          const std::function<bool(const GenDelta &)> &on_delta,
+                          const std::function<void(const GenResult &)> &on_preflight =
+                              nullptr) {
     GenResult out;
+    // The streaming worker waits for the overflow check to finish before it
+    // may open the stream (the HTTP status is fixed at 200 once it does), so
+    // the verdict is reported exactly once, no matter how this returns.
+    bool preflight_reported = false;
+    auto report_preflight = [&]() {
+        if (on_preflight && !preflight_reported) {
+            preflight_reported = true;
+            on_preflight(out);
+        }
+    };
+    struct PreflightGuard {
+        std::function<void()> fn;
+        ~PreflightGuard() { fn(); }
+    } preflight_guard{[&]() { report_preflight(); }};
     auto *model = p.init->model();
     auto *ctx = p.init->context();
     auto *vocab = llama_model_get_vocab(model);
@@ -860,6 +876,7 @@ static GenResult run_chat(PhysModel &p, const ChatRequest &req,
         common_sampler_free(gs);
         return out;
     }
+    report_preflight();  // fits in the context: the stream may open
     std::vector<llama_token> prompt_tokens(n_prompt);
     llama_tokenize(vocab, chat.prompt.data(), (int32_t)chat.prompt.size(),
                    prompt_tokens.data(), n_prompt, true, false);
@@ -1529,6 +1546,12 @@ struct StreamState {
     bool consumer_gone = false;      // the provider gave up (client gone)
     bool run_finished = false;       // run_chat returned
     GenResult result;                // valid once `run_finished`
+    // Overflow-check verdict, reported from the main thread before
+    // generation so the worker can still fail with a 400 before the
+    // first chunk.
+    bool preflight_done = false;
+    bool preflight_bad_request = false;
+    std::string preflight_err;
 };
 
 class Residency {
@@ -2248,49 +2271,34 @@ struct Server {
                 return;
             }
 
-            // An oversized prompt must fail before the first SSE chunk:
-            // the HTTP status is fixed at 200 once streaming starts (as
-            // in llama-server).  apply_chat_template runs again in the
-            // generation; this pass only needed the token count.
-            {
-                common_chat_params pf;
-                std::string perr;
-                if (!apply_chat_template(*p, cr, pf, perr, false)) {
-                    residency.release(*p);
-                    send_err(res, 500, "server_error", "generation_failed",
-                             perr);
-                    return;
-                }
-                auto *pf_ctx = p->init->context();
-                int32_t n = llama_tokenize(
-                    llama_model_get_vocab(p->init->model()), pf.prompt.data(),
-                    (int32_t)pf.prompt.size(), nullptr, 0, true, false);
-                if (n < 0)
-                    n = -n;
-                int n_ctx = (int)llama_n_ctx(pf_ctx);
-                if (n > n_ctx || (cr.max_tokens > 0 &&
-                                  n + cr.max_tokens > n_ctx)) {
-                    residency.release(*p);
-                    send_err(res, 400, "invalid_request_error",
-                             "context_length_exceeded",
-                             ctx_overflow_msg(n, cr.max_tokens, n_ctx));
-                    return;
-                }
-            }
-
             // Streaming: Server-Sent Events via a chunked content provider.
-            // The generation itself runs on the main thread (pump); the
-            // provider only copies pieces to the client as they arrive.
+            // The generation runs on the main thread (pump); the provider
+            // only copies pieces to the client as they arrive.  An oversized
+            // prompt must still fail before the first chunk, as the HTTP
+            // status is fixed at 200 once streaming starts: the overflow
+            // check runs inside the job (run_chat) and its verdict is
+            // reported to this worker before the stream opens.
             auto st = std::make_shared<StreamState>();
             auto job = std::make_shared<EngineJob>();
             job->p = p;
             job->run = [st, p, cr] {
+                // The worker waits on this before it may open the stream;
+                // it carries the overflow-check verdict from the main thread.
+                auto on_preflight = [st](const GenResult &pr) {
+                    std::lock_guard<std::mutex> lk(st->mu);
+                    st->preflight_bad_request = pr.bad_request;
+                    st->preflight_err = pr.err;
+                    st->preflight_done = true;
+                    st->cv.notify_all();
+                };
                 {
                     std::lock_guard<std::mutex> lk(st->mu);
                     if (st->consumer_gone) {
                         // the client went away before the run could start
                         st->result.err = "client disconnected";
                         st->run_finished = true;
+                        st->preflight_err = "client disconnected";
+                        st->preflight_done = true;
                         st->cv.notify_all();
                         return;
                     }
@@ -2307,7 +2315,7 @@ struct Server {
                     st->cv.notify_all();
                     return true;
                 };
-                st->result = run_chat(*p, cr, on_delta);
+                st->result = run_chat(*p, cr, on_delta, on_preflight);
                 {
                     std::lock_guard<std::mutex> lk(st->mu);
                     st->run_finished = true;
@@ -2319,6 +2327,23 @@ struct Server {
                 send_err(res, 503, "server_error", "server_busy",
                          "server is shutting down");
                 return;
+            }
+            // Wait for the overflow verdict; the pump releases the model
+            // when the job finishes, so the error paths here must not.
+            {
+                std::unique_lock<std::mutex> lk(st->mu);
+                st->cv.wait(lk, [&] { return st->preflight_done; });
+                if (!st->preflight_err.empty()) {
+                    if (st->preflight_bad_request) {
+                        send_err(res, 400, "invalid_request_error",
+                                 "context_length_exceeded",
+                                 st->preflight_err);
+                    } else {
+                        send_err(res, 500, "server_error",
+                                 "generation_failed", st->preflight_err);
+                    }
+                    return;
+                }
             }
             res.set_chunked_content_provider(
                 "text/event-stream",
