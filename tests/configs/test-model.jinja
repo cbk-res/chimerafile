@@ -1,0 +1,34 @@
+{#- Chat template for the tiny test model. The [SYSTEM_PROMPT] / [TOOL_CALLS]
+    markers route it through llama.cpp's dedicated tool-grammar path (the
+    Ministral/Magistral family handler in common/chat.cpp), so the serve
+    test suite can exercise tool-call grammar enforcement with a
+    random-weight model. Keep the marker literals in this source: detection
+    is done on the template text. #}
+{{- bos_token }}
+{%- if messages[0].role == 'system' %}
+{%- set system_message = messages[0].content %}
+{%- else %}
+{%- set system_message = 'You are a helpful assistant.' %}
+{%- endif %}
+{{- '[SYSTEM_PROMPT]' + system_message + '[/SYSTEM_PROMPT]' }}
+{%- for message in messages %}
+{%- if message.role == 'user' %}
+{{- '[INST]' + message.content + '[/INST]' }}
+{%- elif message.role == 'assistant' %}
+{%- if message.content %}
+{{- message.content }}
+{%- endif %}
+{%- if message.tool_calls is defined and message.tool_calls is not none %}
+{%- for tool in message.tool_calls %}
+{%- set args = tool.function.arguments %}
+{%- if args is not string %}
+{%- set args = args | tojson %}
+{%- endif %}
+{{- '[TOOL_CALLS]' + tool.function.name + '[ARGS]' + args }}
+{%- endfor %}
+{%- endif %}
+{{- eos_token }}
+{%- elif message.role == 'tool' %}
+{{- '[TOOL_RESULTS]' + message.content + '[/TOOL_RESULTS]' }}
+{%- endif %}
+{%- endfor %}
