@@ -2105,9 +2105,17 @@ struct Server {
 
         // Auth gate: /health stays open (liveness for shell wrappers and the
         // GUI later); everything else needs the bearer key when one is set.
+        // A "req" line with no matching "resp" is the request that took the
+        // process down, so log at the start of routing.
+        http.set_logger([](const httplib::Request &req,
+                           const httplib::Response &res) {
+            serve_log("resp %s %s %d\n", req.method.c_str(), req.path.c_str(),
+                      res.status);
+        });
         http.set_pre_routing_handler([this](const httplib::Request &req,
                                             httplib::Response &res)
                                             -> httplib::Server::HandlerResponse {
+            serve_log("req %s %s\n", req.method.c_str(), req.path.c_str());
             if (req.path == "/health")
                 return httplib::Server::HandlerResponse::Unhandled;
             if (!cfg.key.empty()) {
