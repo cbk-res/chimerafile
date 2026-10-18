@@ -845,21 +845,37 @@ static GenResult run_chat(PhysModel &p, const ChatRequest &req,
     turn_end_markers.push_back("<|im_end|>");
 
     // Per-request sampler: the config's engine args with the OpenAI
-    // sampling fields applied on top.
+    // sampling fields applied on top.  The chat template is applied
+    // first: when tools are present it generates the tool-call grammar,
+    // which the sampler must receive at construction to constrain the
+    // output.  That is what keeps "auto" calls on format and forces a
+    // call under tool_choice "required" (or a named function).
+    common_chat_params chat;
+    if (!apply_chat_template(p, req, chat, out.err, true)) {
+        return out;
+    }
+
     common_params_sampling sp = p.cparams.sampling;
     if (req.temperature >= 0.0f) sp.temp = req.temperature;
     if (req.top_p >= 0.0f) sp.top_p = req.top_p;
     if (req.top_k >= 0) sp.top_k = req.top_k;
     if (req.seed_set) sp.seed = req.seed;
-    auto *gs = common_sampler_init(model, sp);
-    if (!gs) {
-        out.err = "failed to initialize the sampler";
+    if (!chat.grammar.empty()) {
+        sp.grammar = common_grammar(COMMON_GRAMMAR_TYPE_TOOL_CALLS,
+                                   chat.grammar);
+        sp.grammar_lazy = chat.grammar_lazy;
+        sp.grammar_triggers = chat.grammar_triggers;
+        sp.generation_prompt = chat.generation_prompt;
+    }
+    struct common_sampler *gs = nullptr;
+    try {
+        gs = common_sampler_init(model, sp);
+    } catch (const std::exception &e) {
+        out.err = std::string("failed to initialize the sampler: ") + e.what();
         return out;
     }
-
-    common_chat_params chat;
-    if (!apply_chat_template(p, req, chat, out.err, true)) {
-        common_sampler_free(gs);
+    if (!gs) {
+        out.err = "failed to initialize the sampler";
         return out;
     }
 
