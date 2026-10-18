@@ -657,6 +657,7 @@ static bool parse_chat_request(const nlohmann::ordered_json &body,
 struct GenResult {
     bool ok = false;
     std::string err;
+    bool bad_request = false;  // client's fault (400, not 500)
     std::string text;
     int prompt_tokens = 0;
     int completion_tokens = 0;
@@ -751,11 +752,52 @@ static int sanitize_tool_schemas(std::vector<common_chat_tool> &tools) {
     return n;
 }
 
-// Run one chat generation on a loaded model.  Must run on the process'
-// main thread (the host-compiled GPU backend only has working
-// host-glibc malloc state there).  on_delta is called with each decoded
-// piece of the reply -- clean content (thinking inline) and structured
-// tool-call deltas, produced by the model's own chat template parser;
+// The template renders the tool schemas into the prompt and carries
+// the PEG parser for the reply's tool-call markup.  Const with respect
+// to the template, so a request thread may preflight while a
+// generation runs on the main thread.
+static bool apply_chat_template(PhysModel &p, const ChatRequest &req,
+                                common_chat_params &chat, std::string &err,
+                                bool log_stripped) {
+    common_chat_templates_inputs in;
+    in.messages = common_chat_msgs_parse_oaicompat(req.messages);
+    in.tools = req.tools;
+    in.tool_choice = req.tool_choice;
+    // Have the parser extract the model's thinking block into
+    // reasoning_content; the markers are derived from the template.
+    in.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+    // As in llama-server: when the client omits the field, the template's
+    // own capability decides (its grammar may allow only one call).
+    in.parallel_tool_calls =
+        req.parallel_tool_calls_set
+            ? req.parallel_tool_calls
+            : common_chat_templates_get_caps(p.chat_tmpl.get())
+                  .at("supports_parallel_tool_calls");
+    int patterns_stripped = sanitize_tool_schemas(in.tools);
+    try {
+        chat = common_chat_templates_apply(p.chat_tmpl.get(), in);
+    } catch (const std::exception &e) {
+        err = std::string("chat template failed: ") + e.what();
+        return false;
+    }
+    if (patterns_stripped && log_stripped)
+        serve_log("tools: stripped %d unanchored schema pattern(s)\n",
+                  patterns_stripped);
+    return true;
+}
+
+static std::string ctx_overflow_msg(int n_prompt, int max_tokens, int n_ctx) {
+    std::string m = "prompt is " + std::to_string(n_prompt) + " tokens";
+    if (max_tokens > 0)
+        m += ", plus max_tokens " + std::to_string(max_tokens);
+    m += ", which exceeds the model's context (" + std::to_string(n_ctx) +
+         " tokens)";
+    return m;
+}
+
+// Must run on the process' main thread: the host-compiled GPU backend
+// only has working host-glibc malloc state there.  on_delta receives
+// each decoded piece (content, reasoning, or one tool-call delta);
 // returning false aborts the generation early (e.g. the client went
 // away).
 static GenResult run_chat(PhysModel &p, const ChatRequest &req,
@@ -799,44 +841,22 @@ static GenResult run_chat(PhysModel &p, const ChatRequest &req,
         return out;
     }
 
-    // OpenAI messages + tools -> the model's chat template -> prompt.
-    // The template renders the tool schemas into the prompt and carries
-    // a PEG parser for the matching tool-call markup in the reply.
-    common_chat_templates_inputs in;
-    in.messages = common_chat_msgs_parse_oaicompat(req.messages);
-    in.tools = req.tools;
-    in.tool_choice = req.tool_choice;
-    // Have the parser extract the model's thinking block into
-    // reasoning_content; the markers are derived from the template.
-    in.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
-    // As in llama-server: when the client omits the field, the template's
-    // own capability decides (its grammar may allow only one call).
-    in.parallel_tool_calls =
-        req.parallel_tool_calls_set
-            ? req.parallel_tool_calls
-            : common_chat_templates_get_caps(p.chat_tmpl.get())
-                  .at("supports_parallel_tool_calls");
-    int patterns_stripped = sanitize_tool_schemas(in.tools);
     common_chat_params chat;
-    try {
-        chat = common_chat_templates_apply(p.chat_tmpl.get(), in);
-    } catch (const std::exception &e) {
-        out.err = std::string("chat template failed: ") + e.what();
+    if (!apply_chat_template(p, req, chat, out.err, true)) {
         common_sampler_free(gs);
         return out;
     }
-    if (patterns_stripped)
-        serve_log("tools: stripped %d unanchored schema pattern(s)\n",
-                  patterns_stripped);
 
     int32_t n_prompt = llama_tokenize(vocab, chat.prompt.data(),
                                       (int32_t)chat.prompt.size(), nullptr, 0,
                                       true, false);
     if (n_prompt < 0)
         n_prompt = -n_prompt;
-    if (n_prompt > (int32_t)llama_n_ctx(ctx)) {
-        out.err = "prompt is longer than the context (" +
-                  std::to_string(llama_n_ctx(ctx)) + " tokens)";
+    int n_ctx = (int)llama_n_ctx(ctx);
+    if (n_prompt > n_ctx ||
+        (req.max_tokens > 0 && n_prompt + req.max_tokens > n_ctx)) {
+        out.bad_request = true;
+        out.err = ctx_overflow_msg(n_prompt, req.max_tokens, n_ctx);
         common_sampler_free(gs);
         return out;
     }
@@ -2181,7 +2201,11 @@ struct Server {
                     job->cv.wait(lk, [&] { return job->finished; });
                 }
                 if (!g.ok) {
-                    send_err(res, 500, "server_error", "generation_failed",
+                    send_err(res, g.bad_request ? 400 : 500,
+                             g.bad_request ? "invalid_request_error"
+                                           : "server_error",
+                             g.bad_request ? "context_length_exceeded"
+                                           : "generation_failed",
                              g.err);
                     return;
                 }
@@ -2222,6 +2246,36 @@ struct Server {
                 metrics.record_chat(g);
                 res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
                 return;
+            }
+
+            // An oversized prompt must fail before the first SSE chunk:
+            // the HTTP status is fixed at 200 once streaming starts (as
+            // in llama-server).  apply_chat_template runs again in the
+            // generation; this pass only needed the token count.
+            {
+                common_chat_params pf;
+                std::string perr;
+                if (!apply_chat_template(*p, cr, pf, perr, false)) {
+                    residency.release(*p);
+                    send_err(res, 500, "server_error", "generation_failed",
+                             perr);
+                    return;
+                }
+                auto *pf_ctx = p->init->context();
+                int32_t n = llama_tokenize(
+                    llama_model_get_vocab(p->init->model()), pf.prompt.data(),
+                    (int32_t)pf.prompt.size(), nullptr, 0, true, false);
+                if (n < 0)
+                    n = -n;
+                int n_ctx = (int)llama_n_ctx(pf_ctx);
+                if (n > n_ctx || (cr.max_tokens > 0 &&
+                                  n + cr.max_tokens > n_ctx)) {
+                    residency.release(*p);
+                    send_err(res, 400, "invalid_request_error",
+                             "context_length_exceeded",
+                             ctx_overflow_msg(n, cr.max_tokens, n_ctx));
+                    return;
+                }
             }
 
             // Streaming: Server-Sent Events via a chunked content provider.
@@ -2363,7 +2417,10 @@ struct Server {
                         nlohmann::json err;
                         err["error"]["message"] = st->result.err.empty()
                             ? "generation failed" : st->result.err;
-                        err["error"]["type"] = "server_error";
+                        err["error"]["type"] = st->result.bad_request
+                            ? "invalid_request_error" : "server_error";
+                        err["error"]["code"] = st->result.bad_request
+                            ? "context_length_exceeded" : "generation_failed";
                         std::string frame =
                             "data: " +
                             err.dump(-1, ' ', false,
