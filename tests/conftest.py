@@ -288,18 +288,30 @@ def server(request):
         reuse = True
     if not reuse:
         gpu = request.config.getoption("--gpu")
-        # The server resolves relative paths against the config's own
-        # directory, so it gets a rewritten copy with absolute paths.
-        cfg_path = Path("/tmp/opencode") / f"chimera-pytest-{port}-cfg.json"
-        cfg_path.write_text(json.dumps(cfg, indent=2))
-        cmd = [os.environ.get("CHIMERAFILE_BIN",
-                              str(ROOT / "llamafile" / "o" / "chimerafile"
-                                  / "chimerafile"))]
-        # No flag means auto-detect: the GPU backends load and the media
-        # engines (which have no layer knob) land on the GPU.  "cpu" maps
-        # to the binary's "off" so the default run never touches it.
-        cmd += ["--gpu", "off" if gpu == "cpu" else gpu]
-        cmd += ["serve", "--config", str(cfg_path)]
+        # "cpu" maps to the binary's "off": with no flag the APE
+        # auto-detects, the GPU backends load, and the media engines
+        # (which have no layer knob) land on the GPU.
+        gpu_flag = "off" if gpu == "cpu" else gpu
+        bin_path = os.environ.get("CHIMERAFILE_BIN",
+                                  str(ROOT / "llamafile" / "o" / "chimerafile"
+                                      / "chimerafile"))
+        if cfg.get("test_spawn") == "llama-server":
+            # A raw upstream llama-server child, no serve layer in between.
+            entry = models[llama_ids[0]]
+            cmd = [bin_path, "--gpu", gpu_flag, "llama", "--server",
+                   "-m", entry["file"],
+                   "--host", listen.rsplit(":", 1)[0],
+                   "--port", str(port),
+                   "--ctx-size", str(entry.get("ctx", 4096))]
+            cmd += entry.get("args", [])
+        else:
+            # The server resolves relative paths against the config's
+            # own directory, so it gets a rewritten copy with absolute
+            # paths.
+            cfg_path = Path("/tmp/opencode") / f"chimera-pytest-{port}-cfg.json"
+            cfg_path.write_text(json.dumps(cfg, indent=2))
+            cmd = [bin_path, "--gpu", gpu_flag, "serve", "--config",
+                   str(cfg_path)]
         log_path = Path("/tmp/opencode") / f"chimera-pytest-{port}.log"
         log = open(log_path, "wb")
         # The APE is not directly exec-able on Linux; the kernel refuses it

@@ -16,6 +16,7 @@ against the pinned submodule; this suite deliberately does not re-test it.
 | `test_residency.py` | Multi-model: both models load and serve, per-model caches survive interleaving, TTL unload + on-demand reload (via `GET /v1/status`). |
 | `test_media_audio.py` | The Whisper engine via `/v1/audio/transcriptions`: a real transcription of an espeak-ng–synthesised clip, the `json` / `verbose_json` / `text` formats, and the error matrix. |
 | `test_media_images.py` | The diffusion engine via `/v1/images/generations` + `/v1/images/edits`: small CPU-friendly generations (256×256, 8 steps) return a valid PNG of the requested size, plus the error matrix. |
+| `test_child_kv.py` | The KV retention scenarios again, but against a raw `llama --server` child with no serve layer in between, asserting on upstream's exact `timings.cache_n` counter — the check that warm continuation is inherited from upstream. |
 
 Configs live in `tests/configs/`.  Each is a normal serve config; a run
 points at one of them, so "a different model/backend" is a different
@@ -76,6 +77,14 @@ The media model files live in `tests/fixtures/` (gitignored — they are
 hundreds of MB): a whisper `.bin` and an SD 1.5 GGUF.  The success-path
 tests need them; without them (or against a config with no media entries)
 the module skips.
+
+**Raw child** uses the config key `test_spawn` to spawn a bare
+`llama --server` child (the first llama entry's file and args) instead
+of the serve layer:
+
+```sh
+pytest tests/test_child_kv.py --serve-config tests/configs/tiny-llama-child.json
+```
 
 Useful options and environment:
 

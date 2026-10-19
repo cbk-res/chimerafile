@@ -1,0 +1,14 @@
+{
+  "listen": "127.0.0.1:18094",
+  "test_profile": "tiny",
+  "test_spawn": "llama-server",
+  "models": {
+    "tiny": {
+      "engine": "llama",
+      "file": "llamafile/models/TinyLLama-v0.1-5M-F16.gguf",
+      "ctx": 4096,
+      "gpu_layers": 0,
+      "args": ["--chat-template-file", "tests/configs/test-model.jinja"]
+    }
+  }
+}
