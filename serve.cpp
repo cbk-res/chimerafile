@@ -2553,15 +2553,19 @@ struct Server {
             std::map<std::string, std::string> fields;
             std::string audio;
             bool got_file = false;
-            const httplib::FormData *part = nullptr;
+            std::string part_name;
+            std::string part_filename;
             bool parsed = content_reader(
                 [&](const httplib::FormData &fd) -> bool {
-                    part = &fd;
+                    // The FormData reference is only valid for the
+                    // duration of the header callback.
+                    part_name     = fd.name;
+                    part_filename = fd.filename;
                     return true;
                 },
                 [&](const char *d, size_t n) -> bool {
-                    if (part->filename.empty())
-                        fields[part->name] += std::string(d, n);
+                    if (part_filename.empty())
+                        fields[part_name] += std::string(d, n);
                     else {
                         audio += std::string(d, n);
                         got_file = true;
@@ -2766,15 +2770,19 @@ struct Server {
             std::map<std::string, std::string> fields;
             std::string file;
             bool got_file = false;
-            const httplib::FormData *part = nullptr;
+            std::string part_name;
+            std::string part_filename;
             bool parsed = content_reader(
                 [&](const httplib::FormData &fd) -> bool {
-                    part = &fd;
+                    // The FormData reference is only valid for the
+                    // duration of the header callback.
+                    part_name     = fd.name;
+                    part_filename = fd.filename;
                     return true;
                 },
                 [&](const char *d, size_t n) -> bool {
-                    if (part->filename.empty())
-                        fields[part->name] += std::string(d, n);
+                    if (part_filename.empty())
+                        fields[part_name] += std::string(d, n);
                     else {
                         file += std::string(d, n);
                         got_file = true;
