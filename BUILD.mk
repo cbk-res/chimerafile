@@ -376,10 +376,13 @@ CHIMERAFILE_GPU_SOS := $(wildcard o/$(MODE)/ggml-cuda.so o/$(MODE)/ggml-vulkan.s
 
 # --allow-multiple-definition dedupes stb (llamafile's third_party/stb vs
 # stable-diffusion.cpp's bundled copy) and other benign overlaps.
+# Link to a fresh file and rename into place: the APE runtime mmaps the
+# installed binary as executable text, so relinking in place (truncate +
+# rewrite of the same inode) corrupts every running instance of it.
 o/$(MODE)/chimerafile/chimerafile: $(CHIMERAFILE_ALL_OBJS) $(CHIMERAFILE_GPU_SOS) \
 	o/$(MODE)/third_party/zipalign/zipalign
 	@mkdir -p $(@D)
-	$(CXX) $(LDFLAGS) -o $@ $(filter %.o %.a,$^) $(LDLIBS) \
+	$(CXX) $(LDFLAGS) -o $@.new $(filter %.o %.a,$^) $(LDLIBS) \
 			-Wl,--allow-multiple-definition
 	@echo "==> Built: $@"
 	@ZIPALIGN="$(CURDIR)/o/$(MODE)/third_party/zipalign/zipalign"; \
@@ -398,13 +401,14 @@ o/$(MODE)/chimerafile/chimerafile: $(CHIMERAFILE_ALL_OBJS) $(CHIMERAFILE_GPU_SOS
 			fi; \
 		done; \
 		cd "$$BUNDLE_DIR" && \
-		"$$ZIPALIGN" -j0 "$(CURDIR)/$@" *.so && \
+		"$$ZIPALIGN" -j0 "$(CURDIR)/$@.new" *.so && \
 		rm -rf "$$BUNDLE_DIR" && \
 		echo "==> GPU backends embedded — binary has GPU support"; \
 	elif [ "$$HAVE_GPU" = "0" ]; then \
 		echo "==> No GPU backends found — binary runs CPU-only."; \
 		echo "    Optional: build with 'make cuda' and/or 'make vulkan' then rebuild"; \
 	fi
+	@mv $@.new $@
 
 .PHONY: o/$(MODE)/chimerafile
 o/$(MODE)/chimerafile: o/$(MODE)/chimerafile/chimerafile
