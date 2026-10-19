@@ -4,3 +4,6 @@ serve-mellum.json
 # python test caches
 __pycache__/
 .pytest_cache/
+
+# large model fixtures for the media tests (not committed)
+tests/fixtures/*

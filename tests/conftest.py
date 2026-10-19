@@ -50,9 +50,9 @@ def pytest_addoption(parser):
     parser.addoption("--serve-config", default=str(DEFAULT_CONFIG),
                      help="serve config for the server under test")
     parser.addoption("--gpu", default="cpu",
-                     help="backend for the spawned server: vulkan, metal, "
-                          "rocm, or cpu (default: cpu, matching the "
-                          "default tiny config)")
+                     help="backend for the spawned server: cpu (default; no "
+                           "GPU backend is loaded at all), vulkan, metal, or "
+                           "rocm")
     parser.addoption("--reuse", action="store_true",
                      help="use a server already listening on the config port")
     parser.addoption("--keep-server", action="store_true",
@@ -133,12 +133,39 @@ class Client:
         """POST a raw byte body (for the malformed-JSON checks)."""
         return self._request(path, body=body, timeout=timeout)
 
+    def post(self, path, payload, timeout=600):
+        """POST a JSON payload to any path; returns (status, raw-bytes)."""
+        return self._request(path, body=payload, timeout=timeout)
+
     def health(self, timeout=5):
         s, body = self.get("/health", timeout=timeout)
         return s, (body if isinstance(body, dict) else {})
 
     def models(self, timeout=10):
         return self.get("/v1/models", timeout=timeout)
+
+    def multipart(self, path, fields, file_field, file_name, file_bytes,
+                  file_type="application/octet-stream", timeout=600):
+        """POST a multipart/form-data body; returns (status, raw-bytes)."""
+        boundary = "----chimerafiletest" + os.urandom(8).hex()
+        parts = []
+        for k, v in fields.items():
+            parts.append(
+                (f"--{boundary}\r\n"
+                 f'Content-Disposition: form-data; name="{k}"\r\n\r\n'
+                 f"{v}\r\n").encode())
+        parts.append(
+            (f"--{boundary}\r\n"
+             f'Content-Disposition: form-data; name="{file_field}"; '
+             f'filename="{file_name}"\r\n'
+             f"Content-Type: {file_type}\r\n\r\n").encode()
+            + file_bytes + b"\r\n")
+        parts.append(f"--{boundary}--\r\n".encode())
+        return self._request(
+            path, body=b"".join(parts),
+            headers={"Content-Type":
+                     f"multipart/form-data; boundary={boundary}"},
+            timeout=timeout)
 
     def chat(self, payload, timeout=600):
         """Non-streaming chat; returns (status, parsed-json-or-text)."""
@@ -268,8 +295,10 @@ def server(request):
         cmd = [os.environ.get("CHIMERAFILE_BIN",
                               str(ROOT / "llamafile" / "o" / "chimerafile"
                                   / "chimerafile"))]
-        if gpu != "cpu":
-            cmd += ["--gpu", gpu]
+        # No flag means auto-detect: the GPU backends load and the media
+        # engines (which have no layer knob) land on the GPU.  "cpu" maps
+        # to the binary's "off" so the default run never touches it.
+        cmd += ["--gpu", "off" if gpu == "cpu" else gpu]
         cmd += ["serve", "--config", str(cfg_path)]
         log_path = Path("/tmp/opencode") / f"chimera-pytest-{port}.log"
         log = open(log_path, "wb")

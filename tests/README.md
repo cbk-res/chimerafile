@@ -1,10 +1,10 @@
 # serve tests
 
 A pytest suite for the **serve integration layer** — the part chimerafile
-owns: the OpenAI surface, model residency, queueing, and per-model KV
-retention.  Engine-level behaviour (sampling, chat templates, PEG,
-quantisations) is covered by llama.cpp's own test suite against the pinned
-submodule; this suite deliberately does not re-test it.
+owns: the OpenAI surface (chat and media), model residency, queueing,
+and per-model KV retention.  Engine-level behaviour (sampling, chat
+templates, PEG, quantisations) is covered by llama.cpp's own test suite
+against the pinned submodule; this suite deliberately does not re-test it.
 
 ## Layout
 
@@ -14,6 +14,8 @@ submodule; this suite deliberately does not re-test it.
 | `test_kv_retention.py` | Per-model KV cache via `timings.prompt_processing_s`: identical prompt decodes nothing, shared prefix decodes only the tail, divergent prefix colds the cache. |
 | `test_queueing.py` | The pump's serialisation under load: concurrent chats all succeed, `/health` stays responsive in flight, stream + non-stream interleave, recovery after a burst. |
 | `test_residency.py` | Multi-model: both models load and serve, per-model caches survive interleaving, TTL unload + on-demand reload (via `GET /v1/status`). |
+| `test_media_audio.py` | The Whisper engine via `/v1/audio/transcriptions`: a real transcription of an espeak-ng–synthesised clip, the `json` / `verbose_json` / `text` formats, and the error matrix. |
+| `test_media_images.py` | The diffusion engine via `/v1/images/generations` + `/v1/images/edits`: small CPU-friendly generations (256×256, 8 steps) return a valid PNG of the requested size, plus the error matrix. |
 
 Configs live in `tests/configs/`.  Each is a normal serve config; a run
 points at one of them, so "a different model/backend" is a different
@@ -31,7 +33,11 @@ a tool of its own volition).
 
 The default config is the repo's **tiny test model** (TinyLLama-5M from
 the llamafile submodule, 10 MB) on the CPU, so a full run costs nothing
-on the GPU and can happen while the live service is up:
+on the GPU and can happen while the live service is up.  The spawned
+server always gets an explicit `--gpu`: the default (`cpu`) maps to the
+binary's `off`, so no GPU backend loads at all — without the flag the APE
+auto-detects, and the media engines (which have no layer knob) would land
+on the GPU.
 
 ```sh
 pytest tests/
@@ -58,6 +64,18 @@ service is listening, residency skips itself and says so.)
 `two-models.json` loads the same model file twice, so its entries differ
 in `args` (and `ctx`): the server keys a physical model by file + args,
 and a distinct args list is what forces two physical loads.
+
+**Media** uses the tiny-media config (tiny llama + whisper + diffusion):
+
+```sh
+pytest tests/test_media_audio.py tests/test_media_images.py \
+    --serve-config tests/configs/tiny-media.json
+```
+
+The media model files live in `tests/fixtures/` (gitignored — they are
+hundreds of MB): a whisper `.bin` and an SD 1.5 GGUF.  The success-path
+tests need them; without them (or against a config with no media entries)
+the module skips.
 
 Useful options and environment:
 
