@@ -54,6 +54,7 @@
 #include <deque>
 #include <fstream>
 #include <future>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -435,8 +436,33 @@ static void load_llama(PhysModel &p, std::string &err) {
     // A re-load after TTL eviction starts from fresh defaults: the parser
     // asserts on stale values a previous load of this handle left behind.
     p.cparams = common_params();
+    // --chat-template / --chat-template-file are not in the common example
+    // set (the parse below rejects them), and serve owns template
+    // construction, so they are pulled out of the engine args here.
+    std::string chat_template;
+    std::vector<std::string> engine_args;
+    for (size_t i = 0; i < e.args.size(); i++) {
+        if ((e.args[i] == "--chat-template" || e.args[i] == "--chat-template-file") &&
+            i + 1 < e.args.size()) {
+            if (e.args[i] == "--chat-template") {
+                chat_template = e.args[i + 1];
+            } else {
+                std::ifstream tf(e.args[i + 1]);
+                if (!tf) {
+                    err = "llama: cannot open chat template file '" + e.args[i + 1] +
+                          "' for model '" + e.id + "'";
+                    return;
+                }
+                chat_template.assign(std::istreambuf_iterator<char>(tf),
+                                     std::istreambuf_iterator<char>());
+            }
+            i++;
+        } else {
+            engine_args.push_back(e.args[i]);
+        }
+    }
     std::vector<std::string> strs = {"chimerafile serve", "-m", e.file};
-    for (const auto &a : e.args)
+    for (const auto &a : engine_args)
         strs.push_back(a);
     std::vector<char *> argv;
     for (auto &s : strs)
@@ -465,7 +491,9 @@ static void load_llama(PhysModel &p, std::string &err) {
         err = "llama: failed to load '" + e.file + "' (out of memory?)";
         return;
     }
-    p.chat_tmpl = common_chat_templates_init(p.init->model(), "");
+    // An empty override keeps the model's own GGUF template (falling back
+    // to built-in ChatML when the GGUF has none).
+    p.chat_tmpl = common_chat_templates_init(p.init->model(), chat_template);
     p.chat_cache.clear();  // fresh context, empty cache
 }
 
