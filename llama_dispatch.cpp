@@ -174,8 +174,13 @@ int llama_dispatch(int argc, char **argv) {
         }
     }
 
+    // Router mode (server with --models-preset/--models-dir) never takes -m;
+    // the preset defines the model fleet instead.
+    const bool router_mode = args.mode == lf::ProgramMode::SERVER &&
+        (llamafile_has(argv, "--models-preset") || llamafile_has(argv, "--models-dir"));
     if (args.model_path.empty() &&
-        !llamafile_has(argv, "--help") && !llamafile_has(argv, "-h")) {
+        !llamafile_has(argv, "--help") && !llamafile_has(argv, "-h") &&
+        !router_mode) {
         fprintf(stderr, "error: missing required -m MODEL.gguf\n\n");
         switch (args.mode) {
             case lf::ProgramMode::SERVER: print_general_help(); break;

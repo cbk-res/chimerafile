@@ -10,6 +10,7 @@
 
 #include <cosmo.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <dlfcn.h>
 
@@ -164,6 +165,7 @@ int main(int argc, char **argv) {
     }
 
     // ── Parse --gpu MODE before banner (so GPU backend list is accurate) ──
+    bool gpu_flag_seen = false;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--gpu") && i + 1 < argc) {
             const char *mode = argv[i + 1];
@@ -172,7 +174,20 @@ int main(int argc, char **argv) {
             FLAG_gpu = llamafile_gpu_parse(mode);
             memmove(&argv[i], &argv[i + 2], (argc - i - 2 + 1) * sizeof(char *));
             argc -= 2;
+            gpu_flag_seen = true;
             break;
+        }
+    }
+    if (!gpu_flag_seen) {
+        // Router-spawned model children carry no --gpu; the front router
+        // exports the chosen backend via LLAMAFILE_GPU so grandchildren
+        // pick up the same one.
+        const char * gpu_env = getenv("LLAMAFILE_GPU");
+        if (gpu_env != nullptr && gpu_env[0] != '\0') {
+            const char *mode = gpu_env;
+            if (!strcasecmp(mode, "off"))
+                mode = "disable";
+            FLAG_gpu = llamafile_gpu_parse(mode);
         }
     }
 
