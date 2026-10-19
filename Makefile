@@ -70,6 +70,8 @@ fresh: # Reset the submodule trees to the pinned state, re-apply setup, rebuild
 	$(MAKE) -C $(LLAMAFILE) setup
 	@echo "==> Applying builder patches (llama.cpp ROCm/TinyBLAS)..."
 	@bash $(CHIMERAFILE_REPO)/ci-patches/patch-rocm-tinyblas.sh
+	@echo "==> Applying builder patches (llama.cpp router child spawn)..."
+	@bash $(CHIMERAFILE_REPO)/ci-patches/patch-router-child.sh
 	@echo "==> Recording setup baselines..."
 	@$(CHIMERAFILE_REPO)/scripts/record-setup-baseline.sh
 	@echo "==> Building from the known state..."
@@ -116,6 +118,8 @@ setup:
 	$(MAKE) -C $(LLAMAFILE) setup
 	@echo "==> Applying builder patches (llama.cpp ROCm/TinyBLAS)..."
 	@bash $(CHIMERAFILE_REPO)/ci-patches/patch-rocm-tinyblas.sh
+	@echo "==> Applying builder patches (llama.cpp router child spawn)..."
+	@bash $(CHIMERAFILE_REPO)/ci-patches/patch-router-child.sh
 	@echo "==> Recording setup baselines..."
 	@$(CHIMERAFILE_REPO)/scripts/record-setup-baseline.sh
 	@echo ""

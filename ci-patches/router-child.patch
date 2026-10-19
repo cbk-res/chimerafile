@@ -1,0 +1,34 @@
+diff --git a/tools/server/server-models.cpp b/tools/server/server-models.cpp
+--- a/tools/server/server-models.cpp
++++ b/tools/server/server-models.cpp
+@@ -368,10 +368,26 @@
+     args = preset.to_args(bin_path);
+ 
+     // unified binary dispatches by subcommand, re-inject it right after the
+-    // binary path so the child starts as 'llama serve ...' not 'llama ...'
+-    const char * app_cmd = std::getenv("LLAMA_APP_CMD");
+-    if (app_cmd != nullptr && app_cmd[0] != '\0' && !bin_path.empty()) {
+-        args.insert(args.begin() + 1, app_cmd);
++    // binary path (and after the APE file path from LLAMA_APP_PATH for APE
++    // runtimes) so the child starts as 'llama serve ...' not 'llama ...'
++    const char * app_cmd  = std::getenv("LLAMA_APP_CMD");
++    const char * app_path = std::getenv("LLAMA_APP_PATH");
++    if (!bin_path.empty() &&
++        ((app_cmd != nullptr && app_cmd[0] != '\0') ||
++         (app_path != nullptr && app_path[0] != '\0'))) {
++        auto it = args.begin() + 1;
++        // APE-style runtimes resolve the payload from a file passed as the
++        // first argument, not from argv[0]; LLAMA_APP_PATH carries that path.
++        if (app_path != nullptr && app_path[0] != '\0') {
++            args.insert(it, app_path);
++            ++it;
++        }
++        if (app_cmd != nullptr && app_cmd[0] != '\0') {
++            args.insert(it, app_cmd);
++            ++it;
++            // the dispatch default is combined chat+server; force server mode
++            args.insert(it, "--server");
++        }
+     }
+ }
+ 
