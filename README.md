@@ -139,7 +139,8 @@ Chat completions carry the model child's own per-request `timings` object (the u
 ### How it runs
 
 - Llama models run behind an upstream router child: serve spawns one `llama-server` router per port (a generated `--models-preset` names the fleet) and forwards the llama API to it. The router owns model spawning, loading, queueing and crash respawns; serve keeps the front half — admission against `max_loaded_models`, TTL eviction, pins, and the status merge. The first request for a model waits for its load, and concurrent requests for a full fleet get a retryable 503.
-- Media engines (whisper, diffusion, transcribe) still run in-process: their work (loads, inference, unloads) is posted to the process' main thread, because in this APE only the thread that dlopen'd the host engine libraries has a working host-glibc TLS state. So the first request for a model waits for its load, and concurrent media jobs queue behind it; interactive work (transcription) takes a fast lane ahead of queued image generations.
+- Media engines (whisper, diffusion, transcribe) run in a media child process: a config with media models makes serve spawn a second child (`chimerafile media`) and forward `/v1/audio/*` and `/v1/images/*` to it. The child keeps the single-pump discipline of the in-process days — loads, inference and unloads run on its main thread, because in this APE only the thread that dlopen'd the host engine libraries has a working host-glibc TLS state — so the first request for a model waits for its load and concurrent media jobs queue behind it; interactive work (transcription) takes a fast lane ahead of queued image generations. A crashed media child is respawned on the next request (bounded: five in any five-minute window) and that request is retried once.
+- GPU lease: with a GPU in play, model loads are serialised across the two children — while one child is loading a model, the other defers starting its own loads with a retryable 503 `model_loading` (`Retry-After: 5`). The other side's state is polled (the router snapshot every 1 s, the media child's `/v1/status` every 5 s), so the lease is coarse and best-effort, with a false-positive window of up to one sweep; with `--gpu off` it is a complete no-op.
 - KV retention is the child's own: it keeps prompt tokens in its KV cache between requests (unified cache, matched by content), so a prompt that repeats a previous prefix only prefills the new tail (clients like opencode resend the whole conversation each turn); the cache never clears on its own, and each model has its own child and its own cache.
 - Diffusion models get a fresh engine context per request: the pinned stable-diffusion.cpp cannot run a second generation on the same context, so each image request pays a few seconds of model load.
 - Streaming caveat: `stop` strings are checked by llama.cpp at token boundaries, so a stream can overshoot a stop string by the rest of the token the match landed inside.
@@ -259,9 +260,11 @@ it out of the shared brk region. Nothing to do — it's built in.
 chimerafile/                    ← this repo (chimerafile layer only)
 ├── chimerafile.cpp             ← dispatcher (owns main())
 ├── llama_dispatch.cpp          ← llamafile mode dispatch
-├── serve.cpp                   ← serve layer: OpenAI surface, media residency
+├── serve.cpp                   ← serve layer: OpenAI surface, routing to the children
 ├── serve_common.h              ← shared serve types (config, model entries)
-├── serve_forward.{h,cpp}       ← the router-child forwarder (the llama path)
+├── serve_config.cpp            ← config parsing (shared with the media child)
+├── serve_forward.{h,cpp}       ← the child forwarders: router (llama) + media
+├── serve_media.{h,cpp}         ← the media child: whisper / diffusion / transcribe
 ├── BUILD.mk                    ← build rules (injected into llamafile's make)
 ├── Makefile                    ← thin wrapper, delegates to llamafile/Makefile
 ├── ci-patches/                 ← builder patches (Pascal sm_61; ROCm TinyBLAS; router child spawn)
@@ -368,6 +371,7 @@ However, this has not yet been tested within chimerafile itself.
 - **v0.3** — aligned with llamafile v0.10.6: upstream diffusionfile pattern, transcribe engine, CI builds the pinned submodule
 - **v0.4** — `chimerafile serve`: OpenAI-compatible server over all four engines (declarative config, TTL residency, serial execution)
 - **v0.5** — llama path moved behind an upstream router child (one router per serve, front-side admission, TTL/pins kept); media engines still in-process
+- **v0.6** — media engines moved behind a media child process (serve is now a thin router over the router child and the media child); GPU lease serialises model loads across the two children
 
 ## License
 

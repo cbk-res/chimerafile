@@ -14,7 +14,7 @@ against the pinned submodule; this suite deliberately does not re-test it.
 | `test_kv_retention.py` | Per-model KV cache via the child's `timings.prompt_ms`: identical prompt decodes nothing, shared prefix decodes only the tail, divergent prefix pays a full prefill. Every test uses sentences no other test uses (the child's KV cache is content-addressed and never clears). |
 | `test_queueing.py` | Load: concurrent chats all succeed, `/health` stays responsive in flight, stream + non-stream interleave, recovery after a burst. |
 | `test_residency.py` | Multi-model: both models load and serve, per-model caches survive interleaving, TTL unload + on-demand reload (via `GET /v1/status`). |
-| `test_gizmo_lifecycle.py` | The process tree, on a fresh port per test: spawn failure, crash self-heal, TTL release, orphans after a group kill and after a graceful stop, disconnect cancellation, alias routing, load coalescing, capacity eviction, pinned-fleet 503. |
+| `test_gizmo_lifecycle.py` | The process tree, on a fresh port per test: spawn failure, crash self-heal, TTL release, orphans after a group kill and after a graceful stop, disconnect cancellation, alias routing, load coalescing, capacity eviction, pinned-fleet 503 — and the media child's own lifecycle (crash self-heal, TTL unload + reload, group kill with a media config). |
 | `test_media_audio.py` | The Whisper engine via `/v1/audio/transcriptions`: a real transcription of an espeak-ng–synthesised clip, the `json` / `verbose_json` / `text` formats, and the error matrix. |
 | `test_media_images.py` | The diffusion engine via `/v1/images/generations` + `/v1/images/edits`: small CPU-friendly generations (256×256, 8 steps) return a valid PNG of the requested size, plus the error matrix. |
 | `test_child_kv.py` | The KV retention scenarios again, but against a raw `llama --server` child with no serve layer in between, asserting on upstream's exact `timings.cache_n` counter — the check that warm continuation is inherited from upstream. |
@@ -78,6 +78,12 @@ The media model files live in `tests/fixtures/` (gitignored — they are
 hundreds of MB): a whisper `.bin` and an SD 1.5 GGUF.  The success-path
 tests need them; without them (or against a config with no media entries)
 the module skips.
+
+The GPU lease (model loads serialised across the two children — see the
+top-level README's "How it runs") is a no-op in this suite: the runs are
+`--gpu off`, and even on a GPU the page-cached test models load in ~3 s,
+faster than the lease's 5 s status sweep can observe the "loading" state.
+It is checked by a manual `--gpu vulkan` run instead.
 
 **Raw child** uses the config key `test_spawn` to spawn a bare
 `llama --server` child (the first llama entry's file and args) instead
