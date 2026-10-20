@@ -1,0 +1,11 @@
+{
+  "listen": "127.0.0.1:18124",
+  "test_profile": "tiny",
+  "models": {
+    "wspk": {
+      "engine": "whisper",
+      "file": "tests/fixtures/ggml-large-v3-turbo-q5_0.bin",
+      "ttl": 3
+    }
+  }
+}

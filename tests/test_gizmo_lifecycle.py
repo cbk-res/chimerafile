@@ -1,17 +1,19 @@
-"""Router-child lifecycle tests (the "gizmo" layer).
+"""Child-process lifecycle tests (the "gizmo" layer).
 
 The session-scoped `server` fixture covers the request surface; these
 tests drive the process tree itself: spawn failure, crash self-heal,
 TTL release, orphan cleanup after a SIGKILL'd serve, generation
-cancellation on client disconnect, alias routing, load coalescing, and
-capacity eviction.  Each test spawns its own serve on a fresh port and
-inspects the process table via /proc, scoped to the spawned tree so the
-live service is never touched.
+cancellation on client disconnect, alias routing, load coalescing,
+capacity eviction, and the media child's own lifecycle (crash
+self-heal, TTL unload, group kill).  Each test spawns its own serve on
+a fresh port and inspects the process table via /proc, scoped to the
+spawned tree so the live service is never touched.
 """
 
 import json
 import os
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -50,6 +52,7 @@ class Gizmo:
         self.base = f"http://127.0.0.1:{self.port}"
         cfg_path = Path("/tmp/opencode") / f"chimera-gizmo-{self.port}-cfg.json"
         cfg_path.write_text(json.dumps(cfg, indent=2))
+        self.cfg_path = cfg_path
         bin_path = os.environ.get(
             "CHIMERAFILE_BIN",
             str(ROOT / "llamafile" / "o" / "chimerafile" / "chimerafile"))
@@ -117,6 +120,14 @@ class Gizmo:
         return [pid for pid, argv in self._tree().items()
                 if "--alias" in argv and "--models-preset" not in argv]
 
+    def media_pid(self):
+        """The media child (chimerafile media), or None when the config has
+        no media models."""
+        for pid, argv in self._tree().items():
+            if "media" in argv:
+                return pid
+        return None
+
     def cfg_model_file(self, model_id):
         return self.cfg["models"][model_id].get("file") or ""
 
@@ -133,6 +144,12 @@ class Gizmo:
             "messages": [{"role": "user", "content": "Say hi."}],
             "max_tokens": n,
         })
+
+    def transcribe(self, model, wav_bytes):
+        return self.client.multipart(
+            "/v1/audio/transcriptions",
+            {"model": model, "response_format": "json"},
+            "file", "speech.wav", wav_bytes)
 
     def teardown(self):
         if self.proc.poll() is None:
@@ -158,6 +175,19 @@ def gserv():
     yield _start
     for g in started:
         g.teardown()
+
+
+@pytest.fixture(scope="module")
+def speech_wav():
+    """A short espeak-ng utterance; one synthesis serves all media tests."""
+    if not shutil.which("espeak-ng"):
+        pytest.skip("espeak-ng not available; cannot synthesise audio")
+    out = "/tmp/opencode/chimera-gizmo-speech.wav"
+    subprocess.run(
+        ["espeak-ng", "-w", out,
+         "The quick brown fox jumps over the lazy dog."], check=True)
+    with open(out, "rb") as f:
+        return f.read()
 
 
 # ── lifecycle tests ────────────────────────────────────────────────────
@@ -406,3 +436,70 @@ def test_pinned_model_blocks_eviction(gserv):
     assert rows["tiny-a"]["state"] == "loaded", \
         f"the pinned model must not be touched: {rows['tiny-a']}"
     assert rows["tiny-b"]["state"] == "unloaded", f"row={rows['tiny-b']}"
+
+
+# ── media-child lifecycle tests ────────────────────────────────────────
+
+def test_media_crash_self_heal(gserv, speech_wav):
+    g = gserv("tiny-media.json")
+    s, r = g.transcribe("whisper-turbo", speech_wav)
+    assert s == 200, \
+        f"the media model must load while the child is up: {str(r)[:160]}"
+    old = g.media_pid()
+    assert old is not None, "no media child after a successful transcription"
+    os.kill(old, signal.SIGKILL)
+    # The request path respawns the child (bounded) and retries once, so a
+    # single transcription normally heals it; the loop is the safety net.
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        s, r = g.transcribe("whisper-turbo", speech_wav)
+        if s == 200:
+            break
+        time.sleep(2)
+    assert s == 200, f"the media child must respawn and serve: {str(r)[:160]}"
+    new = g.media_pid()
+    assert new is not None and new != old, "the media child was not respawned"
+
+
+def test_media_ttl_unloads_and_reloads(gserv, speech_wav):
+    g = gserv("gizmo-media-ttl.json")  # wspk: whisper, ttl: 3
+    s, r = g.transcribe("wspk", speech_wav)
+    assert s == 200, f"status={s} body={str(r)[:160]}"
+    row = g.status_rows()["wspk"]
+    assert row["state"] == "loaded", f"row={row}"
+    time.sleep(12)  # ttl 3s + the child's 5s sweeper cycle + the unload
+    row = g.status_rows()["wspk"]
+    assert row["state"] == "unloaded", f"row={row}"
+    # and it comes back on demand
+    s, r = g.transcribe("wspk", speech_wav)
+    assert s == 200, f"status={s} body={str(r)[:160]}"
+    row = g.status_rows()["wspk"]
+    assert row["state"] == "loaded", f"row={row}"
+
+
+def test_no_orphans_after_group_kill_media(gserv):
+    # The media config adds the media child to the tree: serve + router +
+    # model child + media child must all die with the group.
+    g = gserv("tiny-media.json")
+    s, _ = g.chat("tiny")
+    assert s == 200
+    router, child, media = g.router_pid(), g.child_pid("tiny"), g.media_pid()
+    assert router is not None and child is not None and media is not None, \
+        f"tree incomplete: router={router} child={child} media={media}"
+    preset_marker = f"/tmp/chimerafile-serve-{g.proc.pid}/"
+    model_marker = g.cfg_model_file("tiny")
+    media_marker = str(g.cfg_path)
+    os.killpg(g.proc.pid, signal.SIGKILL)
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        if (_proc_gone(router, preset_marker)
+                and _proc_gone(child, model_marker)
+                and _proc_gone(media, media_marker)):
+            break
+        time.sleep(0.5)
+    assert _proc_gone(router, preset_marker), \
+        "the router outlived the group kill"
+    assert _proc_gone(child, model_marker), \
+        "the model child outlived the group kill"
+    assert _proc_gone(media, media_marker), \
+        "the media child outlived the group kill"
