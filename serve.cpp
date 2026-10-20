@@ -272,6 +272,29 @@ struct Server {
                          " engine, not llama");
                 return;
             }
+            // Reject prompts that provably cannot fit before the child sees
+            // them: the pinned child sometimes crashes (segfault, not 400)
+            // while tokenizing a huge prompt with tools, and one bad request
+            // must not take the child -- and every in-flight chat -- down
+            // (pass-through-plan 14.11).  A token is 1-4 UTF-8 bytes, so
+            // more than 4*ctx bytes of content is guaranteed to exceed the
+            // context; the child's effective context is at most the config's.
+            {
+                size_t bytes = 0;
+                if (body.contains("messages") && body["messages"].is_array())
+                    for (const auto &m : body["messages"])
+                        if (m.is_object() && m.contains("content") &&
+                            m["content"].is_string())
+                            bytes += m["content"].get<std::string>().size();
+                if (body.contains("tools") && body["tools"].is_array())
+                    bytes += body["tools"].dump().size();
+                if (bytes > 4 * (size_t)e->ctx) {
+                    send_err(res, 400, "invalid_request_error",
+                             "context_length_exceeded",
+                             "prompt is too large for the model's context");
+                    return;
+                }
+            }
             forwarder.handle_chat(res, *e, body);
         });
 

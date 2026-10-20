@@ -239,7 +239,9 @@ def test_error_matrix(server):
 
 def test_overflow_with_tools_400(server):
     """The load-crash regression: an oversized prompt with tools must be
-    a clean 400, before the first chunk in streaming mode."""
+    a clean 400, before the first chunk in streaming mode.  The serve
+    layer now pre-rejects provably oversized prompts (4*ctx byte bound),
+    so the child never sees this one."""
     c = server.client
 
     s, r = c.chat({"model": server.model,
