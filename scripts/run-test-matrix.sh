@@ -45,6 +45,9 @@ run() {
 run "compat + kv + queueing + gizmo (default config)" tests/
 run "media (audio + images)" tests/test_media_audio.py \
     tests/test_media_images.py --serve-config tests/configs/tiny-media.json
+run "media (sdcpp + transcribe)" tests/test_media_sdcpp.py \
+    tests/test_media_transcribe.py \
+    --serve-config tests/configs/tiny-media-sdcpp.json
 run "residency (two-model config)" tests/test_residency.py \
     --serve-config tests/configs/two-models.json
 run "child kv (raw llama --server child)" tests/test_child_kv.py \

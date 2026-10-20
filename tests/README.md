@@ -17,6 +17,8 @@ against the pinned submodule; this suite deliberately does not re-test it.
 | `test_gizmo_lifecycle.py` | The process tree, on a fresh port per test: spawn failure, crash self-heal, TTL release, orphans after a group kill, after a graceful stop, and after a bare hard kill of serve (the parent-death watcher), disconnect cancellation, alias routing, load coalescing, capacity eviction, pinned-fleet 503 — the GPU lease deferring a llama load while the media child is on the GPU (`gpu_exclusive`), and the media child's own lifecycle (crash self-heal, TTL unload + reload, group kill with a media config). |
 | `test_media_audio.py` | The Whisper engine via `/v1/audio/transcriptions`: a real transcription of an espeak-ng–synthesised clip, the `json` / `verbose_json` / `text` formats, and the error matrix. |
 | `test_media_images.py` | The diffusion engine via `/v1/images/generations` + `/v1/images/edits`: small CPU-friendly generations (256×256, 8 steps) return a valid PNG of the requested size, plus the error matrix. |
+| `test_media_sdcpp.py` | The sdcpp mirror of stable-diffusion.cpp's server API: `/sdcpp/v1/capabilities`, async `img_gen` jobs (txt2img, img2img, hires upscale, cancel of a queued job), and the error matrix (including the `mask_image` rejection). Uses the tiny-media-sdcpp config. Note: img2img (init-image) runs are engine-unreliable -- the pinned engine can stack-overflow the child's 80 KB guest thread stack during VAE encode (see pass-through-plan 14.10); a dead child on an img2img job is that engine limitation, not a serve-layer regression. |
+| `test_media_transcribe.py` | The transcribe.cpp engine on the same `/v1/audio/transcriptions` surface as whisper: a real transcription of an espeak-ng clip with a canary-180m model, `json` + `verbose_json`, and the 400 for a non-speech model. Uses the tiny-media-sdcpp config. |
 | `test_child_kv.py` | The KV retention scenarios again, but against a raw `llama --server` child with no serve layer in between, asserting on upstream's exact `timings.cache_n` counter — the check that warm continuation is inherited from upstream. |
 
 Configs live in `tests/configs/`.  Each is a normal serve config; a run
@@ -90,10 +92,22 @@ pytest tests/test_media_audio.py tests/test_media_images.py \
     --serve-config tests/configs/tiny-media.json
 ```
 
+The sdcpp and transcribe suites use the tiny-media-sdcpp config (tiny
+llama + whisper + diffusion + a transcribe model, with `"sdcpp"` enabled
+on the diffusion model):
+
+```sh
+pytest tests/test_media_sdcpp.py tests/test_media_transcribe.py \
+    --serve-config tests/configs/tiny-media-sdcpp.json
+```
+
 The media model files live in `tests/fixtures/` (gitignored — they are
-hundreds of MB): a whisper `.bin` and an SD 1.5 GGUF.  The success-path
-tests need them; without them (or against a config with no media entries)
-the module skips.
+hundreds of MB): a whisper `.bin`, an SD 1.5 GGUF and a
+canary-180m-flash GGUF.  The success-path tests need them; without them
+(or against a config with no media entries) the module skips.  The one
+committed exception is the `upscalers/` placeholder: a labeled 67-byte
+file that `test_capabilities` asserts on through the capabilities
+listing (it is never loaded).
 
 The GPU lease (model loads serialised across the two children — see the
 top-level README's "How it runs") is a no-op in the CPU lane: with

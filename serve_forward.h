@@ -154,12 +154,16 @@ struct MediaForwarder {
     bool start(std::string &err);
     void stop();
 
-    // Relay one request to the child verbatim (path, body, Content-Type)
-    // and copy the child's response (status, Content-Type, body) back.
-    // On a dead child: respawn, retry once; still dead -> 502
-    // media_unavailable.
+    // Relay one request to the child verbatim (path, body, Content-Type) and copy the child's
+    // response (status, Content-Type, body) back. On a dead child: respawn, retry once; still
+    // dead -> 502 media_unavailable. model_hint names the model the request will load when the
+    // body carries no model field (the sdcpp img_gen route), for the lease gate below.
     void forward(const std::string &path, const std::string &body,
-                 const std::string &content_type, httplib::Response &res);
+                 const std::string &content_type, httplib::Response &res,
+                 const std::string &model_hint = "");
+
+    // GET variant of forward(): no body, and no lease gate (GETs only read job state or capabilities, they load nothing).
+    void forward_get(const std::string &path, httplib::Response &res);
 
     // /v1/status merge inputs: the child's queue and resident rows (live
     // fetch).  Empty object when the child is absent or down.

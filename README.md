@@ -94,6 +94,10 @@ All four engines behind one port, driven by a declarative config file:
 {
   "listen": "127.0.0.1:8080",
   "key": "optional-bearer-token",
+  "sdcpp": {
+    "model": "artist",
+    "upscalers_dir": "upscalers"
+  },
   "models": {
     "assistant": {
       "engine": "llama", "file": "gemma.gguf",
@@ -114,6 +118,7 @@ All four engines behind one port, driven by a declarative config file:
 - `ttl` — seconds to stay in RAM when idle. Omitted = engine default (30 min llama, 5 min everything else); `0` = never.
 - `pin` — never unload, never evict.
 - `args` — CLI flags passed through verbatim, **llama only**: they land in the model child's own `llama-server` command line (`--temp`, `--ctk`, `--no-mmap`, `--flash-attn on`, `--cache-type-k q8_0`, ...), so the full llama-server option set is available, including server-tool-only flags like `--cache-prompt`. The other engines have no flag passthrough; their behaviour is steered by the request fields instead.
+- `sdcpp` — optional; the block's presence enables the `/sdcpp/v1/*` surface (see Endpoints). `model` — the diffusion model it serves; defaults to the first diffusion model in the config, and must name a diffusion model. `upscalers_dir` — optional directory of extra hires upscaler models (`.gguf`, `.safetensors`, `.pt`, `.pth`), resolved relative to the config file's directory.
 
 ### Endpoints
 
@@ -125,6 +130,10 @@ All four engines behind one port, driven by a declarative config file:
 | `POST /v1/audio/transcriptions` | whisper, transcribe | multipart `file` + `model`; `response_format` = `json` (default) \| `text` \| `srt` \| `vtt` \| `verbose_json`; `language` |
 | `POST /v1/images/generations` | diffusion | JSON; see extensions below |
 | `POST /v1/images/edits` | diffusion | multipart `image` + `prompt` (img2img); optional `size`, defaults to the input image's |
+| `POST /sdcpp/v1/img_gen` | diffusion | sdcpp surface (config-gated): async image job; 202 with `poll_url` |
+| `GET /sdcpp/v1/jobs/<id>` | diffusion | job status/result; 410 once expired |
+| `POST /sdcpp/v1/jobs/<id>/cancel` | diffusion | cancel a queued job (409 while generating) |
+| `GET /sdcpp/v1/capabilities` | diffusion | model, modes, defaults, limits, samplers, upscalers |
 | `GET /v1/status` | — | what is loaded, what is queued, uptime |
 | `POST /v1/residency/<id>` | — | preload / keep warm (starts the TTL clock) |
 | `POST /v1/residency/<id>/unload` | — | explicit unload (409 while in use) |
@@ -139,7 +148,7 @@ Chat completions carry the model child's own per-request `timings` object (the u
 ### How it runs
 
 - Llama models run behind an upstream router child: serve spawns one `llama-server` router per port (a generated `--models-preset` names the fleet) and forwards the llama API to it. The router owns model spawning, loading, queueing and crash respawns; serve keeps the front half — admission against `max_loaded_models`, TTL eviction, pins, and the status merge. The first request for a model waits for its load, and concurrent requests for a full fleet get a retryable 503.
-- Media engines (whisper, diffusion, transcribe) run in a media child process: a config with media models makes serve spawn a second child (`chimerafile media`) and forward `/v1/audio/*` and `/v1/images/*` to it. The child keeps the single-pump discipline of the in-process days — loads, inference and unloads run on its main thread, because in this APE only the thread that dlopen'd the host engine libraries has a working host-glibc TLS state — so the first request for a model waits for its load and concurrent media jobs queue behind it; interactive work (transcription) takes a fast lane ahead of queued image generations. A crashed media child is respawned on the next request (bounded: five in any five-minute window) and that request is retried once.
+- Media engines (whisper, diffusion, transcribe) run in a media child process: a config with media models makes serve spawn a second child (`chimerafile media`) and forward `/v1/audio/*`, `/v1/images/*` and (when `sdcpp` is enabled) `/sdcpp/*` to it. The child keeps the single-pump discipline of the in-process days — loads, inference and unloads run on its main thread, because in this APE only the thread that dlopen'd the host engine libraries has a working host-glibc TLS state — so the first request for a model waits for its load and concurrent media jobs queue behind it; interactive work (transcription) takes a fast lane ahead of queued image generations. A crashed media child is respawned on the next request (bounded: five in any five-minute window) and that request is retried once.
 - GPU lease: with a GPU in play, model loads are serialised across the two children — while one child is loading a model, the other defers starting its own loads with a retryable 503 `model_loading` (`Retry-After: 5`). The other side's state is polled (the router snapshot every 1 s, the media child's `/v1/status` every 5 s), so the lease is coarse and best-effort, with a false-positive window of up to one sweep; with `--gpu off` it is a complete no-op.
 - No orphans: the APE runtime swallows PDEATHSIG, so every child carries its own parent-death watcher instead — when serve dies (hard kill, crash), each child notices within about a second and shuts down through its own SIGTERM path, and the tree cascades: the router takes its model children down with it. A launcher that kills the whole process group (systemd `KillMode=control-group`, job control) takes everything down immediately.
 - KV retention is the child's own: it keeps prompt tokens in its KV cache between requests (unified cache, matched by content), so a prompt that repeats a previous prefix only prefills the new tail (clients like opencode resend the whole conversation each turn); the cache never clears on its own, and each model has its own child and its own cache.
@@ -149,6 +158,7 @@ Chat completions carry the model child's own per-request `timings` object (the u
 - A prompt that does not fit the model's context — alone, or together with `max_tokens` — is a client error: 400 `context_length_exceeded` before the reply starts. In streaming mode the 400 arrives before the first chunk, not mid-stream.
 - `temperature` and `prompt` on `/v1/audio/transcriptions` are whisper-only: whisper.cpp has both, transcribe.cpp has neither, and the server passes down only what the engine supports.
 - Image generation takes the OpenAI fields `prompt`, `size` (`WxH`), `n` (1–4), `seed`, `response_format` (`b64_json` default | `url`, returned as a `data:` URL) plus the chimerafile extensions `negative_prompt`, `steps` and `cfg_scale` — all optional.
+- The `sdcpp` block mirrors the native API of stable-diffusion.cpp's own server (`/sdcpp/v1/*`) so clients pointed at an sd.cpp server work unchanged: `img_gen` jobs (txt2img, img2img via `init_image` + `strength`, hires upscale, batches of up to 8) with the upstream's async poll/cancel semantics, request field names and response shapes. What the mirror does not expose: video, control images, reference images, loras, vae tiling, and `mask_image` (rejected with a 400 — the pinned engine's mask path corrupts memory in this APE, with or without the serve layer).
 
 An end-to-end smoke test of the whole surface lives at `scripts/serve-smoke-test.py` (standard library only):
 

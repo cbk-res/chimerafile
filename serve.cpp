@@ -427,6 +427,37 @@ struct Server {
                 metrics.image_requests++;
         });
 
+        // sdcpp: the native API of stable-diffusion.cpp's own server, hosted by the media child
+        // and relayed verbatim (the child owns the job state); enabled by the config's "sdcpp" entry.
+        if (cfg.sdcpp.enabled) {
+            http.Post("/sdcpp/v1/img_gen",
+                      [this](const httplib::Request &req,
+                             httplib::Response &res) {
+                // The body has no model field; the job always runs on the configured model (the lease gate needs to know it).
+                media_forwarder.forward("/sdcpp/v1/img_gen", req.body,
+                                        "application/json", res,
+                                        cfg.sdcpp.model);
+            });
+            http.Get(R"(/sdcpp/v1/jobs/([A-Za-z0-9_\-]+))",
+                     [this](const httplib::Request &req,
+                            httplib::Response &res) {
+                media_forwarder.forward_get(
+                    "/sdcpp/v1/jobs/" + req.matches[1].str(), res);
+            });
+            http.Post(R"(/sdcpp/v1/jobs/([A-Za-z0-9_\-]+)/cancel)",
+                      [this](const httplib::Request &req,
+                             httplib::Response &res) {
+                media_forwarder.forward(
+                    "/sdcpp/v1/jobs/" + req.matches[1].str() + "/cancel",
+                    "", "application/json", res);
+            });
+            http.Get("/sdcpp/v1/capabilities",
+                     [this](const httplib::Request &,
+                            httplib::Response &res) {
+                media_forwarder.forward_get("/sdcpp/v1/capabilities", res);
+            });
+        }
+
         // Chimerafile extension: what is loaded, what is queued, how long
         // the server has been up.  Resident rows merge the media child's
         // state with the llama models' state from the router child (which

@@ -48,12 +48,21 @@ struct ModelEntry {
     int effective_ttl() const { return ttl < 0 ? default_ttl(engine) : ttl; }
 };
 
+// The sdcpp surface of the media child: the native /sdcpp/v1/* API of
+// stable-diffusion.cpp's own server, mirrored so clients that point at an sd.cpp server work unchanged. Present in the config = enabled.
+struct SdcppConfig {
+    bool enabled = false;
+    std::string model;          // diffusion model id that serves img_gen
+    std::string upscalers_dir;  // hires upscaler models (optional)
+};
+
 struct Config {
     std::string host = "127.0.0.1";
     int port = 8080;
     std::string key;                 // empty = no auth
     int max_loaded = 1;              // llama models resident at once
     std::vector<ModelEntry> models;
+    SdcppConfig sdcpp;
 
     const ModelEntry *find(const std::string &id) const {
         for (const auto &m : models)

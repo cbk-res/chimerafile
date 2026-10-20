@@ -14,6 +14,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <cmath>
+#include <dirent.h>
+#include <iomanip>
+#include <sstream>
+#include <unordered_map>
 
 // stb_image (decode uploads for /v1/images/edits) and stb_image_write
 // (encode generated images to PNG).  Only the declarations are pulled in
@@ -60,6 +65,35 @@ static std::string b64_encode(const std::string &in) {
         out += left > 1 ? tbl[v & 63] : '=';
     }
     return out;
+}
+
+// b64_encode's inverse, for the sdcpp surface's init_image payloads (a bare base64 body or a data: url, the two forms upstream accepts).
+static bool b64_decode(const std::string &in, std::string &out) {
+    std::string s = in;
+    size_t comma = s.find(',');
+    if (s.rfind("data:", 0) == 0 && comma != std::string::npos)
+        s.erase(0, comma + 1);
+    out.clear();
+    out.reserve(s.size() * 3 / 4 + 4);
+    int acc = 0, bits = 0;
+    for (char c : s) {
+        if (c == '=' || c == '\n' || c == '\r')
+            continue;
+        int v;
+        if (c >= 'A' && c <= 'Z')       v = c - 'A';
+        else if (c >= 'a' && c <= 'z')  v = c - 'a' + 26;
+        else if (c >= '0' && c <= '9')  v = c - '0' + 52;
+        else if (c == '+')              v = 62;
+        else if (c == '/')              v = 63;
+        else                            return false;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out += (char)((acc >> bits) & 0xFF);
+        }
+    }
+    return !out.empty();
 }
 
 static std::string phys_key(const ModelEntry &e) {
@@ -304,20 +338,12 @@ std::string build_vtt(const std::vector<TranscribeResult::Segment> &segs) {
 // seconds per request, in exchange for the rest of the design staying
 // identical to the other engines.
 
-// Run one generation on a loaded model (main thread only).
-// edit is the decoded input image for image edits (nullptr = text-to-image).
-ImageResult run_image(PhysModel &p, const std::string &prompt,
-                             const std::string &negative, int w, int h,
-                             int n, int steps, float cfg, long seed,
-                             const std::vector<uint8_t> *edit,
-                             int edit_w, int edit_h) {
-    ImageResult out;
-    // The pinned engine cannot run a second generation on the same
-    // context -- the second compute graph crashes, and a minimal
-    // harness against the engine alone reproduces it -- so every
-    // request gets a fresh context: load it if there is none, free it
-    // again once the pixels are out.  The pump serializes engine work,
-    // so at most one request touches p.sctx at a time.
+// The one-shot context dance behind every generation (see the note above): load the
+// context if there is none, generate, copy the pixels out, and free the context again.
+// The pump serializes engine work, so at most one request touches p.sctx at a time. Main thread only.
+static void image_generate(PhysModel &p, sd_img_gen_params_t &sp,
+                           std::vector<ImageResult::Img> &out,
+                           std::string &err) {
     std::string lerr;
     {
         std::lock_guard<std::mutex> lk(p.mu);
@@ -325,16 +351,52 @@ ImageResult run_image(PhysModel &p, const std::string &prompt,
             load_diffusion(p, lerr);
     }
     if (!p.sctx) {
-        out.err = lerr.empty() ? "model not loaded" : lerr;
-        return out;
+        err = lerr.empty() ? "model not loaded" : lerr;
+        return;
     }
     if (!sd_ctx_supports_image_generation(p.sctx)) {
-        out.err = "this model does not support image generation";
+        err = "this model does not support image generation";
         std::lock_guard<std::mutex> lk(p.mu);
         free_sd_ctx(p.sctx);  // never ran a generation, but don't hold it
         p.sctx = nullptr;
-        return out;
+        return;
     }
+    sd_image_t *imgs = generate_image(p.sctx, &sp);
+    if (!imgs) {
+        err = "generation failed (out of memory?)";
+        std::lock_guard<std::mutex> lk(p.mu);
+        free_sd_ctx(p.sctx);  // a failed run may leave it half-set-up
+        p.sctx = nullptr;
+        return;
+    }
+    for (int i = 0; i < sp.batch_count; i++) {
+        ImageResult::Img img;
+        img.w = (int)imgs[i].width;
+        img.h = (int)imgs[i].height;
+        img.ch = (int)imgs[i].channel;
+        img.px.resize((size_t)img.w * img.h * img.ch);
+        if (imgs[i].data)
+            std::memcpy(img.px.data(), imgs[i].data, img.px.size());
+        free(imgs[i].data);
+        out.push_back(std::move(img));
+    }
+    free(imgs);  // the engine's array itself
+    {
+        // One-shot context: drop it now that the pixels are copied out.
+        std::lock_guard<std::mutex> lk(p.mu);
+        free_sd_ctx(p.sctx);
+        p.sctx = nullptr;
+    }
+}
+
+// Run one generation on a loaded model (main thread only).
+// edit is the decoded input image for image edits (nullptr = text-to-image).
+ImageResult run_image(PhysModel &p, const std::string &prompt,
+                      const std::string &negative, int w, int h,
+                      int n, int steps, float cfg, long seed,
+                      const std::vector<uint8_t> *edit,
+                      int edit_w, int edit_h) {
+    ImageResult out;
     sd_img_gen_params_t sp;
     sd_img_gen_params_init(&sp);
     sp.prompt = prompt.c_str();
@@ -356,33 +418,14 @@ ImageResult run_image(PhysModel &p, const std::string &prompt,
         // the engine only reads the input image's pixels
         sp.init_image.data = const_cast<uint8_t *>(edit->data());
     }
-    sd_image_t *imgs = generate_image(p.sctx, &sp);
-    if (!imgs) {
-        out.err = "generation failed (out of memory?)";
-        std::lock_guard<std::mutex> lk(p.mu);
-        free_sd_ctx(p.sctx);  // a failed run may leave it half-set-up
-        p.sctx = nullptr;
+    std::vector<ImageResult::Img> imgs;
+    std::string err;
+    image_generate(p, sp, imgs, err);
+    if (!err.empty()) {
+        out.err = err;
         return out;
     }
-    for (int i = 0; i < n; i++) {
-        ImageResult::Img img;
-        img.w = (int)imgs[i].width;
-        img.h = (int)imgs[i].height;
-        img.ch = (int)imgs[i].channel;
-        img.px.resize((size_t)img.w * img.h * img.ch);
-        if (imgs[i].data)
-            std::memcpy(img.px.data(), imgs[i].data, img.px.size());
-        free(imgs[i].data);
-        out.images.push_back(std::move(img));
-    }
-    free(imgs);  // the engine's array itself
-    {
-        // The context is one-shot (see the note at the top): drop it
-        // now that the pixels are safely copied out.
-        std::lock_guard<std::mutex> lk(p.mu);
-        free_sd_ctx(p.sctx);
-        p.sctx = nullptr;
-    }
+    out.images = std::move(imgs);
     out.ok = true;
     return out;
 }
@@ -414,6 +457,385 @@ bool decode_image(const std::string &data, int &w, int &h,
     px.assign(p, p + (size_t)pw * ph * 3);
     free(p);
     return true;
+}
+
+
+// ── sdcpp surface (mirrors stable-diffusion.cpp's own server) ────────────
+//
+// The native /sdcpp/v1/* API of the sd.cpp server (examples/server), mirrored onto this
+// child's one-shot generation path so clients that point at an sd.cpp server work unchanged.
+// Request field names, the ignore-unknown-fields leniency and response shapes follow the
+// pinned examples/server + examples/common; sampler/scheduler/upscaler names resolve through
+// the engine's own str_to_* / *_name APIs. Only img_gen is exposed: the child hosts no video
+// models, and execution goes through the same residency queue as every other engine job --
+// the manager below only keeps the status/result JSON clients poll.
+
+enum class SdcppStatus { Queued, Generating, Completed, Failed, Cancelled };
+
+static const char *sdcpp_status_name(SdcppStatus s) {
+    switch (s) {
+        case SdcppStatus::Queued:     return "queued";
+        case SdcppStatus::Generating: return "generating";
+        case SdcppStatus::Completed:  return "completed";
+        case SdcppStatus::Failed:     return "failed";
+        case SdcppStatus::Cancelled:  return "cancelled";
+    }
+    return "?";
+}
+
+// One /sdcpp/v1/img_gen job: parsed and resolved at submission, then shared between the
+// HTTP workers (which serialize it) and the pump (which runs it), so the engine params
+// can point straight into its members for the duration of the run.
+struct SdcppJob {
+    std::string id;
+    SdcppStatus status = SdcppStatus::Queued;
+    long created_at = 0, started_at = 0, completed_at = 0;
+    uint64_t seq = 0;  // submission order; queue_position counts ahead of it
+
+    // Request, as parsed.
+    std::string prompt, negative_prompt;
+    int clip_skip = -1;
+    int width = 0, height = 0;  // <= 0 = resolve from the init image, else 512
+    int batch_count = 1;
+    long seed = -1;             // < 0 = random at run time
+    float strength = 0.75f;
+    sd_sample_params_t sp{};    // engine defaults, request fields override
+    std::vector<float> custom_sigmas;
+    std::vector<uint8_t> init_px;  int init_w = 0, init_h = 0;
+    bool hires_enabled = false;
+    sd_hires_params_t hires{};
+    std::string hires_model_path;  // resolved upscaler file ("" = builtin)
+    std::string output_format = "png";
+
+    // Result, set by the run on the pump thread.
+    std::vector<std::string> result_b64;
+    std::string error_code, error_message;
+};
+
+// Status/result bookkeeping for the jobs, mirroring upstream's AsyncJobManager: finished
+// jobs linger 600 s, then stay 410-able for another 600 s. No execution lives here --
+// that is the residency queue.
+struct SdcppJobs {
+    std::mutex mu;
+    std::unordered_map<std::string, std::shared_ptr<SdcppJob>> jobs;
+    std::unordered_map<std::string, long> expired;  // id -> when it forgets
+    uint64_t next_id = 0;
+
+    static const size_t MAX_PENDING = 64;  // upstream's default
+    static const long FINISHED_TTL = 600;
+    static const long EXPIRED_TTL = 600;
+};
+
+// Call with mgr.mu held.
+static void sdcpp_purge(SdcppJobs &mgr, long now) {
+    for (auto it = mgr.expired.begin(); it != mgr.expired.end();)
+        it = (it->second <= now) ? mgr.expired.erase(it) : std::next(it);
+    for (auto it = mgr.jobs.begin(); it != mgr.jobs.end();) {
+        const auto &job = it->second;
+        if (job->completed_at == 0) {
+            ++it;
+            continue;
+        }
+        if (now - job->completed_at >= SdcppJobs::FINISHED_TTL) {
+            mgr.expired[job->id] = now + SdcppJobs::EXPIRED_TTL;
+            it = mgr.jobs.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+// Call with mgr.mu held.
+static size_t sdcpp_pending(const SdcppJobs &mgr) {
+    size_t n = 0;
+    for (const auto &kv : mgr.jobs)
+        if (kv.second->status == SdcppStatus::Queued ||
+            kv.second->status == SdcppStatus::Generating)
+            n++;
+    return n;
+}
+
+// The job as clients see it; mirrors upstream's make_async_job_json.
+// Call with mgr.mu held.
+static nlohmann::json sdcpp_job_json(const SdcppJobs &mgr,
+                                     const SdcppJob &job) {
+    nlohmann::json r;
+    r["id"] = job.id;
+    r["kind"] = "img_gen";
+    r["status"] = sdcpp_status_name(job.status);
+    r["created"] = job.created_at;
+    r["started"] = job.started_at == 0 ? nlohmann::json(nullptr)
+                                      : nlohmann::json(job.started_at);
+    r["completed"] = job.completed_at == 0 ? nlohmann::json(nullptr)
+                                           : nlohmann::json(job.completed_at);
+    r["queue_position"] = 0;
+    if (job.status == SdcppStatus::Queued) {
+        size_t position = 1;
+        for (const auto &kv : mgr.jobs)
+            if (kv.second->status == SdcppStatus::Queued &&
+                kv.second->seq < job.seq)
+                position++;
+        r["queue_position"] = position;
+    }
+    if (job.status == SdcppStatus::Completed) {
+        nlohmann::json images = nlohmann::json::array();
+        for (size_t i = 0; i < job.result_b64.size(); i++)
+            images.push_back({{"index", (int)i},
+                              {"b64_json", job.result_b64[i]}});
+        r["result"] = {{"output_format", job.output_format},
+                       {"images", images}};
+        r["error"] = nullptr;
+    } else if (job.status == SdcppStatus::Failed ||
+               job.status == SdcppStatus::Cancelled) {
+        r["result"] = nullptr;
+        r["error"] = {{"code", job.error_code},
+                      {"message", job.error_message}};
+    } else {
+        r["result"] = nullptr;
+        r["error"] = nullptr;
+    }
+    return r;
+}
+
+// The request's inline init image: a base64 payload or a data: url, decoded to 3-channel
+// pixels (stb, the same decoder the OpenAI edits path uses).
+static bool decode_sdcpp_image(const std::string &encoded,
+                               std::vector<uint8_t> &px, int &w, int &h) {
+    std::string bytes;
+    if (!b64_decode(encoded, bytes))
+        return false;
+    int pw = 0, ph = 0, pch = 0;
+    unsigned char *p = stbi_load_from_memory(
+        (const unsigned char *)bytes.data(), (int)bytes.size(), &pw, &ph,
+        &pch, 3);
+    if (!p)
+        return false;
+    w = pw;
+    h = ph;
+    px.assign(p, p + (size_t)pw * ph * 3);
+    free(p);
+    return true;
+}
+
+// Parse and validate one /sdcpp/v1/img_gen body into a job. Field names and the
+// ignore-unknown-fields leniency follow upstream's SDGenerationParams::from_json_str;
+// sampler/scheduler/upscaler names resolve through the engine's own str_to_* APIs
+// (an unknown name is ignored, as upstream does).
+static bool parse_sdcpp_img_gen(const nlohmann::json &j, const Config &cfg,
+                                SdcppJob &job, std::string &err) {
+    auto str = [&j](const char *k) {
+        return j.contains(k) && j[k].is_string() ? j[k].get<std::string>()
+                                                 : std::string();
+    };
+
+    job.prompt = str("prompt");
+    if (job.prompt.empty()) {
+        err = "prompt is required";
+        return false;
+    }
+    job.negative_prompt = str("negative_prompt");
+    if (j.contains("clip_skip") && j["clip_skip"].is_number_integer())
+        job.clip_skip = j["clip_skip"].get<int>();
+    if (j.contains("width") && j["width"].is_number_integer())
+        job.width = j["width"].get<int>();
+    if (j.contains("height") && j["height"].is_number_integer())
+        job.height = j["height"].get<int>();
+    if (job.width > 4096 || job.height > 4096) {
+        err = "width and height must be at most 4096";
+        return false;
+    }
+    if (j.contains("batch_count") && j["batch_count"].is_number_integer())
+        job.batch_count = j["batch_count"].get<int>();
+    // upstream's strict-mode clamps
+    job.batch_count = std::clamp(job.batch_count, 1, 8);
+    if (j.contains("seed") && j["seed"].is_number_integer())
+        job.seed = j["seed"].get<long>();
+    if (j.contains("strength") && j["strength"].is_number())
+        job.strength = (float)j["strength"].get<double>();
+
+    std::string init = str("init_image");
+    if (!init.empty() &&
+        !decode_sdcpp_image(init, job.init_px, job.init_w, job.init_h)) {
+        err = "invalid init_image";
+        return false;
+    }
+    // Inpainting is out of scope for this mirror: the pinned engine's mask path corrupts memory
+    // in this APE (segfault or a wedged child, reproduced without the serve layer via the plain
+    // diffusion CLI), so the field is rejected rather than passed to the engine.
+    if (j.contains("mask_image")) {
+        err = "mask_image is not supported by this server";
+        return false;
+    }
+
+    // sample_params: engine defaults, request fields override (upstream's parse_sample_params_json).
+    {
+        sd_img_gen_params_t scratch;
+        sd_img_gen_params_init(&scratch);
+        job.sp = scratch.sample_params;
+        job.sp.custom_sigmas = nullptr;  // repointed at the job's vector below
+        job.sp.custom_sigmas_count = 0;
+        job.sp.extra_sample_args = nullptr;
+        if (j.contains("sample_params") && j["sample_params"].is_object()) {
+            const nlohmann::json &sp = j["sample_params"];
+            if (sp.contains("sample_steps") &&
+                sp["sample_steps"].is_number_integer())
+                job.sp.sample_steps = sp["sample_steps"].get<int>();
+            if (sp.contains("eta") && sp["eta"].is_number())
+                job.sp.eta = (float)sp["eta"].get<double>();
+            if (sp.contains("shifted_timestep") &&
+                sp["shifted_timestep"].is_number_integer())
+                job.sp.shifted_timestep = sp["shifted_timestep"].get<int>();
+            if (sp.contains("flow_shift") && sp["flow_shift"].is_number())
+                job.sp.flow_shift = (float)sp["flow_shift"].get<double>();
+            if (sp.contains("custom_sigmas") &&
+                sp["custom_sigmas"].is_array())
+                job.custom_sigmas =
+                    sp["custom_sigmas"].get<std::vector<float>>();
+            if (sp.contains("sample_method") &&
+                sp["sample_method"].is_string()) {
+                sample_method_t m = str_to_sample_method(
+                    sp["sample_method"].get<std::string>().c_str());
+                if (m != SAMPLE_METHOD_COUNT)
+                    job.sp.sample_method = m;
+            }
+            if (sp.contains("scheduler") && sp["scheduler"].is_string()) {
+                scheduler_t s = str_to_scheduler(
+                    sp["scheduler"].get<std::string>().c_str());
+                if (s != SCHEDULER_COUNT)
+                    job.sp.scheduler = s;
+            }
+            if (sp.contains("guidance") && sp["guidance"].is_object()) {
+                const nlohmann::json &g = sp["guidance"];
+                if (g.contains("txt_cfg") && g["txt_cfg"].is_number())
+                    job.sp.guidance.txt_cfg = (float)g["txt_cfg"].get<double>();
+                if (g.contains("img_cfg") && g["img_cfg"].is_number())
+                    job.sp.guidance.img_cfg = (float)g["img_cfg"].get<double>();
+                if (g.contains("distilled_guidance") &&
+                    g["distilled_guidance"].is_number())
+                    job.sp.guidance.distilled_guidance =
+                        (float)g["distilled_guidance"].get<double>();
+            }
+        }
+        if (job.sp.sample_steps > 0)
+            job.sp.sample_steps = std::clamp(job.sp.sample_steps, 1, 100);
+    }
+
+    // hires (upstream's resolve(): an empty upscaler means "Latent", "None" disables it, and a
+    // name that is not a builtin is an upscaler model file in upscalers_dir).
+    if (j.contains("hires") && j["hires"].is_object()) {
+        const nlohmann::json &h = j["hires"];
+        job.hires_enabled = h.contains("enabled") && h["enabled"].is_boolean() &&
+                            h["enabled"].get<bool>();
+        std::string up;
+        if (h.contains("upscaler") && h["upscaler"].is_string())
+            up = h["upscaler"].get<std::string>();
+        if (job.hires_enabled) {
+            if (up.empty())
+                up = "Latent";
+            job.hires.upscaler = str_to_sd_hires_upscaler(up.c_str());
+            if (job.hires.upscaler == SD_HIRES_UPSCALER_NONE)
+                job.hires_enabled = false;
+            else if (job.hires.upscaler == SD_HIRES_UPSCALER_COUNT) {
+                // not a builtin: an upscaler model file in upscalers_dir
+                static const char *exts[] = {".gguf", ".safetensors", ".pt",
+                                             ".pth"};
+                std::string cand = cfg.sdcpp.upscalers_dir + "/" + up;
+                FILE *f = fopen(cand.c_str(), "r");
+                if (!f)
+                    for (const char *ext : exts) {
+                        cand = cfg.sdcpp.upscalers_dir + "/" + up + ext;
+                        f = fopen(cand.c_str(), "r");
+                        if (f)
+                            break;
+                    }
+                if (!f) {
+                    err = "hires upscaler '" + up + "' is not a builtin name "
+                          "and no upscaler model file was found for it";
+                    return false;
+                }
+                fclose(f);
+                job.hires_model_path = cand;
+                job.hires.upscaler = SD_HIRES_UPSCALER_MODEL;
+            }
+            if (h.contains("scale") && h["scale"].is_number())
+                job.hires.scale = (float)h["scale"].get<double>();
+            if (h.contains("target_width") &&
+                h["target_width"].is_number_integer())
+                job.hires.target_width = h["target_width"].get<int>();
+            if (h.contains("target_height") &&
+                h["target_height"].is_number_integer())
+                job.hires.target_height = h["target_height"].get<int>();
+            if (h.contains("steps") && h["steps"].is_number_integer())
+                job.hires.steps = h["steps"].get<int>();
+            if (h.contains("denoising_strength") &&
+                h["denoising_strength"].is_number())
+                job.hires.denoising_strength =
+                    (float)h["denoising_strength"].get<double>();
+            if (h.contains("upscale_tile_size") &&
+                h["upscale_tile_size"].is_number_integer())
+                job.hires.upscale_tile_size =
+                    h["upscale_tile_size"].get<int>();
+        }
+    }
+
+    job.output_format = str("output_format");
+    if (job.output_format.empty())
+        job.output_format = "png";
+    if (job.output_format != "png") {
+        err = "output_format '" + job.output_format +
+              "' is not supported (png only)";
+        return false;
+    }
+    return true;
+}
+
+// Map a parsed job to the engine's params (upstream's to_sd_img_gen_params_t, for the fields
+// img_gen exposes). The pointers point into the job, which the run closure keeps alive
+// for the whole run.
+static void build_sdcpp_params(const SdcppJob &job, sd_img_gen_params_t &sp) {
+    sd_img_gen_params_init(&sp);
+    sp.prompt = job.prompt.c_str();
+    if (!job.negative_prompt.empty())
+        sp.negative_prompt = job.negative_prompt.c_str();
+    sp.clip_skip = job.clip_skip;
+    int w = job.width > 0 ? job.width : (job.init_w > 0 ? job.init_w : 512);
+    int h = job.height > 0 ? job.height : (job.init_h > 0 ? job.init_h : 512);
+    sp.width = w;
+    sp.height = h;
+    sp.batch_count = job.batch_count;
+    sp.seed = job.seed >= 0 ? job.seed : (int64_t)rand();
+    sp.sample_params = job.sp;
+    sp.sample_params.custom_sigmas = job.custom_sigmas.empty()
+                                         ? nullptr
+                                         : const_cast<float *>(
+                                               job.custom_sigmas.data());
+    sp.sample_params.custom_sigmas_count = (int)job.custom_sigmas.size();
+    if (!job.init_px.empty()) {
+        sp.init_image.width = (uint32_t)job.init_w;
+        sp.init_image.height = (uint32_t)job.init_h;
+        sp.init_image.channel = 3;
+        sp.init_image.data = const_cast<uint8_t *>(job.init_px.data());
+        sp.strength = job.strength;
+    }
+    if (job.hires_enabled) {
+        sp.hires.enabled = true;
+        sp.hires.upscaler = job.hires.upscaler;
+        sp.hires.model_path = job.hires_model_path.empty()
+                                  ? nullptr
+                                  : job.hires_model_path.c_str();
+        sp.hires.scale = job.hires.scale;
+        sp.hires.target_width = job.hires.target_width > 0
+                                    ? job.hires.target_width
+                                    : (int)(w * job.hires.scale + 0.5);
+        sp.hires.target_height = job.hires.target_height > 0
+                                     ? job.hires.target_height
+                                     : (int)(h * job.hires.scale + 0.5);
+        sp.hires.steps = job.hires.steps > 0
+                             ? job.hires.steps
+                             : sp.sample_params.sample_steps;
+        sp.hires.denoising_strength = job.hires.denoising_strength;
+        sp.hires.upscale_tile_size = job.hires.upscale_tile_size;
+    }
 }
 
 // One unit of engine work submitted to the main thread's pump.  The pump
@@ -601,6 +1023,7 @@ std::shared_ptr<PhysModel> Residency::acquire(const ModelEntry &e, std::string &
         if (p->state.load() == 2)
             return p;
         err = p->last_err;
+        p->in_use.fetch_sub(1);  // the load failed; callers release only on success
     }
     return nullptr;
 }
@@ -757,8 +1180,13 @@ struct MediaServer {
     httplib::Server http;
     time_t start_at = 0;
     std::thread http_thread;
+    SdcppJobs sdcpp_jobs;
+    const ModelEntry *sdcpp_model = nullptr;  // resolved at start, stable
 
-    explicit MediaServer(Config c) : cfg(std::move(c)), residency(cfg) {}
+    explicit MediaServer(Config c)
+        : cfg(std::move(c)), residency(cfg),
+          sdcpp_model(cfg.sdcpp.enabled ? cfg.find(cfg.sdcpp.model)
+                                        : nullptr) {}
 
     // OpenAI image generation + edits share one core: validate the model
     // (diffusion engine only), run the generation on the main thread
@@ -1219,6 +1647,370 @@ struct MediaServer {
                 &ipp, iw, ih, res);
         });
 
+        // sdcpp: the native API of stable-diffusion.cpp's own server, mirrored (see the section above); present in the config = on.
+        if (cfg.sdcpp.enabled) {
+            http.Post("/sdcpp/v1/img_gen",
+                      [this](const httplib::Request &req,
+                             httplib::Response &res) {
+                if (req.body.empty()) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"empty body"})",
+                                    "application/json");
+                    return;
+                }
+                nlohmann::json body;
+                try {
+                    body = nlohmann::json::parse(req.body);
+                } catch (const nlohmann::json::exception &e) {
+                    res.status = 400;
+                    res.set_content(
+                        nlohmann::json({{"error", "invalid json"},
+                                        {"message", e.what()}})
+                            .dump(-1, ' ', false,
+                                  nlohmann::json::error_handler_t::replace),
+                        "application/json");
+                    return;
+                }
+                auto job = std::make_shared<SdcppJob>();
+                std::string perr;
+                if (!parse_sdcpp_img_gen(body, cfg, *job, perr)) {
+                    res.status = 400;
+                    res.set_content(
+                        nlohmann::json({{"error", perr}})
+                            .dump(-1, ' ', false,
+                                  nlohmann::json::error_handler_t::replace),
+                        "application/json");
+                    return;
+                }
+                {
+                    std::lock_guard<std::mutex> lk(sdcpp_jobs.mu);
+                    sdcpp_purge(sdcpp_jobs, (long)time(nullptr));
+                    if (sdcpp_pending(sdcpp_jobs) >= SdcppJobs::MAX_PENDING) {
+                        res.status = 429;
+                        res.set_content(R"({"error":"job queue is full"})",
+                                        "application/json");
+                        return;
+                    }
+                    uint64_t seq = sdcpp_jobs.next_id++;
+                    std::ostringstream oss;
+                    oss << "job_" << std::hex << (long)time(nullptr) << "_"
+                        << std::setw(8) << std::setfill('0') << seq;
+                    job->id = oss.str();
+                    job->seq = seq;
+                    job->created_at = (long)time(nullptr);
+                    sdcpp_jobs.jobs[job->id] = job;
+                }
+                std::string aerr;
+                auto p = residency.acquire(*sdcpp_model, aerr);
+                if (!p) {
+                    std::lock_guard<std::mutex> lk(sdcpp_jobs.mu);
+                    sdcpp_jobs.jobs.erase(job->id);
+                    res.status = 503;
+                    res.set_content(
+                        nlohmann::json(
+                            {{"error", "model load failed: " + aerr}})
+                            .dump(-1, ' ', false,
+                                  nlohmann::json::error_handler_t::replace),
+                        "application/json");
+                    return;
+                }
+                auto ej = std::make_shared<EngineJob>();
+                ej->p = p;
+                ej->run = [this, p, job] {
+                    {
+                        std::lock_guard<std::mutex> lk(sdcpp_jobs.mu);
+                        // cancelled while queued: never generate
+                        if (job->status == SdcppStatus::Cancelled)
+                            return;
+                        job->status = SdcppStatus::Generating;
+                        job->started_at = (long)time(nullptr);
+                    }
+                    std::string gerr;
+                    {
+                        sd_img_gen_params_t sp;
+                        build_sdcpp_params(*job, sp);
+                        std::vector<ImageResult::Img> imgs;
+                        image_generate(*p, sp, imgs, gerr);
+                        if (gerr.empty()) {
+                            bool encoded_all = true;
+                            for (const auto &img : imgs) {
+                                std::string png;
+                                if (!encode_png(img, png)) {
+                                    encoded_all = false;
+                                    break;
+                                }
+                                job->result_b64.push_back(b64_encode(png));
+                            }
+                            if (!encoded_all)
+                                gerr = "failed to encode the generated image(s)";
+                        }
+                    }
+                    std::lock_guard<std::mutex> lk(sdcpp_jobs.mu);
+                    job->completed_at = (long)time(nullptr);
+                    if (!gerr.empty()) {
+                        job->status = SdcppStatus::Failed;
+                        job->error_code = "generation_failed";
+                        job->error_message = gerr;
+                    } else {
+                        job->status = SdcppStatus::Completed;
+                    }
+                };
+                if (!residency.submit_engine(ej)) {
+                    residency.release(*p);
+                    std::lock_guard<std::mutex> lk(sdcpp_jobs.mu);
+                    job->completed_at = (long)time(nullptr);
+                    job->status = SdcppStatus::Failed;
+                    job->error_code = "server_shutdown";
+                    job->error_message = "server is shutting down";
+                    res.status = 503;
+                    res.set_content(
+                        nlohmann::json(
+                            {{"error", "server is shutting down"}})
+                            .dump(-1, ' ', false,
+                                  nlohmann::json::error_handler_t::replace),
+                        "application/json");
+                    return;
+                }
+                res.status = 202;
+                nlohmann::json out;
+                out["id"] = job->id;
+                out["kind"] = "img_gen";
+                out["status"] = "queued";
+                out["created"] = job->created_at;
+                out["poll_url"] = "/sdcpp/v1/jobs/" + job->id;
+                res.set_content(
+                    out.dump(-1, ' ', false,
+                             nlohmann::json::error_handler_t::replace),
+                    "application/json");
+            });
+
+            http.Get(R"(/sdcpp/v1/jobs/([A-Za-z0-9_\-]+))",
+                     [this](const httplib::Request &req,
+                            httplib::Response &res) {
+                std::lock_guard<std::mutex> lk(sdcpp_jobs.mu);
+                sdcpp_purge(sdcpp_jobs, (long)time(nullptr));
+                const std::string id = req.matches[1].str();
+                auto it = sdcpp_jobs.jobs.find(id);
+                if (it == sdcpp_jobs.jobs.end()) {
+                    if (sdcpp_jobs.expired.count(id)) {
+                        res.status = 410;
+                        res.set_content(R"({"error":"job expired"})",
+                                        "application/json");
+                    } else {
+                        res.status = 404;
+                        res.set_content(R"({"error":"job not found"})",
+                                        "application/json");
+                    }
+                    return;
+                }
+                res.set_content(
+                    sdcpp_job_json(sdcpp_jobs, *it->second)
+                        .dump(-1, ' ', false,
+                              nlohmann::json::error_handler_t::replace),
+                    "application/json");
+            });
+
+            http.Post(R"(/sdcpp/v1/jobs/([A-Za-z0-9_\-]+)/cancel)",
+                      [this](const httplib::Request &req,
+                             httplib::Response &res) {
+                std::lock_guard<std::mutex> lk(sdcpp_jobs.mu);
+                sdcpp_purge(sdcpp_jobs, (long)time(nullptr));
+                const std::string id = req.matches[1].str();
+                auto it = sdcpp_jobs.jobs.find(id);
+                if (it == sdcpp_jobs.jobs.end()) {
+                    if (sdcpp_jobs.expired.count(id)) {
+                        res.status = 410;
+                        res.set_content(R"({"error":"job expired"})",
+                                        "application/json");
+                    } else {
+                        res.status = 404;
+                        res.set_content(R"({"error":"job not found"})",
+                                        "application/json");
+                    }
+                    return;
+                }
+                SdcppJob &job = *it->second;
+                if (job.status == SdcppStatus::Queued) {
+                    // the queued run no-ops on the pump; this is the client-visible result
+                    job.status = SdcppStatus::Cancelled;
+                    job.completed_at = (long)time(nullptr);
+                    job.error_code = "cancelled";
+                    job.error_message = "job cancelled by client";
+                } else if (job.status == SdcppStatus::Generating) {
+                    res.status = 409;
+                    res.set_content(
+                        R"({"error":"job is currently generating and cannot be interrupted yet"})",
+                        "application/json");
+                    return;
+                }
+                res.status = 200;
+                res.set_content(
+                    sdcpp_job_json(sdcpp_jobs, job)
+                        .dump(-1, ' ', false,
+                              nlohmann::json::error_handler_t::replace),
+                    "application/json");
+            });
+
+            http.Get("/sdcpp/v1/capabilities",
+                     [this](const httplib::Request &,
+                            httplib::Response &res) {
+                const ModelEntry &m = *sdcpp_model;
+                std::string name = m.file;
+                {
+                    const char *slash = strrchr(m.file.c_str(), '/');
+                    if (slash)
+                        name = slash + 1;
+                }
+                size_t dot = name.rfind('.');
+                std::string stem =
+                    dot != std::string::npos ? name.substr(0, dot) : name;
+
+                // The engine's own defaults, reported like upstream's make_img_gen_defaults_json.
+                sd_img_gen_params_t d;
+                sd_img_gen_params_init(&d);
+                auto finite_or_null = [](double v) -> nlohmann::json {
+                    return std::isfinite(v) ? nlohmann::json(v)
+                                            : nlohmann::json(nullptr);
+                };
+                const sd_sample_params_t &dsp = d.sample_params;
+                nlohmann::json defaults;
+                defaults["prompt"] = "";
+                defaults["negative_prompt"] = "";
+                defaults["clip_skip"] = -1;
+                defaults["width"] = 512;
+                defaults["height"] = 512;
+                defaults["strength"] = 0.75;
+                defaults["seed"] = 42;
+                defaults["batch_count"] = 1;
+                defaults["auto_resize_ref_image"] = true;
+                defaults["increase_ref_index"] = false;
+                defaults["control_strength"] = 0.9;
+                defaults["sample_params"] = {
+                    {"scheduler", sd_scheduler_name(dsp.scheduler)},
+                    {"sample_method",
+                     sd_sample_method_name(dsp.sample_method)},
+                    {"sample_steps", dsp.sample_steps},
+                    {"eta", finite_or_null(dsp.eta)},
+                    {"shifted_timestep", dsp.shifted_timestep},
+                    {"flow_shift", finite_or_null(dsp.flow_shift)},
+                    {"guidance",
+                     {
+                         {"txt_cfg", dsp.guidance.txt_cfg},
+                         {"img_cfg", finite_or_null(dsp.guidance.img_cfg)},
+                         {"distilled_guidance",
+                          dsp.guidance.distilled_guidance},
+                         {"slg",
+                          {
+                              {"layers", nlohmann::json::array()},
+                              {"layer_start",
+                               dsp.guidance.slg.layer_start},
+                              {"layer_end", dsp.guidance.slg.layer_end},
+                              {"scale", dsp.guidance.slg.scale},
+                          }},
+                     }},
+                };
+                defaults["hires"] = {
+                    {"enabled", false},
+                    {"upscaler", "Latent"},
+                    {"scale", 2.0},
+                    {"target_width", 0},
+                    {"target_height", 0},
+                    {"steps", 0},
+                    {"denoising_strength", 0.7},
+                    {"upscale_tile_size", 128},
+                };
+                defaults["cache_mode"] = "";
+                defaults["cache_option"] = "";
+                defaults["scm_mask"] = "";
+                defaults["scm_policy_dynamic"] = true;
+                defaults["output_format"] = "png";
+                defaults["output_compression"] = 100;
+
+                nlohmann::json samplers = nlohmann::json::array();
+                for (int i = 0; i < SAMPLE_METHOD_COUNT; i++)
+                    samplers.push_back(
+                        sd_sample_method_name((sample_method_t)i));
+                nlohmann::json schedulers = nlohmann::json::array();
+                for (int i = 0; i < SCHEDULER_COUNT; i++)
+                    schedulers.push_back(sd_scheduler_name((scheduler_t)i));
+
+                nlohmann::json upscalers = nlohmann::json::array();
+                static const char *builtin[] = {
+                    "None", "Lanczos", "Nearest", "Latent",
+                    "Latent (nearest)", "Latent (nearest-exact)",
+                    "Latent (antialiased)", "Latent (bicubic)",
+                    "Latent (bicubic antialiased)",
+                };
+                for (const char *u : builtin)
+                    upscalers.push_back({{"name", u}});
+                std::vector<std::string> dir_up;
+                if (!cfg.sdcpp.upscalers_dir.empty()) {
+                    DIR *dir = opendir(cfg.sdcpp.upscalers_dir.c_str());
+                    if (dir) {
+                        while (struct dirent *de = readdir(dir)) {
+                            const std::string n = de->d_name;
+                            static const char *exts[] = {".gguf",
+                                                         ".safetensors",
+                                                         ".pt", ".pth"};
+                            for (const char *ext : exts) {
+                                size_t el = strlen(ext);
+                                if (n.size() > el &&
+                                    n.compare(n.size() - el, el, ext) == 0) {
+                                    // upstream reports the file's stem
+                                    dir_up.push_back(
+                                        n.substr(0, n.size() - el));
+                                    break;
+                                }
+                            }
+                        }
+                        closedir(dir);
+                    }
+                }
+                std::sort(dir_up.begin(), dir_up.end());
+                for (const auto &u : dir_up)
+                    upscalers.push_back({{"name", u}});
+
+                nlohmann::json out;
+                out["model"] = {{"name", name}, {"stem", stem},
+                                {"path", m.file}};
+                out["current_mode"] = "img_gen";
+                out["supported_modes"] = {"img_gen"};
+                out["defaults"] = defaults;
+                out["defaults_by_mode"] = {{"img_gen", defaults}};
+                out["limits"] = {
+                    {"min_width", 64},
+                    {"max_width", 4096},
+                    {"min_height", 64},
+                    {"max_height", 4096},
+                    {"max_batch_count", 8},
+                    {"max_queue_size", (int)SdcppJobs::MAX_PENDING},
+                };
+                out["samplers"] = samplers;
+                out["schedulers"] = schedulers;
+                out["output_formats"] = {"png"};
+                // features list what this mirror actually exposes; the full sd.cpp server
+                // also serves control images, refs, loras, vae tiling and cache modes
+                out["features"] = {
+                    {"init_image", true},
+                    {"mask_image", false},  // rejected: engine's mask path is broken here
+                    {"control_image", false},
+                    {"ref_images", false},
+                    {"lora", false},
+                    {"vae_tiling", false},
+                    {"hires", true},
+                    {"cache", false},
+                    {"cancel_queued", true},
+                    {"cancel_generating", false},
+                };
+                out["loras"] = nlohmann::json::array();
+                out["upscalers"] = upscalers;
+                res.set_content(
+                    out.dump(-1, ' ', false,
+                             nlohmann::json::error_handler_t::replace),
+                    "application/json");
+            });
+        }
+
         // /v1/status for the serve layer to merge: the child's queue and
         // its resident rows (media models only -- llama rows come from the
         // router child).
@@ -1442,7 +2234,16 @@ int media_main(int argc, char **argv) {
 
     // The main thread is the pump (engine calls only run there, in this
     // APE); pump() returns when a signal asks for shutdown.
-    server.residency.pump();
+    // Test-only knob: run the pump on a dedicated worker thread instead, the shape of
+    // sd-server's async_worker (one non-main thread owns all engine work, including the
+    // first backend load) -- probes how far the APE threading constraint actually reaches.
+    if (const char *w = std::getenv("CHIMERAFILE_MEDIA_PUMP_WORKER");
+        w && w[0] == '1') {
+        std::thread pt([&server] { server.residency.pump(); });
+        pt.join();
+    } else {
+        server.residency.pump();
+    }
     server.shutdown();
     return 0;
 }

@@ -1,0 +1,30 @@
+{
+  "listen": "127.0.0.1:18093",
+  "test_profile": "tiny",
+  "sdcpp": {
+    "model": "sd15",
+    "upscalers_dir": "tests/fixtures/upscalers"
+  },
+  "models": {
+    "tiny": {
+      "engine": "llama",
+      "file": "llamafile/models/TinyLLama-v0.1-5M-F16.gguf",
+      "ctx": 4096,
+      "gpu_layers": 0,
+      "args": ["--chat-template-file", "tests/configs/test-model.jinja"]
+    },
+    "whisper-turbo": {
+      "engine": "whisper",
+      "file": "tests/fixtures/ggml-large-v3-turbo-q5_0.bin"
+    },
+    "sd15": {
+      "engine": "diffusion",
+      "file": "tests/fixtures/stable-diffusion-v1-5-pruned-emaonly-Q4_0.gguf",
+      "gpu_layers": 0
+    },
+    "canary-180m": {
+      "engine": "transcribe",
+      "file": "tests/fixtures/canary-180m-flash-Q4_K_M.gguf"
+    }
+  }
+}

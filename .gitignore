@@ -7,3 +7,7 @@ __pycache__/
 
 # large model fixtures for the media tests (not committed)
 tests/fixtures/*
+# ...except the sdcpp upscaler placeholder (labeled test data, committed because
+# test_capabilities asserts on the capabilities listing)
+!tests/fixtures/upscalers/
+!tests/fixtures/upscalers/*

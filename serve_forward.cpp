@@ -181,8 +181,9 @@ static bool loopback_open(const std::string &method, const std::string &path,
 
     std::string req = method + " " + path + " HTTP/1.1\r\n" +
                       "Host: 127.0.0.1:" + std::to_string(port) + "\r\n" +
-                      "Connection: close\r\n" +
-                      "Content-Type: " + content_type + "\r\n";
+                      "Connection: close\r\n";
+    if (!content_type.empty())
+        req += "Content-Type: " + content_type + "\r\n";
     if (!body.empty())
         req += "Content-Length: " + std::to_string(body.size()) + "\r\n";
     req += "\r\n" + body;
@@ -821,7 +822,8 @@ void MediaForwarder::stop() {
 
 void MediaForwarder::forward(const std::string &path, const std::string &body,
                              const std::string &content_type,
-                             httplib::Response &res) {
+                             httplib::Response &res,
+                             const std::string &model_hint) {
     if (!has_media) {
         send_error(res, 502, "server_error", "media_unavailable",
                    "no media child (the config has no media models)");
@@ -833,6 +835,8 @@ void MediaForwarder::forward(const std::string &path, const std::string &body,
     // of loading two GPU models at once.
     {
         std::string model = extract_model(body, content_type);
+        if (model.empty())
+            model = model_hint;
         if (!model.empty() && model_state(model) != "loaded" &&
             other_child_loading && other_child_loading() &&
             gpu_serialisation_needed()) {
@@ -852,6 +856,31 @@ void MediaForwarder::forward(const std::string &path, const std::string &body,
         if (!respawn_media() ||
             !loopback_open("POST", path, body, media_port.load(), 600, c, err,
                            content_type)) {
+            send_error(res, 502, "server_error", "media_unavailable",
+                       "the media child is not available");
+            return;
+        }
+    }
+    std::string out = c.read_all();
+    res.status = c.status;
+    res.set_content(
+        out,
+        c.content_type.empty() ? "application/json" : c.content_type);
+}
+
+void MediaForwarder::forward_get(const std::string &path,
+                                 httplib::Response &res) {
+    if (!has_media) {
+        send_error(res, 502, "server_error", "media_unavailable",
+                   "no media child (the config has no media models)");
+        return;
+    }
+    UpstreamConn c;
+    std::string err;
+    if (!loopback_open("GET", path, "", media_port.load(), 600, c, err, "")) {
+        if (!respawn_media() ||
+            !loopback_open("GET", path, "", media_port.load(), 600, c, err,
+                           "")) {
             send_error(res, 502, "server_error", "media_unavailable",
                        "the media child is not available");
             return;

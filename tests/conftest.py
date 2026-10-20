@@ -219,6 +219,11 @@ def absolutize(cfg):
     relative paths would break; the tests themselves also want to find
     the model (CHIMERAFILE_TEST_MODEL) without knowing the layout.
     """
+    sdcpp = cfg.get("sdcpp")
+    if isinstance(sdcpp, dict) and sdcpp.get("upscalers_dir"):
+        d = sdcpp["upscalers_dir"]
+        if not os.path.isabs(d):
+            sdcpp["upscalers_dir"] = str(ROOT / d)
     for entry in cfg.get("models", {}).values():
         f = entry.get("file")
         if f and not os.path.isabs(f):

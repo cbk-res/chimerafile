@@ -106,6 +106,32 @@ bool parse_config(const char *path, Config &cfg, std::string &err) {
         cfg.max_loaded = j["max_loaded_models"].get<int>();
     }
 
+    if (j.contains("sdcpp")) {
+        if (!j["sdcpp"].is_object()) {
+            err = "'sdcpp' must be an object";
+            return false;
+        }
+        const nlohmann::json &s = j["sdcpp"];
+        cfg.sdcpp.enabled = true;
+        if (s.contains("model")) {
+            if (!s["model"].is_string() || s["model"].get<std::string>().empty()) {
+                err = "sdcpp.model must be a non-empty string";
+                return false;
+            }
+            cfg.sdcpp.model = s["model"].get<std::string>();
+        }
+        if (s.contains("upscalers_dir")) {
+            if (!s["upscalers_dir"].is_string()) {
+                err = "sdcpp.upscalers_dir must be a string";
+                return false;
+            }
+            cfg.sdcpp.upscalers_dir = s["upscalers_dir"].get<std::string>();
+            if (!cfg.sdcpp.upscalers_dir.empty() &&
+                cfg.sdcpp.upscalers_dir[0] != '/')
+                cfg.sdcpp.upscalers_dir = dir + cfg.sdcpp.upscalers_dir;
+        }
+    }
+
     if (!j.contains("models") || !j["models"].is_object() || j["models"].empty()) {
         err = "config must contain a non-empty 'models' object";
         return false;
@@ -249,6 +275,22 @@ bool parse_config(const char *path, Config &cfg, std::string &err) {
             err = "max_loaded_models (" + std::to_string(cfg.max_loaded) +
                   ") is below the number of pinned llama models (" +
                   std::to_string(pinned) + ")";
+            return false;
+        }
+    }
+
+    // The sdcpp surface serves one configured diffusion model; default it to the first diffusion entry so a bare "sdcpp": {} config works.
+    if (cfg.sdcpp.enabled) {
+        if (cfg.sdcpp.model.empty()) {
+            for (const auto &m : cfg.models)
+                if (!m.is_alias() && m.engine == EngineKind::Diffusion) {
+                    cfg.sdcpp.model = m.id;
+                    break;
+                }
+        }
+        const ModelEntry *m = cfg.find(cfg.sdcpp.model);
+        if (!m || m->is_alias() || m->engine != EngineKind::Diffusion) {
+            err = "sdcpp.model must name a diffusion model";
             return false;
         }
     }
