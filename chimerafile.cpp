@@ -12,7 +12,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <dlfcn.h>
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 
 #include "llamafile/llamafile.h"
 
@@ -103,6 +107,22 @@ extern int transcribefile_main(int argc, char **argv);
 #endif
 extern int serve_main(int argc, char **argv);
 
+// The GPU backend this process resolved in main(); the serve layer hands it
+// to the router child via LLAMAFILE_GPU.  nullptr = auto-detect, which the
+// serve layer expresses by leaving the variable unset (the child then
+// auto-detects too).
+extern "C" const char *chimerafile_gpu_mode(void) {
+    switch (FLAG_gpu) {
+        case LLAMAFILE_GPU_DISABLE: return "off";
+        case LLAMAFILE_GPU_AUTO:    return nullptr;
+        case LLAMAFILE_GPU_AMD:     return "amd";
+        case LLAMAFILE_GPU_APPLE:   return "apple";
+        case LLAMAFILE_GPU_NVIDIA:  return "nvidia";
+        case LLAMAFILE_GPU_VULKAN:  return "vulkan";
+        default:                    return nullptr;
+    }
+}
+
 // ── Usage ──────────────────────────────────────────────────────────────────
 
 static void print_usage(FILE *f, const char *prog) {
@@ -159,6 +179,14 @@ static void isolate_host_glibc_heap(void) {
 // ── Entry point ────────────────────────────────────────────────────────────
 
 int main(int argc, char **argv) {
+    // If our parent dies (a SIGKILL of the serve process, pytest going
+    // away, ...), the kernel signals this process instead of orphaning it;
+    // every generation of the APE process tree (serve -> router child ->
+    // model children) gets this from this one line.
+#if defined(__linux__)
+    prctl(PR_SET_PDEATHSIG, SIGTERM);
+#endif
+
     if (llamafile_has(argv, "--version")) {
         printf("chimerafile v" CHIMERAFILE_VERSION_STRING "\n");
         return 0;
