@@ -184,10 +184,14 @@ private:
 
     std::mutex mu;              // media_pid/port and respawn bookkeeping
     std::atomic<bool> running{false};
+    // Status sweeper interval in seconds (default 5); CHIMERAFILE_MEDIA_SWEEP_S
+    // shortens it -- the lease tests run with a 1 s sweep so they can observe
+    // the gate inside the model's load window.
+    int sweep_s = 5;
 
     // Last /v1/status resident rows, published by the status sweeper and
     // read by the lease gate (model_state) and the llama side
-    // (any_loading).  Stale by up to one sweep interval (~5 s).
+    // (any_loading).  Stale by up to one sweep interval (~5 s by default).
     mutable std::mutex status_mu;
     nlohmann::json resident_cache;
     std::thread sweeper;
@@ -200,9 +204,9 @@ private:
     bool wait_healthy(long timeout_s);
     bool respawn_media();
 
-    // The status sweeper: every ~5 s pull the child's /v1/status and keep
-    // its resident rows for the lease gate.  A failed pull (child down)
-    // leaves the last known rows in place.
+    // The status sweeper: every sweep_s (default 5) seconds pull the
+    // child's /v1/status and keep its resident rows for the lease gate.  A
+    // failed pull (child down) leaves the last known rows in place.
     void sweep_loop();
     nlohmann::json cached_resident() const;
     // The last known state of one media model ("unloaded" when unknown):

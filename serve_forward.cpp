@@ -695,6 +695,12 @@ bool MediaForwarder::init(const std::string &ape, const std::string &config,
         return true;
     ape_path = ape;
     config_path = config;
+    const char *sweep_env = getenv("CHIMERAFILE_MEDIA_SWEEP_S");
+    if (sweep_env) {
+        int v = atoi(sweep_env);
+        if (v >= 1 && v <= 3600)
+            sweep_s = v;
+    }
     // The same <pid> work dir the router child uses (created by whoever
     // gets here first; both tolerate EEXIST).
     work_dir = "/tmp/chimerafile-serve-" + std::to_string((long)getpid());
@@ -877,7 +883,7 @@ nlohmann::json MediaForwarder::status() const {
 
 void MediaForwarder::sweep_loop() {
     while (running) {
-        for (int i = 0; i < 10 && running; i++)
+        for (int i = 0; i < sweep_s * 2 && running; i++)
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
         if (!running)
             break;
