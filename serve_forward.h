@@ -28,6 +28,13 @@ struct Forwarder {
     // /metrics counters fed from forwarded chat traffic.
     std::function<void(const nlohmann::json &usage, const nlohmann::json &timings)> record_chat;
 
+    // Set by Server before the first request: reports whether the media
+    // child has a model in "loading" state.  The llama side asks it in
+    // ensure_capacity (the GPU lease): while the media child is loading a
+    // model and a GPU is in play, a llama model load is deferred.  An
+    // unset callback never defers.
+    std::function<bool()> other_child_loading;
+
     explicit Forwarder(const Config &c) : cfg(c) {}
 
     bool active() const { return has_llama && running.load(); }
@@ -56,6 +63,10 @@ struct Forwarder {
     // /v1/status rows for the llama models (the media rows come from
     // Residency).
     nlohmann::json resident_json() const;
+
+    // True while any llama model is loading (from the sweeper's snapshot):
+    // the media side's lease gate asks this.
+    bool any_loading() const;
 
 private:
     const Config &cfg;
@@ -116,9 +127,20 @@ private:
 // validation).  Mirrors the llama forwarder; the shared spawn machinery
 // lives in serve_forward.cpp.
 struct MediaForwarder {
+    // Set by Server before the first request: reports whether the router
+    // (llama) child has a model in "loading" state.  The media side asks it
+    // in forward/preload (the GPU lease, the mirror of
+    // Forwarder::ensure_capacity): while the llama child is loading a model
+    // and a GPU is in play, a media model load is deferred.
+    std::function<bool()> other_child_loading;
+
     explicit MediaForwarder(const Config &c) : cfg(c) {}
 
     bool active() const { return has_media && running.load(); }
+
+    // True while any media model is loading (from the status sweeper's
+    // snapshot): the llama side's lease gate asks this.
+    bool any_loading() const;
 
     // No-op (and success) when the config has no media models.  `ape` is
     // argv[0] of the serve process; `config` the config file path the
@@ -163,10 +185,26 @@ private:
     std::mutex mu;              // media_pid/port and respawn bookkeeping
     std::atomic<bool> running{false};
 
+    // Last /v1/status resident rows, published by the status sweeper and
+    // read by the lease gate (model_state) and the llama side
+    // (any_loading).  Stale by up to one sweep interval (~5 s).
+    mutable std::mutex status_mu;
+    nlohmann::json resident_cache;
+    std::thread sweeper;
+
     bool spawn_media(std::string &err);
     bool media_healthy() const;
     bool wait_healthy(long timeout_s);
     bool respawn_media();
+
+    // The status sweeper: every ~5 s pull the child's /v1/status and keep
+    // its resident rows for the lease gate.  A failed pull (child down)
+    // leaves the last known rows in place.
+    void sweep_loop();
+    nlohmann::json cached_resident() const;
+    // The last known state of one media model ("unloaded" when unknown):
+    // the lease gate defers a request whose model is not loaded.
+    std::string model_state(const std::string &id) const;
 };
 
 } // namespace serve

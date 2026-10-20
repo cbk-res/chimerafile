@@ -253,6 +253,41 @@ static nlohmann::json try_parse(const std::string &body) {
     }
 }
 
+// True when the serve process resolved a GPU (or left it to auto-detect,
+// which on a GPU box means a GPU): model loads must then be serialised
+// across the two children so two of them never load at once.  "off" is the
+// only mode that is definitely GPU-free.
+static bool gpu_serialisation_needed() {
+    const char *gpu = chimerafile_gpu_mode();
+    return !(gpu != nullptr && std::strcmp(gpu, "off") == 0);
+}
+
+// The "model" field of one request body: the top-level "model" of a JSON
+// body, or the value of the model part of a multipart form (scanned, since
+// the serve side rebuilt the form and hands the forwarder only the bytes).
+// Empty when absent.
+static std::string extract_model(const std::string &body,
+                                 const std::string &content_type) {
+    if (to_lower(content_type).find("application/json") != std::string::npos) {
+        nlohmann::json j = try_parse(body);
+        if (j.is_object() && j.contains("model") && j["model"].is_string())
+            return j["model"].get<std::string>();
+        return std::string();
+    }
+    const std::string marker = "name=\"model\"";
+    size_t pos = body.find(marker);
+    if (pos == std::string::npos)
+        return std::string();
+    size_t start = body.find("\r\n\r\n", pos);  // end of the part's headers
+    if (start == std::string::npos)
+        return std::string();
+    start += 4;
+    size_t end = body.find("\r\n", start);  // the field is a single line
+    if (end == std::string::npos)
+        return std::string();
+    return body.substr(start, end - start);
+}
+
 // ── Response shaping ─────────────────────────────────────────────────────
 
 static void send_error(httplib::Response &res, int status, const char *type,
@@ -744,6 +779,7 @@ bool MediaForwarder::start(std::string &err) {
         return false;
     }
     running = true;
+    sweeper = std::thread([this] { sweep_loop(); });
     return true;
 }
 
@@ -751,6 +787,8 @@ void MediaForwarder::stop() {
     if (!has_media)
         return;
     running = false;
+    if (sweeper.joinable())
+        sweeper.join();
     if (media_pid.load() > 0) {
         kill((pid_t)media_pid.load(), SIGTERM);
         int st = 0;
@@ -769,6 +807,22 @@ void MediaForwarder::forward(const std::string &path, const std::string &body,
         send_error(res, 502, "server_error", "media_unavailable",
                    "no media child (the config has no media models)");
         return;
+    }
+    // GPU lease (the mirror of Forwarder::ensure_capacity): the request
+    // would load the model if it is not already resident.  If the router
+    // (llama) child is loading a model and a GPU is in play, defer instead
+    // of loading two GPU models at once.
+    {
+        std::string model = extract_model(body, content_type);
+        if (!model.empty() && model_state(model) != "loaded" &&
+            other_child_loading && other_child_loading() &&
+            gpu_serialisation_needed()) {
+            res.set_header("Retry-After", "5");
+            send_error(res, 503, "server_error", "model_loading",
+                       "the llama child is loading a model; "
+                       "retry in a few seconds");
+            return;
+        }
     }
     UpstreamConn c;
     std::string err;
@@ -808,7 +862,55 @@ nlohmann::json MediaForwarder::status() const {
     return out;
 }
 
+void MediaForwarder::sweep_loop() {
+    while (running) {
+        for (int i = 0; i < 10 && running; i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        if (!running)
+            break;
+        // The lease gate reads the last known rows, so a failed pull (child
+        // down) must not clear them: it would look like everything is
+        // unloaded.
+        nlohmann::json st = status();
+        if (!st.is_object() || !st.contains("resident"))
+            continue;
+        nlohmann::json rows = st.value("resident", nlohmann::json::array());
+        std::lock_guard<std::mutex> lk(status_mu);
+        resident_cache = rows;
+    }
+}
+
+nlohmann::json MediaForwarder::cached_resident() const {
+    std::lock_guard<std::mutex> lk(status_mu);
+    return resident_cache;
+}
+
+std::string MediaForwarder::model_state(const std::string &id) const {
+    auto rows = cached_resident();
+    if (rows.is_array())
+        for (const auto &r : rows)
+            if (r.value("id", std::string()) == id)
+                return r.value("state", std::string("unloaded"));
+    return "unloaded";
+}
+
+bool MediaForwarder::any_loading() const {
+    auto rows = cached_resident();
+    if (rows.is_array())
+        for (const auto &r : rows)
+            if (r.value("state", std::string()) == "loading")
+                return true;
+    return false;
+}
+
 bool MediaForwarder::preload(const ModelEntry &e, std::string &err) {
+    // GPU lease (mirror of forward): defer an explicit load while the
+    // router child is loading a model on the same GPU.
+    if (model_state(e.id) != "loaded" && other_child_loading &&
+        other_child_loading() && gpu_serialisation_needed()) {
+        err = "the llama child is loading a model; retry in a few seconds";
+        return false;
+    }
     UpstreamConn c;
     std::string oerr;
     if (!loopback_open("POST", "/v1/residency/" + e.id, "",
@@ -905,6 +1007,16 @@ nlohmann::json Forwarder::cached_models() const {
     return models_cache;
 }
 
+bool Forwarder::any_loading() const {
+    auto models = cached_models();
+    if (!models.is_object())
+        return false;
+    for (const auto &item : models.items())
+        if (item.value().value("state", std::string()) == "loading")
+            return true;
+    return false;
+}
+
 bool Forwarder::wait_for_state(const std::string &id, const std::string &want,
                                long timeout_s, std::string &err) {
     for (long t = 0; t < timeout_s * 10; t++) {
@@ -951,6 +1063,15 @@ bool Forwarder::ensure_capacity(const ModelEntry &e, std::string &err) {
     const Rec &rec = recs[p->id];
     if (rec.in_use.load() > 0)
         return true;  // a request for this model is already driving a load
+    // GPU lease: this request would start a load (the model is unloaded and
+    // nothing is loading it yet).  If the media child is loading a model and
+    // a GPU is in play, defer instead of loading two GPU models at once.  The
+    // media side has the mirror gate (MediaForwarder::forward/preload).
+    if (other_child_loading && other_child_loading() &&
+        gpu_serialisation_needed()) {
+        err = "the media child is loading a model; retry in a few seconds";
+        return false;
+    }
     // Slots in the snapshot: a model counts while it is loaded OR loading
     // (the router owns the slot either way), plus any unloaded model a live
     // request is driving a load for.  Counting "loading" keeps admission

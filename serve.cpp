@@ -609,6 +609,14 @@ struct Server {
                                        const nlohmann::json &t) {
             metrics.record_forward(u, t);
         };
+        // GPU lease: each side defers its model loads while the other child
+        // is loading one (see Forwarder::ensure_capacity and the
+        // MediaForwarder gates).  With only one kind of model present the
+        // other side never reports a load, so nothing is ever deferred.
+        forwarder.other_child_loading =
+            [this] { return media_forwarder.any_loading(); };
+        media_forwarder.other_child_loading =
+            [this] { return forwarder.any_loading(); };
         start_at = time(nullptr);
         fprintf(stderr, "serve: listening on http://%s:%d\n",
                 cfg.host.c_str(), cfg.port);
