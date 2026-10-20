@@ -45,6 +45,22 @@ on the GPU.
 pytest tests/
 ```
 
+**The full matrix** — the default suite, the media, residency, and
+raw-child suites, in one go (`make test` runs the same thing):
+
+```sh
+scripts/run-test-matrix.sh               # the CPU lane (safe while the
+                                         # live service is up)
+GPU=vulkan scripts/run-test-matrix.sh    # + the GPU lane (full suite with
+                                         # --gpu vulkan; the gpu_exclusive
+                                         # tests skip while the live service
+                                         # holds the GPU)
+```
+
+Each suite spawns its own server on a free port; the script exits
+non-zero when any suite fails.  `PYTEST=/path/to/pytest` overrides the
+interpreter.
+
 **Your own model / quant / backend** is a config file (plus `--gpu` for
 the spawned server):
 

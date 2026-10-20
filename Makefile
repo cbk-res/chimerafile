@@ -105,6 +105,10 @@ all:
 	@echo "==> Building chimerafile (bundling any GPU backends found)..."
 	$(SUBMAKE) o/$(MODE)/chimerafile/chimerafile
 
+.PHONY: test
+test: # The serve-layer test matrix (tests/README.md); GPU=vulkan adds the GPU lane
+	@$(CHIMERAFILE_REPO)/scripts/run-test-matrix.sh
+
 .PHONY: setup
 setup:
 	@echo "==> Initialising llamafile submodule..."
