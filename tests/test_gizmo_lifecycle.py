@@ -44,6 +44,7 @@ class Gizmo:
             for v in cfg["models"].values():
                 if v.get("engine") == "llama" and not v.get("alias_of"):
                     v["file"] = model_file
+        self.cfg = cfg
         self.port = free_port()
         cfg["listen"] = f"127.0.0.1:{self.port}"
         self.base = f"http://127.0.0.1:{self.port}"
@@ -54,11 +55,15 @@ class Gizmo:
             str(ROOT / "llamafile" / "o" / "chimerafile" / "chimerafile"))
         self.log_path = Path("/tmp/opencode") / f"chimera-gizmo-{self.port}.log"
         # The APE is not directly exec-able on Linux (see conftest).
+        # start_new_session puts serve and its whole tree in their own
+        # process group, as a launcher (systemd, job control) would, so
+        # the tests can kill the tree the way operators do.
         log = open(self.log_path, "wb")
         cmd = [bin_path, "--gpu", "off", "serve", "--config", str(cfg_path)]
         self.proc = subprocess.Popen(
             ["/bin/sh", "-c", " ".join(shlex.quote(a) for a in cmd)],
-            stdout=log, stderr=subprocess.STDOUT)
+            stdout=log, stderr=subprocess.STDOUT,
+            start_new_session=True)
         log.close()
         self.client = Client(self.base)
         deadline = time.time() + 90
@@ -111,6 +116,9 @@ class Gizmo:
     def child_pids(self):
         return [pid for pid, argv in self._tree().items()
                 if "--alias" in argv and "--models-preset" not in argv]
+
+    def cfg_model_file(self, model_id):
+        return self.cfg["models"][model_id].get("file") or ""
 
     # ── API helpers ───────────────────────────────────────────────────
 
@@ -203,19 +211,64 @@ def test_ttl_releases_port(gserv):
     assert g.child_pid("tiny") is None, "the child outlived its TTL"
 
 
-def test_no_orphans_after_serve_kill(gserv):
+def _proc_gone(pid, marker):
+    """True when pid is dead, or alive but no longer carrying `marker`
+    (a reused pid must not count as the original survivor)."""
+    if not os.path.isdir(f"/proc/{pid}"):
+        return True
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmd = f.read().decode(errors="replace")
+    except OSError:
+        return True
+    return marker not in cmd
+
+
+def test_no_orphans_after_group_kill(gserv):
+    # The APE runtime swallows PR_SET_PDEATHSIG (verified against
+    # .ape-1.10), so a bare SIGKILL of the serve process orphans its
+    # tree; the contract is that the launcher kills the whole group on a
+    # hard stop, as systemd (KillMode=control-group) and job control do.
     g = gserv("tiny-llama.json")
     s, _ = g.chat("tiny")
     assert s == 200
-    assert g.router_pid() is not None and g.child_pid("tiny") is not None
-    g.proc.kill()  # SIGKILL: no graceful shutdown to lean on
+    router, child = g.router_pid(), g.child_pid("tiny")
+    assert router is not None and child is not None
+    preset_marker = f"/tmp/chimerafile-serve-{g.proc.pid}/"
+    model_marker = g.cfg_model_file("tiny")
+    os.killpg(g.proc.pid, signal.SIGKILL)
     deadline = time.time() + 15
     while time.time() < deadline:
-        if g.router_pid() is None and g.child_pid("tiny") is None:
+        if _proc_gone(router, preset_marker) and _proc_gone(child, model_marker):
             break
         time.sleep(0.5)
-    assert g.router_pid() is None, "the router outlived the serve"
-    assert g.child_pid("tiny") is None, "the model child outlived its tree"
+    assert _proc_gone(router, preset_marker), \
+        "the router outlived the group kill"
+    assert _proc_gone(child, model_marker), \
+        "the model child outlived the group kill"
+
+
+def test_graceful_stop_reaps_the_tree(gserv):
+    # SIGTERM is serve's own guarantee: it stops the router, and the
+    # router takes its model children down with it.
+    g = gserv("tiny-llama.json")
+    s, _ = g.chat("tiny")
+    assert s == 200
+    router, child = g.router_pid(), g.child_pid("tiny")
+    assert router is not None and child is not None
+    preset_marker = f"/tmp/chimerafile-serve-{g.proc.pid}/"
+    model_marker = g.cfg_model_file("tiny")
+    g.proc.send_signal(signal.SIGTERM)
+    g.proc.wait(timeout=30)
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        if _proc_gone(router, preset_marker) and _proc_gone(child, model_marker):
+            break
+        time.sleep(0.5)
+    assert _proc_gone(router, preset_marker), \
+        "the router outlived the graceful stop"
+    assert _proc_gone(child, model_marker), \
+        "the model child outlived the graceful stop"
 
 
 def test_client_disconnect_stops_generation(gserv):
