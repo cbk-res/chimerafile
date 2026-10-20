@@ -58,21 +58,12 @@
 #include <map>
 #include <memory>
 #include <mutex>
-#include <random>
-#include <pthread.h>
 #include <string>
 #include <thread>
 #include <vector>
 #include <chrono>
 #include <sys/socket.h>
 
-// llama.cpp's official client machinery (common params, model init, sampler)
-// comes from common.h/arg.h/sampling.h; it also pulls in llama.h and the json
-// fwd header.
-#include "common.h"
-#include "arg.h"
-#include "sampling.h"
-#include "chat.h"
 #include <nlohmann/json.hpp>
 #include <cpp-httplib/httplib.h>
 #include "serve_common.h"
@@ -406,16 +397,8 @@ void serve_log(const char *fmt, ...) {
     va_end(ap);
 }
 
-static void serve_parse_usage(int, char **) {
-    fprintf(stderr, "  (llama.cpp engine args: see 'chimerafile llama --cli --help')\n");
-}
-
 static std::string phys_key(const ModelEntry &e) {
-    std::string k = std::string(engine_name(e.engine)) + "\x01" + e.file;
-    if (e.engine == EngineKind::Llama)
-        for (const auto &a : e.args)
-            k += "\x01" + a;
-    return k;
+    return std::string(engine_name(e.engine)) + "\x01" + e.file;
 }
 
 struct PhysModel {
@@ -429,18 +412,8 @@ struct PhysModel {
     bool pinned = false;
     int ttl = 0;
 
-    // llama.cpp handles; cparams must outlive the init result
-    common_params cparams;
-    common_init_result_ptr init;
-    common_chat_templates_ptr chat_tmpl;  // llama: the model's chat template
-    // llama: the conversation currently resident in the context's KV cache
-    // (the last chat request's prompt plus its generated tokens).  The
-    // next request that starts with exactly these tokens only decodes its
-    // tail -- clients like opencode resend the whole conversation each
-    // turn.  One conversation per model; a mismatched prefix clears the
-    // cache and prefills from scratch.  Main thread only.
-    std::vector<llama_token> chat_cache;
-    // the other engines' handles
+    // the engines' handles (llama models never reach this struct; they
+    // live in the upstream router child, see serve_forward.h)
     whisper_context * wctx = nullptr;
     sd_ctx_t * sctx = nullptr;
     struct transcribe_model * tmodel = nullptr;
@@ -454,72 +427,6 @@ struct PhysModel {
     std::condition_variable cv;
     std::string last_err;         // last load failure (set on the main thread)
 };
-
-static void load_llama(PhysModel &p, std::string &err) {
-    const ModelEntry &e = *p.entries.front();
-    // A re-load after TTL eviction starts from fresh defaults: the parser
-    // asserts on stale values a previous load of this handle left behind.
-    p.cparams = common_params();
-    // --chat-template / --chat-template-file are not in the common example
-    // set (the parse below rejects them), and serve owns template
-    // construction, so they are pulled out of the engine args here.
-    std::string chat_template;
-    std::vector<std::string> engine_args;
-    for (size_t i = 0; i < e.args.size(); i++) {
-        if ((e.args[i] == "--chat-template" || e.args[i] == "--chat-template-file") &&
-            i + 1 < e.args.size()) {
-            if (e.args[i] == "--chat-template") {
-                chat_template = e.args[i + 1];
-            } else {
-                std::ifstream tf(e.args[i + 1]);
-                if (!tf) {
-                    err = "llama: cannot open chat template file '" + e.args[i + 1] +
-                          "' for model '" + e.id + "'";
-                    return;
-                }
-                chat_template.assign(std::istreambuf_iterator<char>(tf),
-                                     std::istreambuf_iterator<char>());
-            }
-            i++;
-        } else {
-            engine_args.push_back(e.args[i]);
-        }
-    }
-    std::vector<std::string> strs = {"chimerafile serve", "-m", e.file};
-    for (const auto &a : engine_args)
-        strs.push_back(a);
-    std::vector<char *> argv;
-    for (auto &s : strs)
-        argv.push_back(s.data());
-    argv.push_back(nullptr);
-
-    // The engine's own CLI parser fills the params, so the config 'args'
-    // are genuine llama.cpp options (--temp, --ctk, --ctv, ...).  Parsed
-    // with the common example: exactly the options common_init and the
-    // sampler consume here; server-tool-only options (like --cache-prompt,
-    // whose matching logic lives in llama-server's slot code) are rejected
-    // rather than silently ignored.
-    if (!common_params_parse((int)argv.size() - 1, argv.data(), p.cparams,
-                             LLAMA_EXAMPLE_COMMON, serve_parse_usage)) {
-        err = "llama: invalid engine args for model '" + e.id + "'";
-        return;
-    }
-    // For what serve owns, the config is authoritative.
-    if (e.ctx_set)
-        p.cparams.n_ctx = e.ctx;
-    if (e.gpu_set)
-        p.cparams.n_gpu_layers = e.gpu_layers;
-
-    p.init = common_init_from_params(p.cparams, false);
-    if (!p.init) {
-        err = "llama: failed to load '" + e.file + "' (out of memory?)";
-        return;
-    }
-    // An empty override keeps the model's own GGUF template (falling back
-    // to built-in ChatML when the GGUF has none).
-    p.chat_tmpl = common_chat_templates_init(p.init->model(), chat_template);
-    p.chat_cache.clear();  // fresh context, empty cache
-}
 
 static void load_whisper(PhysModel &p, std::string &err) {
     p.wctx = whisper_init_from_file(p.file.c_str());
@@ -574,19 +481,14 @@ static void load_transcribe(PhysModel &p, std::string &err) {
 
 static void load_engine(PhysModel &p, std::string &err) {
     switch (p.engine) {
-        case EngineKind::Llama:      load_llama(p, err);      break;
         case EngineKind::Whisper:    load_whisper(p, err);    break;
         case EngineKind::Diffusion:  load_diffusion(p, err);  break;
         case EngineKind::Transcribe: load_transcribe(p, err); break;
+        default: err = "llama models never load in-process"; break;
     }
 }
 
 static void unload_engine(PhysModel &p) {
-    // the chat template may reference the model; drop it first
-    p.chat_tmpl.reset();
-    p.chat_cache.clear();
-    if (p.init)
-        p.init.reset();
     if (p.wctx) { whisper_free(p.wctx); p.wctx = nullptr; }
     if (p.sctx) { free_sd_ctx(p.sctx); p.sctx = nullptr; }
     if (p.tsess) { transcribe_session_free(p.tsess); p.tsess = nullptr; }
