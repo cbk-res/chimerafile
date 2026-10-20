@@ -77,6 +77,12 @@ struct Config {
 // "serve: " prefixed stderr logging, shared with serve_forward.cpp.
 void serve_log(const char *fmt, ...);
 
+// Parse the declarative server config (JSON) at `path` into `cfg`
+// (serve_config.cpp).  Relative model files resolve against the config
+// file's directory and must exist; alias chains and pin-vs-capacity are
+// validated here.  Shared by the serve layer and the media child.
+bool parse_config(const char *path, Config &cfg, std::string &err);
+
 inline std::string to_lower(std::string s) {
     for (char &c : s) c = (char)tolower((unsigned char)c);
     return s;
