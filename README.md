@@ -113,7 +113,7 @@ All four engines behind one port, driven by a declarative config file:
 - `ctx`, `gpu_layers` — llama only (defaults 4096, `-1` = all layers on GPU).
 - `ttl` — seconds to stay in RAM when idle. Omitted = engine default (30 min llama, 5 min everything else); `0` = never.
 - `pin` — never unload, never evict.
-- `args` — CLI flags passed through verbatim, **llama only**: they go through llama.cpp's own CLI parser (`--temp`, `--ctk`, `--no-mmap`, `--flash-attn on`, `--cache-type-k q8_0`, ...). Server-tool-only flags (like `--cache-prompt`, whose matching logic lives in llama-server's slot code) are rejected rather than silently ignored. The other engines have no flag passthrough; their behaviour is steered by the request fields instead.
+- `args` — CLI flags passed through verbatim, **llama only**: they land in the model child's own `llama-server` command line (`--temp`, `--ctk`, `--no-mmap`, `--flash-attn on`, `--cache-type-k q8_0`, ...), so the full llama-server option set is available, including server-tool-only flags like `--cache-prompt`. The other engines have no flag passthrough; their behaviour is steered by the request fields instead.
 
 ### Endpoints
 
@@ -134,15 +134,16 @@ All four engines behind one port, driven by a declarative config file:
 
 `GET /metrics` returns a Prometheus text-format document, like llama-server's: request counters per surface (`chimerafile_chat_requests_total`, `chimerafile_transcribe_requests_total`, `chimerafile_image_requests_total`), prompt and generation token totals, prompt-processing and generation seconds, the `chimerafile_tokens_per_second` average derived from them, uptime, and per-model residency gauges (`chimerafile_model_state`, `chimerafile_model_in_use`).
 
-Chat completions also carry a per-request `timings` object — `prompt_processing_s`, `generation_s`, `total_s`, and `tokens_per_second` when anything was generated — as a top-level field of the JSON response and in the final SSE chunk of a stream; clients that do not look for it ignore it.
+Chat completions carry the model child's own per-request `timings` object (the upstream llama-server shape — `prompt_ms`, `predicted_ms`, `per_second`, ...) as a top-level field of the JSON response and in the final SSE chunk of a stream; clients that do not look for it ignore it.
 
 ### How it runs
 
-- Models load on first use and stay in RAM for `ttl` seconds of idleness. Execution is serial — one engine job at a time, and all engine work (loads, inference, unloads) runs on the process' main thread: in this APE only the thread that dlopen'd the host engine libraries has a working host-glibc TLS state. So the first request for a model waits for its load, and concurrent requests queue behind it. Interactive work (chat, transcription) takes a fast lane ahead of queued image generations.
-- Chat requests continue the previous conversation: the context's KV cache is kept between requests, so a new prompt that starts with exactly the cached conversation (clients like opencode resend the whole conversation each turn) only prefills the new tail; a mismatched prefix clears the cache and prefills from scratch. One conversation per model entry — different clients on the same model evict each other's cache.
+- Llama models run behind an upstream router child: serve spawns one `llama-server` router per port (a generated `--models-preset` names the fleet) and forwards the llama API to it. The router owns model spawning, loading, queueing and crash respawns; serve keeps the front half — admission against `max_loaded_models`, TTL eviction, pins, and the status merge. The first request for a model waits for its load, and concurrent requests for a full fleet get a retryable 503.
+- Media engines (whisper, diffusion, transcribe) still run in-process: their work (loads, inference, unloads) is posted to the process' main thread, because in this APE only the thread that dlopen'd the host engine libraries has a working host-glibc TLS state. So the first request for a model waits for its load, and concurrent media jobs queue behind it; interactive work (transcription) takes a fast lane ahead of queued image generations.
+- KV retention is the child's own: it keeps prompt tokens in its KV cache between requests (unified cache, matched by content), so a prompt that repeats a previous prefix only prefills the new tail (clients like opencode resend the whole conversation each turn); the cache never clears on its own, and each model has its own child and its own cache.
 - Diffusion models get a fresh engine context per request: the pinned stable-diffusion.cpp cannot run a second generation on the same context, so each image request pays a few seconds of model load.
 - Streaming caveat: `stop` strings are checked by llama.cpp at token boundaries, so a stream can overshoot a stop string by the rest of the token the match landed inside.
-- Tool calling rides the model's own chat template machinery: the template renders the tool schemas into the prompt and carries a PEG parser for its tool-call markup, so replies come back as structured `tool_calls` (in non-streaming responses and as streaming deltas alike) and the raw markup never leaks into `content`. A tool call whose arguments arrive incomplete (the model cut the call off) is dropped rather than forwarded. If the model's output leaves the template's format entirely, the server reports a 500 instead of sending unparsed markup as content.
+- Tool calling is the child's: the template renders the tool schemas into the prompt and carries a PEG parser for its tool-call markup, so replies come back as structured `tool_calls` (in non-streaming responses and as streaming deltas alike) and the raw markup never leaks into `content`. The serve side only validates the request shape before forwarding (`tools` must be an array, `tool_choice` a string or an object of type `none`/`function`).
 - A prompt that does not fit the model's context — alone, or together with `max_tokens` — is a client error: 400 `context_length_exceeded` before the reply starts. In streaming mode the 400 arrives before the first chunk, not mid-stream.
 - `temperature` and `prompt` on `/v1/audio/transcriptions` are whisper-only: whisper.cpp has both, transcribe.cpp has neither, and the server passes down only what the engine supports.
 - Image generation takes the OpenAI fields `prompt`, `size` (`WxH`), `n` (1–4), `seed`, `response_format` (`b64_json` default | `url`, returned as a `data:` URL) plus the chimerafile extensions `negative_prompt`, `steps` and `cfg_scale` — all optional.
@@ -258,11 +259,15 @@ it out of the shared brk region. Nothing to do — it's built in.
 chimerafile/                    ← this repo (chimerafile layer only)
 ├── chimerafile.cpp             ← dispatcher (owns main())
 ├── llama_dispatch.cpp          ← llamafile mode dispatch
+├── serve.cpp                   ← serve layer: OpenAI surface, media residency
+├── serve_common.h              ← shared serve types (config, model entries)
+├── serve_forward.{h,cpp}       ← the router-child forwarder (the llama path)
 ├── BUILD.mk                    ← build rules (injected into llamafile's make)
 ├── Makefile                    ← thin wrapper, delegates to llamafile/Makefile
-├── ci-patches/                 ← builder patches (Pascal sm_61; ROCm TinyBLAS)
+├── ci-patches/                 ← builder patches (Pascal sm_61; ROCm TinyBLAS; router child spawn)
+├── setup-baseline/             ← content hashes of the patched submodule trees
 ├── .github/workflows/build.yml ← CI: 6 variant builds
-└── llamafile/                  ← git submodule (stock, unmodified, v0.10.6)
+└── llamafile/                  ← git submodule (pinned v0.10.6, patched in place by make setup)
     ├── llamafile/              ← LLM TUI + server
     ├── whisperfile/            ← speech-to-text CLI wrapper
     ├── diffusionfile/          ← image generation CLI wrapper
@@ -362,6 +367,7 @@ However, this has not yet been tested within chimerafile itself.
 - **v0.2.99** — diffusion Vulkan save-crash fix (host glibc heap routed via mmap); transcribe ported onto the shared GGML — all four engines GPU-capable from one backend
 - **v0.3** — aligned with llamafile v0.10.6: upstream diffusionfile pattern, transcribe engine, CI builds the pinned submodule
 - **v0.4** — `chimerafile serve`: OpenAI-compatible server over all four engines (declarative config, TTL residency, serial execution)
+- **v0.5** — llama path moved behind an upstream router child (one router per serve, front-side admission, TTL/pins kept); media engines still in-process
 
 ## License
 

@@ -11,9 +11,10 @@ against the pinned submodule; this suite deliberately does not re-test it.
 | File | What it checks |
 | --- | --- |
 | `test_compat.py` | The OpenAI surface against whatever model the config points at: chat, streaming, `max_tokens`, thinking split, tools (auto + forced `required`), the error matrix, overflow-with-tools (the load-crash regression), Bearer auth. Doubles as the model/backend acceptance check. |
-| `test_kv_retention.py` | Per-model KV cache via `timings.prompt_processing_s`: identical prompt decodes nothing, shared prefix decodes only the tail, divergent prefix colds the cache. |
-| `test_queueing.py` | The pump's serialisation under load: concurrent chats all succeed, `/health` stays responsive in flight, stream + non-stream interleave, recovery after a burst. |
+| `test_kv_retention.py` | Per-model KV cache via the child's `timings.prompt_ms`: identical prompt decodes nothing, shared prefix decodes only the tail, divergent prefix pays a full prefill. Every test uses sentences no other test uses (the child's KV cache is content-addressed and never clears). |
+| `test_queueing.py` | Load: concurrent chats all succeed, `/health` stays responsive in flight, stream + non-stream interleave, recovery after a burst. |
 | `test_residency.py` | Multi-model: both models load and serve, per-model caches survive interleaving, TTL unload + on-demand reload (via `GET /v1/status`). |
+| `test_gizmo_lifecycle.py` | The process tree, on a fresh port per test: spawn failure, crash self-heal, TTL release, orphans after a group kill and after a graceful stop, disconnect cancellation, alias routing, load coalescing, capacity eviction, pinned-fleet 503. |
 | `test_media_audio.py` | The Whisper engine via `/v1/audio/transcriptions`: a real transcription of an espeak-ng–synthesised clip, the `json` / `verbose_json` / `text` formats, and the error matrix. |
 | `test_media_images.py` | The diffusion engine via `/v1/images/generations` + `/v1/images/edits`: small CPU-friendly generations (256×256, 8 steps) return a valid PNG of the requested size, plus the error matrix. |
 | `test_child_kv.py` | The KV retention scenarios again, but against a raw `llama --server` child with no serve layer in between, asserting on upstream's exact `timings.cache_n` counter — the check that warm continuation is inherited from upstream. |
@@ -62,9 +63,9 @@ pytest tests/test_residency.py --serve-config tests/configs/two-models.json
 (A GPU two-model config still needs the GPU to itself; while the live
 service is listening, residency skips itself and says so.)
 
-`two-models.json` loads the same model file twice, so its entries differ
-in `args` (and `ctx`): the server keys a physical model by file + args,
-and a distinct args list is what forces two physical loads.
+`two-models.json` loads the same model file twice: the router gives each
+model id its own child, so one file can back several ids with different
+`args` and `ctx` — each id is its own model, with its own KV cache.
 
 **Media** uses the tiny-media config (tiny llama + whisper + diffusion):
 
