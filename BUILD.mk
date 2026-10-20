@@ -111,6 +111,11 @@ o/$(MODE)/chimerafile/serve_forward.o: $(CHIMERAFILE_DIR)/serve_forward.cpp \
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $(CHIMERAFILE_CPPFLAGS) -c -o $@ $<
 
+o/$(MODE)/chimerafile/serve_media.o: $(CHIMERAFILE_DIR)/serve_media.cpp \
+	$(CHIMERAFILE_DIR)/serve_common.h $(CHIMERAFILE_DIR)/serve_media.h
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) $(CHIMERAFILE_CPPFLAGS) -c -o $@ $<
+
 # check_cpu.c is not in LLAMAFILE_SRCS_C (the standalone packages pull it in
 # via the pattern rule below), so we build it explicitly.
 CHIMERAFILE_CHECK_CPU_OBJ = o/$(MODE)/llamafile/check_cpu.o
@@ -323,6 +328,7 @@ CHIMERAFILE_OWN_OBJS := \
 	o/$(MODE)/chimerafile/serve_config.o \
 	o/$(MODE)/chimerafile/serve.o \
 	o/$(MODE)/chimerafile/serve_forward.o \
+	o/$(MODE)/chimerafile/serve_media.o \
 	$(CHIMERAFILE_CHECK_CPU_OBJ) \
 	$(CHIMERAFILE_WHISPER_OBJS)
 
