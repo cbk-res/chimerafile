@@ -1,6 +1,7 @@
 {
   "listen": "127.0.0.1:18093",
   "test_profile": "tiny",
+  "max_loaded_models": 2,
   "models": {
     "tiny-a": {
       "engine": "llama",

@@ -84,8 +84,8 @@ def test_interleaved_requests_keep_separate_caches(server):
     s, r = c.chat(p_a)
     assert s == 200
     t = r["timings"]["prompt_ms"]
-    assert t < 0.05, \
-        f"{a}'s cache did not survive the interleave: {t:.4f}s"
+    assert t < 50, \
+        f"{a}'s cache did not survive the interleave: {t:.1f}ms"
 
 
 def test_ttl_unload_and_reload(server):
