@@ -179,10 +179,13 @@ static void isolate_host_glibc_heap(void) {
 // ── Entry point ────────────────────────────────────────────────────────────
 
 int main(int argc, char **argv) {
-    // If our parent dies (a SIGKILL of the serve process, pytest going
-    // away, ...), the kernel signals this process instead of orphaning it;
-    // every generation of the APE process tree (serve -> router child ->
-    // model children) gets this from this one line.
+    // Best effort: when our parent dies, get signalled instead of
+    // orphaned.  The current APE runtime (.ape-1.10) swallows the prctl,
+    // so on the APE this does not fire -- the guarantees that actually
+    // hold there are serve's graceful stop (it reaps router and model
+    // children) and the launcher killing the whole process group on a
+    // hard stop (systemd KillMode=control-group, job control).  Native
+    // builds honour it for every tree generation.
 #if defined(__linux__)
     prctl(PR_SET_PDEATHSIG, SIGTERM);
 #endif
