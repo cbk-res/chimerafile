@@ -7,6 +7,7 @@
 #include <cpp-httplib/httplib.h>
 
 #include <algorithm>
+#include <csignal>
 #include <cerrno>
 #include <cstdarg>
 #include <cstdio>
@@ -16,6 +17,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <arpa/inet.h>
 #include <chrono>
 #include <fstream>
@@ -548,10 +550,19 @@ static bool spawn_child(std::vector<std::string> &args,
         argv.push_back(&s[0]);
     argv.push_back(nullptr);
 
+    // A respawn runs on an httplib worker thread, and the vendored fork
+    // blocks every signal on those threads (an EINTR workaround) -- and
+    // posix_spawn inherits the caller's signal mask.  A child that can
+    // never receive SIGTERM ignores serve's graceful stop and orphans.
+    // Spawn with a clean mask, then restore the caller's.
+    sigset_t old_mask, clean_mask;
+    sigemptyset(&clean_mask);
+    pthread_sigmask(SIG_SETMASK, &clean_mask, &old_mask);
     posix_spawnattr_t attr;
     posix_spawnattr_init(&attr);
     int rc = posix_spawn(&pid, args[0].c_str(), &fa, &attr, argv.data(),
                          envp.data());
+    pthread_sigmask(SIG_SETMASK, &old_mask, nullptr);
     posix_spawnattr_destroy(&attr);
     posix_spawn_file_actions_destroy(&fa);
     if (rc != 0) {
@@ -615,7 +626,8 @@ bool Forwarder::respawn_router() {
     if (router_pid.load() > 0) {
         int st = 0;
         bool alive = kill((pid_t)router_pid.load(), 0) == 0;
-        waitpid((pid_t)router_pid.load(), &st, WNOHANG);  // reap if dead
+        if (alive && waitpid((pid_t)router_pid.load(), &st, WNOHANG) > 0)
+            alive = false;  // was a zombie; reaped now, spawn a replacement
         if (alive)
             return router_healthy();  // up but maybe wedged: report as-is
     }
@@ -746,7 +758,8 @@ bool MediaForwarder::respawn_media() {
     if (media_pid.load() > 0) {
         int st = 0;
         bool alive = kill((pid_t)media_pid.load(), 0) == 0;
-        waitpid((pid_t)media_pid.load(), &st, WNOHANG);  // reap if dead
+        if (alive && waitpid((pid_t)media_pid.load(), &st, WNOHANG) > 0)
+            alive = false;  // was a zombie; reaped now, spawn a replacement
         if (alive)
             return media_healthy();  // up but maybe wedged: report as-is
     }

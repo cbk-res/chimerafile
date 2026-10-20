@@ -459,6 +459,15 @@ def test_media_crash_self_heal(gserv, speech_wav):
     assert s == 200, f"the media child must respawn and serve: {str(r)[:160]}"
     new = g.media_pid()
     assert new is not None and new != old, "the media child was not respawned"
+    # The respawn happened on a request thread; the child must still die
+    # with serve on a graceful stop (spawn with a clean signal mask).
+    g.proc.send_signal(signal.SIGTERM)
+    g.proc.wait(timeout=30)
+    deadline = time.time() + 15
+    while time.time() < deadline and not _proc_gone(new, str(g.cfg_path)):
+        time.sleep(0.5)
+    assert _proc_gone(new, str(g.cfg_path)), \
+        "the respawned media child outlived the graceful stop"
 
 
 def test_media_ttl_unloads_and_reloads(gserv, speech_wav):
