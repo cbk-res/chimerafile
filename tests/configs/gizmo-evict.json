@@ -1,0 +1,23 @@
+{
+  "listen": "127.0.0.1:18122",
+  "test_profile": "tiny",
+  "max_loaded_models": 1,
+  "models": {
+    "tiny-a": {
+      "engine": "llama",
+      "file": "llamafile/models/TinyLLama-v0.1-5M-F16.gguf",
+      "ctx": 4096,
+      "gpu_layers": 0,
+      "ttl": 600,
+      "args": ["--chat-template-file", "tests/configs/test-model.jinja"]
+    },
+    "tiny-b": {
+      "engine": "llama",
+      "file": "llamafile/models/TinyLLama-v0.1-5M-F16.gguf",
+      "ctx": 4096,
+      "gpu_layers": 0,
+      "ttl": 600,
+      "args": ["--chat-template-file", "tests/configs/test-model.jinja"]
+    }
+  }
+}

@@ -92,8 +92,9 @@ def test_chat_nonstreaming(server):
     assert usage["completion_tokens"] > 0
     assert usage["total_tokens"] == \
         usage["prompt_tokens"] + usage["completion_tokens"]
-    assert r["timings"]["prompt_processing_s"] >= 0
-    assert r["timings"]["generation_s"] >= 0
+    # timings are the child's own (upstream llama-server) shape
+    assert r["timings"]["prompt_ms"] >= 0
+    assert r["timings"]["predicted_ms"] >= 0
 
 
 def test_max_tokens_is_respected(server):

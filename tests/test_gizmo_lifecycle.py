@@ -1,0 +1,355 @@
+"""Router-child lifecycle tests (the "gizmo" layer).
+
+The session-scoped `server` fixture covers the request surface; these
+tests drive the process tree itself: spawn failure, crash self-heal,
+TTL release, orphan cleanup after a SIGKILL'd serve, generation
+cancellation on client disconnect, alias routing, load coalescing, and
+capacity eviction.  Each test spawns its own serve on a fresh port and
+inspects the process table via /proc, scoped to the spawned tree so the
+live service is never touched.
+"""
+
+import json
+import os
+import shlex
+import signal
+import socket
+import subprocess
+import threading
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+import pytest
+
+from conftest import Client, ROOT, absolutize, health_ok
+
+
+def free_port():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+class Gizmo:
+    """A per-test serve process with direct access to its children."""
+
+    def __init__(self, cfg_name, model_file=None):
+        cfg = json.loads((ROOT / "tests" / "configs" / cfg_name).read_text())
+        absolutize(cfg)
+        if model_file:
+            for v in cfg["models"].values():
+                if v.get("engine") == "llama" and not v.get("alias_of"):
+                    v["file"] = model_file
+        self.port = free_port()
+        cfg["listen"] = f"127.0.0.1:{self.port}"
+        self.base = f"http://127.0.0.1:{self.port}"
+        cfg_path = Path("/tmp/opencode") / f"chimera-gizmo-{self.port}-cfg.json"
+        cfg_path.write_text(json.dumps(cfg, indent=2))
+        bin_path = os.environ.get(
+            "CHIMERAFILE_BIN",
+            str(ROOT / "llamafile" / "o" / "chimerafile" / "chimerafile"))
+        self.log_path = Path("/tmp/opencode") / f"chimera-gizmo-{self.port}.log"
+        # The APE is not directly exec-able on Linux (see conftest).
+        log = open(self.log_path, "wb")
+        cmd = [bin_path, "--gpu", "off", "serve", "--config", str(cfg_path)]
+        self.proc = subprocess.Popen(
+            ["/bin/sh", "-c", " ".join(shlex.quote(a) for a in cmd)],
+            stdout=log, stderr=subprocess.STDOUT)
+        log.close()
+        self.client = Client(self.base)
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            if self.proc.poll() is not None:
+                pytest.fail(f"gizmo server died at startup; log: {self.log_path}")
+            if health_ok(self.base):
+                return
+            time.sleep(0.5)
+        self.teardown()
+        pytest.fail(f"gizmo server never came up; log: {self.log_path}")
+
+    # ── process-tree helpers (scoped to our tree, never the live svc) ──
+
+    def _tree(self):
+        """{pid: argv} for our serve, the router, and the model children."""
+        argv_of, ppid_of = {}, {}
+        for pid in filter(str.isdigit, os.listdir("/proc")):
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    argv = [t for t in
+                            f.read().decode(errors="replace").split("\0") if t]
+                with open(f"/proc/{pid}/stat") as f:
+                    ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+            except (OSError, IndexError, ValueError):
+                continue
+            argv_of[int(pid)] = argv
+            ppid_of[int(pid)] = ppid
+        tree, stack = {}, [self.proc.pid]
+        while stack:
+            p = stack.pop()
+            if p not in argv_of or p in tree:
+                continue
+            tree[p] = argv_of[p]
+            stack += [q for q, pp in ppid_of.items() if pp == p]
+        return tree
+
+    def router_pid(self):
+        for pid, argv in self._tree().items():
+            if "--models-preset" in argv:
+                return pid
+        return None
+
+    def child_pid(self, alias):
+        for pid, argv in self._tree().items():
+            if "--alias" in argv and argv[argv.index("--alias") + 1] == alias:
+                return pid
+        return None
+
+    def child_pids(self):
+        return [pid for pid, argv in self._tree().items()
+                if "--alias" in argv and "--models-preset" not in argv]
+
+    # ── API helpers ───────────────────────────────────────────────────
+
+    def status_rows(self):
+        s, body = self.client.get("/v1/status")
+        assert s == 200, f"/v1/status: {s} {str(body)[:120]}"
+        return {r["id"]: r for r in body.get("resident", [])}
+
+    def chat(self, model, n=16):
+        return self.client.chat({
+            "model": model,
+            "messages": [{"role": "user", "content": "Say hi."}],
+            "max_tokens": n,
+        })
+
+    def teardown(self):
+        if self.proc.poll() is None:
+            self.proc.send_signal(signal.SIGTERM)
+            try:
+                self.proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
+        else:
+            self.proc.wait()  # reap (the test may have killed it)
+
+
+@pytest.fixture
+def gserv():
+    started = []
+
+    def _start(cfg_name, model_file=None):
+        g = Gizmo(cfg_name, model_file)
+        started.append(g)
+        return g
+
+    yield _start
+    for g in started:
+        g.teardown()
+
+
+# ── lifecycle tests ────────────────────────────────────────────────────
+
+def test_spawn_failure_503(gserv, tmp_path):
+    # A copy, so the real model file is never disturbed: the config
+    # validates the file at startup, so the file must exist to boot and
+    # vanish only between requests.
+    src = ROOT / "llamafile" / "models" / "TinyLLama-v0.1-5M-F16.gguf"
+    dst = tmp_path / "tiny.gguf"
+    dst.write_bytes(src.read_bytes())
+    g = gserv("tiny-llama.json", model_file=str(dst))
+    s, _ = g.chat("tiny")
+    assert s == 200, "the model must load while its file exists"
+    s, _ = g.client.post("/v1/residency/tiny/unload", {})
+    assert s == 200
+    dst.unlink()
+    s, r = g.chat("tiny")
+    assert s == 503, f"status={s} body={str(r)[:200]}"
+    assert r["error"]["code"] == "model_load_failed", str(r)[:200]
+    row = g.status_rows()["tiny"]
+    assert row["state"] == "unloaded" and row["port"] is None, f"row={row}"
+
+
+def test_crash_self_heal(gserv):
+    g = gserv("tiny-llama.json")
+    s, _ = g.chat("tiny")
+    assert s == 200
+    old = g.child_pid("tiny")
+    assert old is not None, "no model child after a successful chat"
+    os.kill(old, signal.SIGKILL)
+    deadline = time.time() + 15
+    while time.time() < deadline and g.child_pid("tiny") == old:
+        time.sleep(0.2)
+    s, r = g.chat("tiny")
+    assert s == 200, f"the router must respawn the killed child: {str(r)[:160]}"
+    new = g.child_pid("tiny")
+    assert new is not None and new != old, "the child was not respawned"
+
+
+def test_ttl_releases_port(gserv):
+    g = gserv("gizmo-ttl.json")  # ttl: 5
+    s, _ = g.chat("tiny")
+    assert s == 200
+    row = g.status_rows()["tiny"]
+    assert row["state"] == "loaded" and row["port"], f"row={row}"
+    time.sleep(12)  # ttl 5s + the 1s sweeper cycle + the child's exit
+    row = g.status_rows()["tiny"]
+    assert row["state"] == "unloaded", f"row={row}"
+    assert row["port"] is None
+    assert g.child_pid("tiny") is None, "the child outlived its TTL"
+
+
+def test_no_orphans_after_serve_kill(gserv):
+    g = gserv("tiny-llama.json")
+    s, _ = g.chat("tiny")
+    assert s == 200
+    assert g.router_pid() is not None and g.child_pid("tiny") is not None
+    g.proc.kill()  # SIGKILL: no graceful shutdown to lean on
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        if g.router_pid() is None and g.child_pid("tiny") is None:
+            break
+        time.sleep(0.5)
+    assert g.router_pid() is None, "the router outlived the serve"
+    assert g.child_pid("tiny") is None, "the model child outlived its tree"
+
+
+def test_client_disconnect_stops_generation(gserv):
+    g = gserv("tiny-llama.json")
+    s, _ = g.chat("tiny")
+    assert s == 200
+    port = g.status_rows()["tiny"]["port"]
+    assert port, "no child port to inspect"
+
+    # Open a long stream, let a few frames out, then walk out.
+    sock = socket.create_connection(("127.0.0.1", g.port), timeout=60)
+    payload = json.dumps({"model": "tiny",
+                          "messages": [{"role": "user", "content":
+                                        "Count slowly and carefully."}],
+                          "max_tokens": 4096, "stream": True}).encode()
+    req = (f"POST /v1/chat/completions HTTP/1.1\r\n"
+           f"Host: 127.0.0.1:{g.port}\r\n"
+           f"Connection: close\r\n"
+           f"Content-Type: application/json\r\n"
+           f"Content-Length: {len(payload)}\r\n\r\n").encode() + payload
+    sock.sendall(req)
+    buf = b""
+    while buf.count(b'"finish_reason":null') < 3 and len(buf) < (1 << 20):
+        b = sock.recv(4096)
+        if not b:
+            break
+        buf += b
+    sock.close()
+
+    # The slot must go idle (either way), then prove the generation did
+    # not run to completion: the child's own release log says how many
+    # tokens it decoded.  A run-to-completion fills the 2048-token slot
+    # context; a cancelled one stops within a few dozen.
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/slots",
+                                        timeout=5) as r:
+                slots = json.load(r)
+            if all(sl.get("state", "idle") == "idle" for sl in slots):
+                break
+        except Exception:
+            pass
+        time.sleep(0.5)
+    else:
+        pytest.fail("the child's slot never went idle after the disconnect")
+    router_log = Path(f"/tmp/chimerafile-serve-{g.proc.pid}/router.log")
+    text = router_log.read_text(errors="replace")
+    stops = [line for line in text.splitlines() if "stop processing" in line]
+    assert stops, "no slot release recorded in the child log"
+    n_tokens = int(stops[-1].split("n_tokens = ")[1].split(",")[0])
+    assert n_tokens < 500, \
+        f"generation ran to completion after the client left ({n_tokens} tokens)"
+
+
+def test_alias_routing_single_child(gserv):
+    g = gserv("gizmo-alias.json")
+    s, r1 = g.chat("tiny")
+    assert s == 200
+    assert r1.get("model") == "tiny", str(r1)[:160]
+    s, r2 = g.chat("petit")
+    assert s == 200
+    assert r2.get("model") == "petit", \
+        f"the alias must echo back as the client asked: {str(r2)[:160]}"
+    rows = g.status_rows()
+    assert rows["tiny"]["port"] and rows["tiny"]["port"] == rows["petit"]["port"]
+    assert len(g.child_pids()) == 1, "two ids must share one child"
+
+
+def test_load_coalescing(gserv):
+    g = gserv("tiny-llama.json")
+    results, lock = [], threading.Lock()
+
+    def go():
+        s, r = g.chat("tiny")
+        with lock:
+            results.append((s, str(r)[:120]))
+
+    threads = [threading.Thread(target=go) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=120)
+    assert all(s == 200 for s, _ in results), str(results)
+    assert g.child_pid("tiny") is not None
+    assert len(g.child_pids()) == 1, \
+        "concurrent first loads must coalesce into one child"
+
+
+def test_capacity_eviction(gserv):
+    g = gserv("gizmo-evict.json")  # max_loaded_models: 1
+    s, _ = g.chat("tiny-a")
+    assert s == 200
+    rows = g.status_rows()
+    assert rows["tiny-a"]["state"] == "loaded", f"row={rows['tiny-a']}"
+    s, r = g.chat("tiny-b")
+    assert s == 200, f"b must load by evicting a: {str(r)[:200]}"
+    rows = g.status_rows()
+    assert rows["tiny-b"]["state"] == "loaded", f"row={rows['tiny-b']}"
+    assert rows["tiny-a"]["state"] == "unloaded", f"row={rows['tiny-a']}"
+    assert rows["tiny-a"]["port"] is None
+    # And a comes back in turn, evicting b.
+    s, _ = g.chat("tiny-a")
+    assert s == 200
+    rows = g.status_rows()
+    assert rows["tiny-a"]["state"] == "loaded", f"row={rows['tiny-a']}"
+    assert rows["tiny-b"]["state"] == "unloaded", f"row={rows['tiny-b']}"
+
+
+def test_pinned_model_blocks_eviction(gserv):
+    # tiny-a is pinned and the fleet holds one model: a request for b can
+    # neither evict a nor load alongside it -- it gets a retryable 503.
+    g = gserv("gizmo-pinned.json")
+    s, _ = g.chat("tiny-a")
+    assert s == 200
+    # Let the admission snapshot catch up: it is published once a second,
+    # and the point of the test is the steady-state decision, not the
+    # load window.
+    time.sleep(1.5)
+    req = urllib.request.Request(
+        g.base + "/v1/chat/completions",
+        data=json.dumps({"model": "tiny-b",
+                         "messages": [{"role": "user", "content": "Say hi."}],
+                         "max_tokens": 8}).encode(),
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        urllib.request.urlopen(req, timeout=60)
+        pytest.fail("expected the pinned fleet to reject tiny-b")
+    except urllib.error.HTTPError as e:
+        assert e.code == 503, f"status={e.code}"
+        assert e.headers.get("Retry-After") == "5", dict(e.headers)
+        r = json.loads(e.read())
+        assert r["error"]["code"] == "model_loading", str(r)[:200]
+    rows = g.status_rows()
+    assert rows["tiny-a"]["state"] == "loaded", \
+        f"the pinned model must not be touched: {rows['tiny-a']}"
+    assert rows["tiny-b"]["state"] == "unloaded", f"row={rows['tiny-b']}"
