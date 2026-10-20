@@ -9,13 +9,18 @@
 // engine is disabled.
 
 #include <cosmo.h>
+#include <chrono>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string>
 #include <signal.h>
+#include <thread>
 #include <dlfcn.h>
-#if defined(__linux__)
+#if defined(__unix__)
 #include <sys/prctl.h>
+#include <sys/types.h>
+#include <unistd.h>
 #endif
 
 #include "llamafile/llamafile.h"
@@ -179,17 +184,100 @@ static void isolate_host_glibc_heap(void) {
 #endif
 }
 
+// ── Parent-death watcher ─────────────────────────────────────────────────
+//
+// PR_SET_PDEATHSIG alone is not a usable guarantee in the APE: it was
+// never even compiled there (cosmocc does not define __linux__), and the
+// runtime's handling of it is unverified.  So a child whose parent dies
+// would be orphaned: a hard kill of the serve process (task manager, a
+// crash) would leave the router, the model children, and the media child
+// running, holding their ports and the GPU.
+// Every child of the serve layer is spawned with LLAMA_APP_CMD set (the
+// router and media children directly, the router's model children by
+// environment inheritance), so each of them installs this watcher on its
+// direct parent.  When the parent dies the kernel reparents us: getppid()
+// changes, or, if the pid was reused, the parent's start time (field 22 of
+// /proc/<pid>/stat, which a reused pid cannot forge) stops matching.  On
+// detection the child sends itself SIGTERM so its own graceful shutdown
+// runs -- and a router's shutdown takes its model children down with it, so
+// a death at any level cascades to the whole tree.  __unix__, not
+// __linux__: the cosmocc APE toolchain does not define __linux__.
+#if defined(__unix__)
+
+// The process identity that survives pid reuse: field 22 (starttime) of
+// /proc/<pid>/stat, which never changes for the process's lifetime.
+static std::string proc_starttime(pid_t pid) {
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)pid);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return "";
+    char buf[4096];
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    // comm (field 2) may contain spaces and parentheses, so anchor on the
+    // last ')': what follows is fields 3.., single-space separated.
+    char *p = strrchr(buf, ')');
+    if (!p)
+        return "";
+    p += 2;  // skip ") "
+    for (int field = 3; field < 22; field++) {
+        while (*p == ' ')
+            p++;
+        while (*p && *p != ' ')
+            p++;
+    }
+    // Return field 22 alone: the rest of the line (vsize, rss, ...) is
+    // mutable and would read as a changed identity.
+    while (*p == ' ')
+        p++;
+    char *end = p;
+    while (*end && *end != ' ')
+        end++;
+    if (end == p)
+        return "";
+    return std::string(p, (size_t)(end - p));
+}
+
+static void parent_death_watcher(void) {
+    pid_t parent = getppid();
+    std::string parent_start = proc_starttime(parent);
+    if (parent_start.empty())
+        return;  // cannot establish the parent's identity; do not act
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        pid_t cur = getppid();
+        bool dead = cur != parent;
+        if (!dead) {
+            std::string now = proc_starttime(cur);
+            dead = !now.empty() && now != parent_start;  // pid was reused
+        }
+        if (!dead)
+            continue;
+        fprintf(stderr, "parent process died; shutting down with it\n");
+        // The child's own SIGTERM handler runs its graceful shutdown.  If
+        // it is wedged, the backstop kills the process anyway -- any
+        // in-flight work was already lost with the parent.
+        raise(SIGTERM);
+        for (int i = 0; i < 50; i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        _exit(1);
+    }
+}
+#endif
+
 // ── Entry point ────────────────────────────────────────────────────────────
 
 int main(int argc, char **argv) {
     // Best effort: when our parent dies, get signalled instead of
-    // orphaned.  The current APE runtime (.ape-1.10) swallows the prctl,
-    // so on the APE this does not fire -- the guarantees that actually
-    // hold there are serve's graceful stop (it reaps router and model
-    // children) and the launcher killing the whole process group on a
-    // hard stop (systemd KillMode=control-group, job control).  Native
-    // builds honour it for every tree generation.
-#if defined(__linux__)
+    // orphaned.  Whether the cosmo runtime honours it inside the APE is
+    // unverified -- the parent-death watcher below is the guarantee that
+    // actually holds for serve-layer children either way, plus the
+    // launcher killing the whole process group on a hard stop (systemd
+    // KillMode=control-group, job control).  Native builds honour the
+    // prctl for every tree generation.
+#if defined(__unix__)
     prctl(PR_SET_PDEATHSIG, SIGTERM);
 #endif
 
@@ -247,6 +335,24 @@ int main(int argc, char **argv) {
     argv[1] = argv[0];
     argv++;
     argc--;
+
+#if defined(__unix__)
+    // Children of the serve layer carry LLAMA_APP_CMD (spawn_child sets
+    // it; the router's model children inherit it).  They must not outlive
+    // their parent.  Installed just before the dispatch, so every engine
+    // runs with the watcher in place.  Best effort: a failed start leaves
+    // the child with the pre-watcher guarantees only (graceful stop, group
+    // kill).
+    if (getenv("LLAMA_APP_CMD")) {
+        try {
+            std::thread(parent_death_watcher).detach();
+        } catch (...) {
+            fprintf(stderr, "warning: cannot start the parent-death "
+                            "watcher thread; the child will outlive a "
+                            "hard kill of its parent\n");
+        }
+    }
+#endif
 
     if (strcmp(engine, "llama") == 0)
         return llama_dispatch(argc, argv);

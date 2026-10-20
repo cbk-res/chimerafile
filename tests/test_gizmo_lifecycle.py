@@ -39,7 +39,7 @@ def free_port():
 class Gizmo:
     """A per-test serve process with direct access to its children."""
 
-    def __init__(self, cfg_name, model_file=None):
+    def __init__(self, cfg_name, model_file=None, gpu="off", env=None):
         cfg = json.loads((ROOT / "tests" / "configs" / cfg_name).read_text())
         absolutize(cfg)
         if model_file:
@@ -62,10 +62,11 @@ class Gizmo:
         # process group, as a launcher (systemd, job control) would, so
         # the tests can kill the tree the way operators do.
         log = open(self.log_path, "wb")
-        cmd = [bin_path, "--gpu", "off", "serve", "--config", str(cfg_path)]
+        cmd = [bin_path, "--gpu", gpu, "serve", "--config", str(cfg_path)]
         self.proc = subprocess.Popen(
             ["/bin/sh", "-c", " ".join(shlex.quote(a) for a in cmd)],
             stdout=log, stderr=subprocess.STDOUT,
+            env={**os.environ, **env} if env else None,
             start_new_session=True)
         log.close()
         self.client = Client(self.base)
@@ -167,8 +168,8 @@ class Gizmo:
 def gserv():
     started = []
 
-    def _start(cfg_name, model_file=None):
-        g = Gizmo(cfg_name, model_file)
+    def _start(cfg_name, model_file=None, gpu="off", env=None):
+        g = Gizmo(cfg_name, model_file, gpu=gpu, env=env)
         started.append(g)
         return g
 
@@ -299,6 +300,37 @@ def test_graceful_stop_reaps_the_tree(gserv):
         "the router outlived the graceful stop"
     assert _proc_gone(child, model_marker), \
         "the model child outlived the graceful stop"
+
+
+def test_tree_dies_when_serve_hard_killed(gserv):
+    # The task-manager case: only the serve process is killed, no launcher
+    # to kill the group.  Every child carries the parent-death watcher --
+    # when serve goes, each one notices its parent is gone (1 s poll) and
+    # shuts itself down, so the whole tree follows within seconds.
+    g = gserv("tiny-media.json")
+    s, _ = g.chat("tiny")
+    assert s == 200
+    router, child, media = g.router_pid(), g.child_pid("tiny"), g.media_pid()
+    assert router is not None and child is not None and media is not None, \
+        f"tree incomplete: router={router} child={child} media={media}"
+    preset_marker = f"/tmp/chimerafile-serve-{g.proc.pid}/"
+    model_marker = g.cfg_model_file("tiny")
+    media_marker = str(g.cfg_path)
+    os.kill(g.proc.pid, signal.SIGKILL)  # serve only, not the group
+    g.proc.wait(timeout=30)
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        if (_proc_gone(router, preset_marker)
+                and _proc_gone(child, model_marker)
+                and _proc_gone(media, media_marker)):
+            break
+        time.sleep(1)
+    assert _proc_gone(router, preset_marker), \
+        "the router outlived the hard kill of serve"
+    assert _proc_gone(child, model_marker), \
+        "the model child outlived the hard kill of serve"
+    assert _proc_gone(media, media_marker), \
+        "the media child outlived the hard kill of serve"
 
 
 def test_client_disconnect_stops_generation(gserv):
@@ -484,6 +516,55 @@ def test_media_ttl_unloads_and_reloads(gserv, speech_wav):
     assert s == 200, f"status={s} body={str(r)[:160]}"
     row = g.status_rows()["wspk"]
     assert row["state"] == "loaded", f"row={row}"
+
+
+@pytest.mark.gpu_exclusive
+def test_gpu_lease_defers_llama_load(request, gserv, speech_wav):
+    # While the media child is loading a model on the shared GPU, a llama
+    # model load is deferred with a retryable 503 instead of running two
+    # GPU loads at once; once the load settles, the chat goes through.
+    # The 1 s sweep keeps the lease snapshot fresh enough to catch the
+    # ~3 s whisper load window (the default 5 s would miss it).
+    if request.config.getoption("--gpu") not in ("vulkan", "metal", "rocm"):
+        pytest.skip("the lease gate is a no-op on the cpu backend; "
+                    "run the suite with --gpu vulkan")
+    g = gserv("tiny-media.json", gpu="vulkan",
+              env={"CHIMERAFILE_MEDIA_SWEEP_S": "1"})
+    t = threading.Thread(target=lambda: g.transcribe("whisper-turbo",
+                                                     speech_wav))
+    t.start()
+
+    # Wait until the child reports the whisper model as loading, then one
+    # more sweep so the lease snapshot (what the gate reads) has it too.
+    deadline = time.time() + 30
+    rows = {}
+    while time.time() < deadline:
+        rows = g.status_rows()
+        if rows.get("whisper-turbo", {}).get("state") == "loading":
+            break
+        time.sleep(0.2)
+    assert rows.get("whisper-turbo", {}).get("state") == "loading", \
+        f"the whisper model never showed as loading: {rows}"
+    time.sleep(1.3)
+
+    s, r = g.chat("tiny", n=8)
+    assert s == 503, \
+        f"the chat must be deferred while whisper loads: {s} {str(r)[:160]}"
+    assert r.get("error", {}).get("code") == "model_loading", str(r)[:200]
+
+    t.join(timeout=120)
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        rows = g.status_rows()
+        if rows.get("whisper-turbo", {}).get("state") == "loaded":
+            break
+        time.sleep(0.5)
+    assert rows.get("whisper-turbo", {}).get("state") == "loaded", \
+        f"the whisper model never finished loading: {rows}"
+    time.sleep(1.3)  # one more sweep, so the snapshot clears the gate
+    s, r = g.chat("tiny", n=8)
+    assert s == 200, \
+        f"the chat must succeed once the load has settled: {str(r)[:160]}"
 
 
 def test_no_orphans_after_group_kill_media(gserv):
