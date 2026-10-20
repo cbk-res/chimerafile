@@ -106,6 +106,9 @@ extern int diffusionfile_main(int argc, char **argv);
 extern int transcribefile_main(int argc, char **argv);
 #endif
 extern int serve_main(int argc, char **argv);
+// The media child: the in-process home of the whisper / diffusion /
+// transcribe engines, spawned by the serve layer (not a user entry point).
+extern int media_main(int argc, char **argv);
 
 // The GPU backend this process resolved in main(); the serve layer hands it
 // to the router child via LLAMAFILE_GPU.  nullptr = auto-detect, which the
@@ -265,6 +268,9 @@ int main(int argc, char **argv) {
 
     if (strcmp(engine, "serve") == 0)
         return serve_main(argc, argv);
+
+    if (strcmp(engine, "media") == 0)
+        return media_main(argc, argv);
 
     fprintf(stderr, "chimerafile: unknown engine '%s'\n\n", engine);
     print_usage(stderr, argv[0]);

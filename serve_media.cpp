@@ -5,8 +5,11 @@
 
 #include "serve_media.h"
 
+#include <cpp-httplib/httplib.h>
+
 #include <algorithm>
 #include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -38,6 +41,26 @@
 #include "miniaudio.h"
 
 namespace serve {
+
+// Base64 for the data: image urls (the only user of this lives in the
+// image routes below).
+static std::string b64_encode(const std::string &in) {
+    static const char *tbl =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(in.size() / 3 * 4 + 4);
+    for (size_t i = 0; i < in.size(); i += 3) {
+        uint32_t v = (uint8_t)in[i] << 16;
+        int left = (int)in.size() - (int)i - 1;
+        if (left > 0) v |= (uint8_t)in[i + 1] << 8;
+        if (left > 1) v |= (uint8_t)in[i + 2];
+        out += tbl[(v >> 18) & 63];
+        out += tbl[(v >> 12) & 63];
+        out += left > 0 ? tbl[(v >> 6) & 63] : '=';
+        out += left > 1 ? tbl[v & 63] : '=';
+    }
+    return out;
+}
 
 static std::string phys_key(const ModelEntry &e) {
     return std::string(engine_name(e.engine)) + "\x01" + e.file;
@@ -720,4 +743,703 @@ void Residency::stop() {
     }
 }
 
+// ── The media child ──────────────────────────────────────────────────────
+//
+// A thin HTTP front over the in-process residency: the serve layer spawns
+// this (chimerafile media --config FILE --host H --port P) and relays the
+// /v1/audio/* and /v1/images/* requests to it.  The child's main thread
+// is the pump; its loopback port carries no auth (the serve process is
+// the only client, and it gates the key on the public port).
+
+struct MediaServer {
+    Config cfg;
+    Residency residency;
+    httplib::Server http;
+    time_t start_at = 0;
+    std::thread http_thread;
+
+    explicit MediaServer(Config c) : cfg(std::move(c)), residency(cfg) {}
+
+    // OpenAI image generation + edits share one core: validate the model
+    // (diffusion engine only), run the generation on the main thread
+    // through an EngineJob, and serialize the PNGs (b64_json or data: url).
+    // `edit` is the decoded input image for the img2img path (nullptr =
+    // text-to-image).  Runs on the HTTP worker thread; only the engine
+    // call is submitted to the pump.
+    void handle_image_request(const std::string &model_id,
+                              const std::string &prompt,
+                              const std::string &negative,
+                              const std::string &fmt,
+                              const std::string &size, int n, int steps,
+                              double cfg_scale, long seed,
+                              const std::vector<uint8_t> *edit,
+                              int edit_w, int edit_h,
+                              httplib::Response &res) {
+        auto send_err = [](httplib::Response &res, int status,
+                           const char *type, const char *code,
+                           const std::string &message) {
+            nlohmann::json out;
+            out["error"]["message"] = message;
+            out["error"]["type"] = type;
+            out["error"]["code"] = code;
+            res.status = status;
+            res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
+        };
+        const ModelEntry *e = cfg.find(model_id);
+        if (!e) {
+            send_err(res, 404, "invalid_request_error", "model_not_found",
+                     "unknown model id");
+            return;
+        }
+        if (e->engine != EngineKind::Diffusion) {
+            send_err(res, 400, "invalid_request_error", "unsupported_model",
+                     std::string("model '") + e->id +
+                     "' runs on the " + engine_name(e->engine) +
+                     " engine, not diffusion");
+            return;
+        }
+        if (fmt != "b64_json" && fmt != "url") {
+            send_err(res, 400, "invalid_request_error", "invalid_request",
+                     "response_format must be b64_json or url");
+            return;
+        }
+        int w = 512, h = 512;
+        if (!size.empty()) {
+            const size_t x = size.find('x');
+            if (x == std::string::npos ||
+                !(w = atoi(size.substr(0, x).c_str())) ||
+                !(h = atoi(size.substr(x + 1).c_str()))) {
+                send_err(res, 400, "invalid_request_error",
+                         "invalid_request",
+                         "size must be WxH (for example 512x512)");
+                return;
+            }
+            if (w <= 0 || h <= 0 || w > 2048 || h > 2048) {
+                send_err(res, 400, "invalid_request_error",
+                         "invalid_request",
+                         "size must be between 1x1 and 2048x2048");
+                return;
+            }
+        } else if (edit) {
+            // edits without an explicit size keep the input's
+            w = edit_w;
+            h = edit_h;
+        }
+        if (n < 1 || n > 4) {
+            send_err(res, 400, "invalid_request_error", "invalid_request",
+                     "'n' must be between 1 and 4");
+            return;
+        }
+
+        std::string err;
+        auto p = residency.acquire(*e, err);
+        if (!p) {
+            send_err(res, 503, "server_error", "model_load_failed", err);
+            return;
+        }
+
+        auto job = std::make_shared<EngineJob>();
+        job->p = p;
+        ImageResult ir;
+        job->run = [p, prompt, negative, w, h, n, steps,
+                    cfg_f = cfg_scale > 0 ? (float)cfg_scale : -1.0f, seed,
+                    edit, edit_w, edit_h, &ir] {
+            ir = run_image(*p, prompt, negative, w, h, n, steps, cfg_f, seed,
+                           edit, edit_w, edit_h);
+        };
+        if (!residency.submit_engine(job)) {
+            residency.release(*p);
+            send_err(res, 503, "server_error", "server_busy",
+                     "server is shutting down");
+            return;
+        }
+        {
+            std::unique_lock<std::mutex> lk(job->mu);
+            job->cv.wait(lk, [&] { return job->finished; });
+        }
+        if (!ir.ok) {
+            send_err(res, 500, "server_error", "generation_failed", ir.err);
+            return;
+        }
+
+        nlohmann::json data = nlohmann::json::array();
+        for (const auto &img : ir.images) {
+            std::string png;
+            if (!encode_png(img, png)) {
+                send_err(res, 500, "server_error", "generation_failed",
+                         "failed to encode the generated image");
+                return;
+            }
+            nlohmann::json d;
+            if (fmt == "url")
+                d["url"] = "data:image/png;base64," + b64_encode(png);
+            else
+                d["b64_json"] = b64_encode(png);
+            d["revised_prompt"] = prompt;
+            data.push_back(std::move(d));
+        }
+        nlohmann::json out;
+        out["created"] = (long)time(nullptr);
+        out["model"] = e->id;
+        out["data"] = data;
+        res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
+    }
+
+    void register_routes() {
+        // SO_REUSEADDR, not httplib's default SO_REUSEPORT: the kernel
+        // refuses a second bind on this port (see Server in serve.cpp).
+        http.set_socket_options([](socket_t sock) {
+            int yes = 1;
+            setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
+        });
+        http.set_logger([](const httplib::Request &req,
+                           const httplib::Response &res) {
+            serve_log("resp %s %s %d\n", req.method.c_str(), req.path.c_str(),
+                      res.status);
+        });
+        // No auth gate: loopback-only, and the only client is the serve
+        // process, which checks the key on the public port.
+
+        http.Get("/health", [](const httplib::Request &, httplib::Response &res) {
+            res.set_content("{\"status\":\"ok\"}", "application/json");
+        });
+
+        // OpenAI: audio transcriptions (whisper + transcribe engines).
+        // Multipart form: model, file, and optionally language, prompt,
+        // response_format (json | verbose_json | text | srt | vtt), and
+        // temperature (applied to whisper; transcribe has no such knob).
+        http.Post("/v1/audio/transcriptions",
+                  [this](const httplib::Request &req, httplib::Response &res,
+                         const httplib::ContentReader &content_reader) {
+            auto send_err = [](httplib::Response &res, int status,
+                               const char *type, const char *code,
+                               const std::string &message) {
+                nlohmann::json out;
+                out["error"]["message"] = message;
+                out["error"]["type"] = type;
+                out["error"]["code"] = code;
+                res.status = status;
+                res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
+            };
+
+            if (!req.is_multipart_form_data()) {
+                send_err(res, 400, "invalid_request_error",
+                         "invalid_request",
+                         "Content-Type must be multipart/form-data");
+                return;
+            }
+            // Collect the form: the header callback fires at the start of
+            // each part (a file part is recognised by its filename); the
+            // receiver then gets that part's bytes.
+            std::map<std::string, std::string> fields;
+            std::string audio;
+            bool got_file = false;
+            std::string part_name;
+            std::string part_filename;
+            bool parsed = content_reader(
+                [&](const httplib::FormData &fd) -> bool {
+                    // The FormData reference is only valid for the
+                    // duration of the header callback.
+                    part_name     = fd.name;
+                    part_filename = fd.filename;
+                    return true;
+                },
+                [&](const char *d, size_t n) -> bool {
+                    if (part_filename.empty())
+                        fields[part_name] += std::string(d, n);
+                    else {
+                        audio += std::string(d, n);
+                        got_file = true;
+                    }
+                    return true;
+                });
+            if (!parsed) {
+                send_err(res, 400, "invalid_request_error", "invalid_request",
+                         "could not parse the multipart form");
+                return;
+            }
+            auto field = [&fields](const char *name) -> std::string {
+                auto it = fields.find(name);
+                return it == fields.end() ? std::string() : it->second;
+            };
+            const std::string model = field("model");
+            if (model.empty()) {
+                send_err(res, 400, "invalid_request_error",
+                         "invalid_request", "'model' is required");
+                return;
+            }
+            const ModelEntry *e = cfg.find(model);
+            if (!e) {
+                send_err(res, 404, "invalid_request_error", "model_not_found",
+                         "unknown model id");
+                return;
+            }
+            if (e->engine != EngineKind::Whisper &&
+                e->engine != EngineKind::Transcribe) {
+                send_err(res, 400, "invalid_request_error",
+                         "unsupported_model",
+                         std::string("model '") + e->id +
+                         "' runs on the " + engine_name(e->engine) +
+                         " engine, not a speech engine");
+                return;
+            }
+            if (!got_file) {
+                send_err(res, 400, "invalid_request_error",
+                         "invalid_request",
+                         "'file' (the audio) is required");
+                return;
+            }
+            std::string language = field("language");
+            std::string prompt = field("prompt");
+            std::string fmt = field("response_format");
+            if (fmt.empty())
+                fmt = "json";
+            if (fmt != "json" && fmt != "verbose_json" && fmt != "text" &&
+                fmt != "srt" && fmt != "vtt") {
+                send_err(res, 400, "invalid_request_error",
+                         "invalid_request",
+                         "response_format must be json, verbose_json, "
+                         "text, srt or vtt");
+                return;
+            }
+            float temperature = -1.0f;  // < 0 = not set in the request
+            const std::string t = field("temperature");
+            if (!t.empty())
+                temperature = (float)strtod(t.c_str(), nullptr);
+
+            std::vector<float> pcm;
+            if (!decode_audio(audio, pcm)) {
+                send_err(res, 400, "invalid_request_error",
+                         "invalid_request",
+                         "could not decode the audio file (WAV, MP3, FLAC "
+                         "or OGG)");
+                return;
+            }
+
+            std::string err;
+            auto p = residency.acquire(*e, err);
+            if (!p) {
+                send_err(res, 503, "server_error", "model_load_failed", err);
+                return;
+            }
+
+            auto job = std::make_shared<EngineJob>();
+            job->p = p;
+            TranscribeResult tr;
+            job->run = [p, pcm = std::move(pcm), language, prompt,
+                        temperature, &tr] {
+                tr = run_transcribe(*p, pcm, language, prompt, temperature);
+            };
+            if (!residency.submit_engine(job)) {
+                residency.release(*p);
+                send_err(res, 503, "server_error", "server_busy",
+                         "server is shutting down");
+                return;
+            }
+            {
+                std::unique_lock<std::mutex> lk(job->mu);
+                job->cv.wait(lk, [&] { return job->finished; });
+            }
+            if (!tr.ok) {
+                send_err(res, 500, "server_error", "transcription_failed",
+                         tr.err);
+                return;
+            }
+
+            if (fmt == "text") {
+                res.set_content(tr.text, "text/plain");
+                return;
+            }
+            if (fmt == "srt") {
+                res.set_content(build_srt(tr.segments),
+                                "application/x-subrip");
+                return;
+            }
+            if (fmt == "vtt") {
+                res.set_content(build_vtt(tr.segments), "text/vtt");
+                return;
+            }
+            nlohmann::json out;
+            out["text"] = tr.text;
+            if (fmt == "verbose_json") {
+                out["language"] =
+                    tr.language.empty() ? std::string("en") : tr.language;
+                out["duration"] = tr.duration_s;
+                nlohmann::json segs = nlohmann::json::array();
+                for (size_t i = 0; i < tr.segments.size(); i++) {
+                    segs.push_back(
+                        {{"id", (int)i},
+                         {"start", tr.segments[i].t0},
+                         {"end", tr.segments[i].t1},
+                         {"text", tr.segments[i].text}});
+                }
+                out["segments"] = segs;
+            }
+            res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
+        });
+
+        // OpenAI: image generation (diffusion engine models).
+        http.Post("/v1/images/generations",
+                  [this](const httplib::Request &req, httplib::Response &res) {
+            auto send_err = [](httplib::Response &res, int status,
+                               const char *type, const char *code,
+                               const std::string &message) {
+                nlohmann::json out;
+                out["error"]["message"] = message;
+                out["error"]["type"] = type;
+                out["error"]["code"] = code;
+                res.status = status;
+                res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
+            };
+            nlohmann::json body;
+            try {
+                body = nlohmann::json::parse(req.body);
+            } catch (...) {
+                send_err(res, 400, "invalid_request_error", "invalid_json",
+                         "request body is not valid JSON");
+                return;
+            }
+            if (!body.contains("model") || !body["model"].is_string()) {
+                send_err(res, 400, "invalid_request_error",
+                         "invalid_request", "'model' is required");
+                return;
+            }
+            if (!body.contains("prompt") || !body["prompt"].is_string() ||
+                body["prompt"].get<std::string>().empty()) {
+                send_err(res, 400, "invalid_request_error",
+                         "invalid_request", "'prompt' is required");
+                return;
+            }
+            // negative_prompt, steps, cfg_scale and seed are chimerafile
+            // extensions (OpenAI's API has none of them); the rest is
+            // OpenAI-shaped.
+            handle_image_request(
+                body["model"].get<std::string>(),
+                body["prompt"].get<std::string>(),
+                body.value("negative_prompt", std::string()),
+                body.value("response_format", std::string("b64_json")),
+                body.value("size", std::string()),
+                body.value("n", 1), body.value("steps", 0),
+                body.value("cfg_scale", -1.0),
+                body.contains("seed") && body["seed"].is_number()
+                    ? body["seed"].get<long>()
+                    : -1,
+                nullptr, 0, 0, res);
+        });
+
+        // OpenAI: image edits (diffusion engine models, img2img path).
+        http.Post("/v1/images/edits",
+                  [this](const httplib::Request &req, httplib::Response &res,
+                         const httplib::ContentReader &content_reader) {
+            auto send_err = [](httplib::Response &res, int status,
+                               const char *type, const char *code,
+                               const std::string &message) {
+                nlohmann::json out;
+                out["error"]["message"] = message;
+                out["error"]["type"] = type;
+                out["error"]["code"] = code;
+                res.status = status;
+                res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
+            };
+            if (!req.is_multipart_form_data()) {
+                send_err(res, 400, "invalid_request_error",
+                         "invalid_request",
+                         "Content-Type must be multipart/form-data");
+                return;
+            }
+            std::map<std::string, std::string> fields;
+            std::string file;
+            bool got_file = false;
+            std::string part_name;
+            std::string part_filename;
+            bool parsed = content_reader(
+                [&](const httplib::FormData &fd) -> bool {
+                    // The FormData reference is only valid for the
+                    // duration of the header callback.
+                    part_name     = fd.name;
+                    part_filename = fd.filename;
+                    return true;
+                },
+                [&](const char *d, size_t n) -> bool {
+                    if (part_filename.empty())
+                        fields[part_name] += std::string(d, n);
+                    else {
+                        file += std::string(d, n);
+                        got_file = true;
+                    }
+                    return true;
+                });
+            if (!parsed) {
+                send_err(res, 400, "invalid_request_error",
+                         "invalid_request",
+                         "could not parse the multipart form");
+                return;
+            }
+            auto field = [&fields](const char *name) -> std::string {
+                auto it = fields.find(name);
+                return it == fields.end() ? std::string() : it->second;
+            };
+            if (field("model").empty()) {
+                send_err(res, 400, "invalid_request_error",
+                         "invalid_request", "'model' is required");
+                return;
+            }
+            if (field("prompt").empty()) {
+                send_err(res, 400, "invalid_request_error",
+                         "invalid_request", "'prompt' is required");
+                return;
+            }
+            if (!got_file) {
+                send_err(res, 400, "invalid_request_error",
+                         "invalid_request",
+                         "'image' (the input image) is required");
+                return;
+            }
+            int iw = 0, ih = 0;
+            std::vector<uint8_t> ipp;
+            if (!decode_image(file, iw, ih, ipp)) {
+                send_err(res, 400, "invalid_request_error",
+                         "invalid_request",
+                         "could not decode the input image (PNG or JPEG)");
+                return;
+            }
+            handle_image_request(
+                field("model"), field("prompt"), field("negative_prompt"),
+                field("response_format").empty() ? "b64_json"
+                                                 : field("response_format"),
+                field("size"),
+                (int)atol(field("n").empty() ? "1" : field("n").c_str()),
+                (int)atol(field("steps").empty()
+                              ? "0"
+                              : field("steps").c_str()),
+                field("cfg_scale").empty()
+                    ? -1.0
+                    : atof(field("cfg_scale").c_str()),
+                field("seed").empty() ? -1 : atoll(field("seed").c_str()),
+                &ipp, iw, ih, res);
+        });
+
+        // /v1/status for the serve layer to merge: the child's queue and
+        // its resident rows (media models only -- llama rows come from the
+        // router child).
+        http.Get("/v1/status", [this](const httplib::Request &,
+                                      httplib::Response &res) {
+            nlohmann::json out;
+            out["listen"] = cfg.host + ":" + std::to_string(cfg.port);
+            out["key"] = false;  // the child gates no key; serve does
+            out["uptime_s"] = (long)(time(nullptr) - start_at);
+            out["queue"] = residency.queue_json();
+            out["resident"] = residency.resident_json();
+            res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
+        });
+
+        // Chimerafile extensions: preload / explicit-unload controls,
+        // media models only (the serve layer dispatches llama models to
+        // the router child).
+        http.Post(R"(^/v1/residency/([A-Za-z0-9_-]+)$)",
+                  [this](const httplib::Request &req, httplib::Response &res) {
+            const ModelEntry *e = cfg.find(req.matches[1].str());
+            if (!e) {
+                res.status = 404;
+                res.set_content(
+                    "{\"error\":{\"message\":\"unknown model id\","
+                    "\"type\":\"invalid_request_error\",\"code\":null}}",
+                    "application/json");
+                return;
+            }
+            if (e->engine == EngineKind::Llama) {
+                res.status = 400;
+                res.set_content(
+                    "{\"error\":{\"message\":\"llama models are loaded by "
+                    "the router child\","
+                    "\"type\":\"invalid_request_error\",\"code\":null}}",
+                    "application/json");
+                return;
+            }
+            std::string err;
+            auto p = residency.acquire(*e, err);
+            if (!p) {
+                res.status = 503;
+                res.set_content(
+                    nlohmann::json({{"error", {{"message", err},
+                                               {"type", "server_error"},
+                                               {"code", "model_load_failed"}}}})
+                        .dump(-1, ' ', false, nlohmann::json::error_handler_t::replace),
+                    "application/json");
+                return;
+            }
+            residency.release(*p);  // keep it warm; the TTL clock starts now
+            nlohmann::json out;
+            out["id"] = e->id;
+            out["state"] = "loaded";
+            res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
+        });
+
+        http.Post(R"(^/v1/residency/([A-Za-z0-9_-]+)/unload$)",
+                  [this](const httplib::Request &req, httplib::Response &res) {
+            const ModelEntry *e = cfg.find(req.matches[1].str());
+            nlohmann::json out;
+            out["id"] = e ? e->id : req.matches[1].str();
+            if (!e) {
+                res.status = 404;
+                out["state"] = "unknown";
+                res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
+                return;
+            }
+            if (e->engine == EngineKind::Llama) {
+                res.status = 400;
+                out["state"] = "unknown";
+                out["error"] = "llama models are unloaded by the router child";
+                res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
+                return;
+            }
+            std::string err;
+            bool ok = residency.unload(*e, err);
+            if (!ok) {
+                res.status = 409;
+                out["state"] = "busy";
+                out["error"] = err;
+                res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
+                return;
+            }
+            out["state"] = "unloaded";
+            res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
+        });
+
+        // In this httplib fork the error handler runs for every response
+        // with status >= 400, including the JSON errors our own handlers
+        // send; only rewrite the body of truly unrouted requests, which
+        // arrive with an empty body.
+        http.set_error_handler([](const httplib::Request &,
+                                  httplib::Response &res) {
+            if ((res.status == 404 || res.status == 405) && res.body.empty()) {
+                res.set_content(
+                    "{\"error\":{\"message\":\"no such route\","
+                    "\"type\":\"invalid_request_error\",\"code\":null}}",
+                    "application/json");
+            }
+        });
+    }
+
+    // Binds the port and starts the accept loop on a background thread;
+    // the calling (main) thread then owns the model lifecycle via
+    // residency.pump().
+    bool start(std::string &err) {
+        register_routes();
+        start_at = time(nullptr);
+        residency.start();
+        serve_log("media: listening on http://%s:%d\n", cfg.host.c_str(),
+                  cfg.port);
+        if (!http.bind_to_port(cfg.host.c_str(), cfg.port)) {
+            err = "cannot bind " + cfg.host + ":" + std::to_string(cfg.port) +
+                  " (is another media child running?)";
+            residency.stop();
+            return false;
+        }
+        http_thread = std::thread([this] { http.listen_after_bind(); });
+        return true;
+    }
+
+    // Main thread, after the pump exits: stop the server and release every
+    // resident model.
+    void shutdown() {
+        http.stop();
+        if (http_thread.joinable())
+            http_thread.join();
+        residency.stop();
+    }
+};
+
 } // namespace serve
+
+// ── Entry point ──────────────────────────────────────────────────────────
+
+static void print_media_usage(FILE *f) {
+    fprintf(f, "usage: chimerafile media --config FILE [--host H] [--port P]\n\n");
+    fprintf(f,
+            "  FILE    declarative server config (JSON); the same file the\n"
+            "          serve layer uses -- the child hosts the media engines\n"
+            "          (whisper / diffusion / transcribe) in its own process\n"
+            "  --host  override the config's listen host (the serve layer\n"
+            "          always passes its own loopback port)\n"
+            "  --port  override the config's listen port\n\n");
+    fprintf(f,
+            "The child listens on loopback with no key; the serve layer is\n"
+            "its only client.  Run it directly only for debugging.\n");
+}
+
+static serve::MediaServer *g_media = nullptr;
+static void on_media_signal(int) {
+    if (g_media) {
+        g_media->residency.stop_pump();
+        g_media->http.stop();
+    }
+}
+
+int media_main(int argc, char **argv) {
+    const char *config = nullptr;
+    const char *host = nullptr;
+    int port = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--config") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: --config requires a path\n");
+                return 1;
+            }
+            config = argv[++i];
+        } else if (strcmp(argv[i], "--host") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: --host requires a value\n");
+                return 1;
+            }
+            host = argv[++i];
+        } else if (strcmp(argv[i], "--port") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: --port requires a value\n");
+                return 1;
+            }
+            port = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            print_media_usage(stdout);
+            return 0;
+        } else {
+            fprintf(stderr, "error: unknown option '%s'\n", argv[i]);
+            return 1;
+        }
+    }
+
+    if (!config) {
+        fprintf(stderr, "error: media requires --config FILE\n\n");
+        print_media_usage(stderr);
+        return 1;
+    }
+
+    serve::Config cfg;
+    std::string err;
+    if (!serve::parse_config(config, cfg, err)) {
+        fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
+    // The serve layer spawns the child with its own loopback port; the
+    // flags override the config's listen entry.
+    if (host)
+        cfg.host = host;
+    if (port > 0)
+        cfg.port = port;
+
+    serve::MediaServer server(cfg);
+    g_media = &server;
+    std::signal(SIGINT, on_media_signal);
+    std::signal(SIGTERM, on_media_signal);
+
+    if (!server.start(err)) {
+        fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
+
+    // The main thread is the pump (engine calls only run there, in this
+    // APE); pump() returns when a signal asks for shutdown.
+    server.residency.pump();
+    server.shutdown();
+    return 0;
+}

@@ -156,7 +156,9 @@ struct UpstreamConn {
 static bool loopback_open(const std::string &method, const std::string &path,
                           const std::string &body, int port,
                           int recv_timeout_s, UpstreamConn &c,
-                          std::string &err) {
+                          std::string &err,
+                          const std::string &content_type =
+                              "application/json") {
     int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         err = "socket: " + std::string(strerror(errno));
@@ -178,7 +180,7 @@ static bool loopback_open(const std::string &method, const std::string &path,
     std::string req = method + " " + path + " HTTP/1.1\r\n" +
                       "Host: 127.0.0.1:" + std::to_string(port) + "\r\n" +
                       "Connection: close\r\n" +
-                      "Content-Type: application/json\r\n";
+                      "Content-Type: " + content_type + "\r\n";
     if (!body.empty())
         req += "Content-Length: " + std::to_string(body.size()) + "\r\n";
     req += "\r\n" + body;
@@ -402,12 +404,14 @@ bool Forwarder::init(const std::string &ape, std::string &err) {
     return write_preset_ini(cfg, ini_path, err);
 }
 
-bool Forwarder::spawn_router(std::string &err) {
-    // A free loopback port for the router child.
+// ── Child spawn, shared by the router and media children ─────────────────
+
+// A free loopback port: bind to port 0, let the kernel pick, release.
+static int free_loopback_port(std::string &err) {
     int ls = ::socket(AF_INET, SOCK_STREAM, 0);
     if (ls < 0) {
         err = "socket: " + std::string(strerror(errno));
-        return false;
+        return 0;
     }
     sockaddr_in a{};
     a.sin_family = AF_INET;
@@ -417,25 +421,24 @@ bool Forwarder::spawn_router(std::string &err) {
         ::getsockname(ls, (sockaddr *)&a, &alen) < 0) {
         ::close(ls);
         err = "cannot pick a free port";
-        return false;
+        return 0;
     }
     int port = ntohs(a.sin_port);
     ::close(ls);
+    return port;
+}
 
-    std::vector<std::string> args = {
-        "/proc/self/exe",  // replaced below by the resolved runtime path
-        ape_path,
-    };
-    args.insert(args.end(), {
-        "llama", "--server",
-        "--host", "127.0.0.1",
-        "--port", std::to_string(port),
-        "--models-max", std::to_string(cfg.max_loaded),
-        "--models-preset", ini_path,
-    });
-    // The APE runtime is what /proc/self/exe points at; it needs the APE
-    // file as its first argument, so the child command is
-    // <runtime> <ape> llama --server ...
+// The spawn steps every serve child shares: resolve the APE runtime
+// (/proc/self/exe), wire the child fd table (stdin from /dev/null,
+// stdout+stderr to `log_path`, everything else CLOEXEC so nothing of ours
+// is inherited), and build the environment the APE runtime needs
+// (LLAMA_APP_CMD/LLAMA_APP_PATH) plus the resolved GPU mode.  args[0] is
+// a placeholder replaced by the resolved runtime path.
+static bool spawn_child(std::vector<std::string> &args,
+                        const std::string &log_path,
+                        const std::string &app_cmd,
+                        const std::string &ape_path, pid_t &pid,
+                        std::string &err) {
     char exe[4096];
     ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
     if (n <= 0) {
@@ -444,7 +447,7 @@ bool Forwarder::spawn_router(std::string &err) {
     }
     args[0] = std::string(exe, (size_t)n);
 
-    // Child fd table: stdin from /dev/null, stdout+stderr to the router
+    // Child fd table: stdin from /dev/null, stdout+stderr to the child
     // log, and nothing else of ours (the listen socket must not be
     // inherited).
     posix_spawn_file_actions_t fa;
@@ -471,8 +474,8 @@ bool Forwarder::spawn_router(std::string &err) {
         closedir(d);
     }
 
-    // Full environment plus the vars the child and the router-spawned
-    // grandchildren need to run as <runtime> <ape> llama ...
+    // Full environment plus the vars the child (and the router child's
+    // model grandchildren) need to run as <runtime> <ape> <cmd> ...
     std::vector<std::string> envv;
     for (char **e = environ; *e; e++)
         envv.push_back(*e);
@@ -485,7 +488,7 @@ bool Forwarder::spawn_router(std::string &err) {
                    envv.end());
         envv.push_back(prefix + value);
     };
-    set_var("LLAMA_APP_CMD", "llama");
+    set_var("LLAMA_APP_CMD", app_cmd.c_str());
     set_var("LLAMA_APP_PATH", ape_path.c_str());
     // The child must resolve the same GPU mode this process did; an
     // inherited LLAMAFILE_GPU would override our auto-detection.
@@ -512,7 +515,6 @@ bool Forwarder::spawn_router(std::string &err) {
 
     posix_spawnattr_t attr;
     posix_spawnattr_init(&attr);
-    pid_t pid = 0;
     int rc = posix_spawn(&pid, args[0].c_str(), &fa, &attr, argv.data(),
                          envp.data());
     posix_spawnattr_destroy(&attr);
@@ -521,6 +523,29 @@ bool Forwarder::spawn_router(std::string &err) {
         err = "posix_spawn: " + std::string(strerror(rc));
         return false;
     }
+    return true;
+}
+
+bool Forwarder::spawn_router(std::string &err) {
+    int port = free_loopback_port(err);
+    if (port <= 0)
+        return false;
+
+    // The APE runtime is what /proc/self/exe points at; it needs the APE
+    // file as its first argument, so the child command is
+    // <runtime> <ape> llama --server ...
+    std::vector<std::string> args = {
+        "/proc/self/exe",  // replaced by the resolved runtime path
+        ape_path,
+        "llama", "--server",
+        "--host", "127.0.0.1",
+        "--port", std::to_string(port),
+        "--models-max", std::to_string(cfg.max_loaded),
+        "--models-preset", ini_path,
+    };
+    pid_t pid;
+    if (!spawn_child(args, log_path, "llama", ape_path, pid, err))
+        return false;
     router_pid = (int)pid;
     router_port = port;
     serve_log("router child: pid=%d port=%d log=%s\n", (int)pid, port,
@@ -607,6 +632,222 @@ void Forwarder::stop() {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
     }
+}
+
+// ── The media forwarder ──────────────────────────────────────────────────
+
+bool MediaForwarder::init(const std::string &ape, const std::string &config,
+                          std::string &err) {
+    has_media = false;
+    for (const auto &m : cfg.models)
+        if (m.engine != EngineKind::Llama) {
+            has_media = true;
+            break;
+        }
+    if (!has_media)
+        return true;
+    ape_path = ape;
+    config_path = config;
+    // The same <pid> work dir the router child uses (created by whoever
+    // gets here first; both tolerate EEXIST).
+    work_dir = "/tmp/chimerafile-serve-" + std::to_string((long)getpid());
+    if (mkdir(work_dir.c_str(), 0700) != 0 && errno != EEXIST) {
+        err = "cannot create " + work_dir;
+        return false;
+    }
+    log_path = work_dir + "/media.log";
+    return true;
+}
+
+bool MediaForwarder::spawn_media(std::string &err) {
+    int port = free_loopback_port(err);
+    if (port <= 0)
+        return false;
+
+    // The child re-parses the same config file; --host/--port override its
+    // listen entry, so no generated config is needed.
+    std::vector<std::string> args = {
+        "/proc/self/exe",  // replaced by the resolved runtime path
+        ape_path,
+        "media",
+        "--host", "127.0.0.1",
+        "--port", std::to_string(port),
+        "--config", config_path,
+    };
+    pid_t pid;
+    if (!spawn_child(args, log_path, "media", ape_path, pid, err))
+        return false;
+    media_pid = (int)pid;
+    media_port = port;
+    serve_log("media child: pid=%d port=%d log=%s\n", (int)pid, port,
+              log_path.c_str());
+    return true;
+}
+
+bool MediaForwarder::media_healthy() const {
+    if (media_port.load() <= 0)
+        return false;
+    UpstreamConn c;
+    std::string err;
+    if (!loopback_open("GET", "/health", "", media_port.load(), 5, c, err))
+        return false;
+    return c.status == 200;
+}
+
+bool MediaForwarder::wait_healthy(long timeout_s) {
+    for (long t = 0; t < timeout_s * 2; t++) {
+        if (media_healthy())
+            return true;
+        if (media_pid.load() > 0 &&
+            waitpid((pid_t)media_pid.load(), nullptr, WNOHANG) > 0)
+            return false;  // the child is gone
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+    return false;
+}
+
+bool MediaForwarder::respawn_media() {
+    std::lock_guard<std::mutex> lk(mu);
+    if (media_pid.load() > 0) {
+        int st = 0;
+        bool alive = kill((pid_t)media_pid.load(), 0) == 0;
+        waitpid((pid_t)media_pid.load(), &st, WNOHANG);  // reap if dead
+        if (alive)
+            return media_healthy();  // up but maybe wedged: report as-is
+    }
+    long now = (long)time(nullptr);
+    // Bounded respawns: at most five in any five-minute window; past that
+    // the child stays down until the window has passed.
+    if (respawns >= 5 && now - last_respawn < 300)
+        return false;
+    std::string err;
+    if (!spawn_media(err)) {
+        serve_log("media respawn failed: %s\n", err.c_str());
+        return false;
+    }
+    respawns++;
+    last_respawn = now;
+    serve_log("media child respawned\n");
+    return wait_healthy(60);
+}
+
+bool MediaForwarder::start(std::string &err) {
+    if (!has_media)
+        return true;
+    std::string serr;
+    if (!spawn_media(serr)) {
+        err = "media child: " + serr;
+        return false;
+    }
+    if (!wait_healthy(60)) {
+        err = "media child did not become healthy (log: " + log_path + ")";
+        return false;
+    }
+    running = true;
+    return true;
+}
+
+void MediaForwarder::stop() {
+    if (!has_media)
+        return;
+    running = false;
+    if (media_pid.load() > 0) {
+        kill((pid_t)media_pid.load(), SIGTERM);
+        int st = 0;
+        for (int i = 0; i < 100; i++) {
+            if (waitpid((pid_t)media_pid.load(), &st, WNOHANG) > 0)
+                break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+}
+
+void MediaForwarder::forward(const std::string &path, const std::string &body,
+                             const std::string &content_type,
+                             httplib::Response &res) {
+    if (!has_media) {
+        send_error(res, 502, "server_error", "media_unavailable",
+                   "no media child (the config has no media models)");
+        return;
+    }
+    UpstreamConn c;
+    std::string err;
+    // The child loads the model on first use (on its main thread), so the
+    // request can sit for a long time, like a chat completion.
+    if (!loopback_open("POST", path, body, media_port.load(), 600, c, err,
+                       content_type)) {
+        if (!respawn_media() ||
+            !loopback_open("POST", path, body, media_port.load(), 600, c, err,
+                           content_type)) {
+            send_error(res, 502, "server_error", "media_unavailable",
+                       "the media child is not available");
+            return;
+        }
+    }
+    std::string out = c.read_all();
+    res.status = c.status;
+    res.set_content(
+        out,
+        c.content_type.empty() ? "application/json" : c.content_type);
+}
+
+nlohmann::json MediaForwarder::status() const {
+    nlohmann::json out = nlohmann::json::object();
+    if (!has_media || media_port.load() <= 0)
+        return out;
+    UpstreamConn c;
+    std::string err;
+    if (!loopback_open("GET", "/v1/status", "", media_port.load(), 10, c, err) ||
+        c.status != 200)
+        return out;
+    nlohmann::json body = try_parse(c.read_all());
+    if (!body.is_object())
+        return out;
+    out["queue"] = body.value("queue", nlohmann::json::object());
+    out["resident"] = body.value("resident", nlohmann::json::array());
+    return out;
+}
+
+bool MediaForwarder::preload(const ModelEntry &e, std::string &err) {
+    UpstreamConn c;
+    std::string oerr;
+    if (!loopback_open("POST", "/v1/residency/" + e.id, "",
+                       media_port.load(), 600, c, oerr)) {
+        if (!respawn_media() ||
+            !loopback_open("POST", "/v1/residency/" + e.id, "",
+                           media_port.load(), 600, c, oerr)) {
+            err = "the media child is not available";
+            return false;
+        }
+    }
+    if (c.status == 200)
+        return true;
+    nlohmann::json body = try_parse(c.read_all());
+    err = body.is_object() && body.contains("error")
+              ? body["error"].value("message", std::string("preload failed"))
+              : std::string("preload failed");
+    return false;
+}
+
+bool MediaForwarder::unload(const ModelEntry &e, std::string &err) {
+    UpstreamConn c;
+    std::string oerr;
+    if (!loopback_open("POST", "/v1/residency/" + e.id + "/unload", "",
+                       media_port.load(), 60, c, oerr)) {
+        if (!respawn_media() ||
+            !loopback_open("POST", "/v1/residency/" + e.id + "/unload", "",
+                           media_port.load(), 60, c, oerr)) {
+            err = "the media child is not available";
+            return false;
+        }
+    }
+    if (c.status == 200)
+        return true;
+    nlohmann::json body = try_parse(c.read_all());
+    err = body.is_object() && body.contains("error")
+              ? body["error"].value("message", std::string("unload failed"))
+              : std::string("unload failed");
+    return false;
 }
 
 // One GET /v1/models from the router, reduced to what the front half

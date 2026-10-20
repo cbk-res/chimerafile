@@ -1,10 +1,9 @@
-// The llama forwarder.  One upstream router child (llama.cpp router mode)
-// owns the model fleet -- spawn, readiness, crash respawns of the model
-// children, proxying -- and this file owns the front half: it spawns that
-// router child with a generated --models-preset, forwards the llama API to
-// it, and carries the llama side of residency (TTL, pins, capacity
-// admission).  Media engines never come here; they stay on serve.cpp's
-// in-process pump.
+// The children of the serve layer.  One upstream router child (llama.cpp
+// router mode) owns the llama fleet -- spawn, readiness, crash respawns of
+// the model children, proxying -- and one media child (chimerafile media)
+// owns the whisper / diffusion / transcribe engines.  This file owns the
+// front half for both: it spawns the children, proxies the API to them, and
+// carries the llama side of residency (TTL, pins, capacity admission).
 
 #ifndef CHIMERAFILE_SERVE_FORWARD_H
 #define CHIMERAFILE_SERVE_FORWARD_H
@@ -107,6 +106,67 @@ private:
     void sweep_loop();
     static bool write_preset_ini(const Config &cfg, const std::string &path,
                                  std::string &err);
+};
+
+// The media forwarder: the media child (chimerafile media) hosts the
+// whisper / diffusion / transcribe engines on its own main thread; this
+// owns the process that talks to it -- spawn, readiness, crash respawns,
+// and the verbatim relay of the /v1/audio/* and /v1/images/* requests
+// (the child re-parses the same config file and is the authority on
+// validation).  Mirrors the llama forwarder; the shared spawn machinery
+// lives in serve_forward.cpp.
+struct MediaForwarder {
+    explicit MediaForwarder(const Config &c) : cfg(c) {}
+
+    bool active() const { return has_media && running.load(); }
+
+    // No-op (and success) when the config has no media models.  `ape` is
+    // argv[0] of the serve process; `config` the config file path the
+    // child re-parses.  Called from Server::start() before the port is
+    // bound.
+    bool init(const std::string &ape, const std::string &config,
+              std::string &err);
+
+    // Spawn the media child and wait for it to answer /health.  No-op
+    // (and success) with no media models.
+    bool start(std::string &err);
+    void stop();
+
+    // Relay one request to the child verbatim (path, body, Content-Type)
+    // and copy the child's response (status, Content-Type, body) back.
+    // On a dead child: respawn, retry once; still dead -> 502
+    // media_unavailable.
+    void forward(const std::string &path, const std::string &body,
+                 const std::string &content_type, httplib::Response &res);
+
+    // /v1/status merge inputs: the child's queue and resident rows (live
+    // fetch).  Empty object when the child is absent or down.
+    nlohmann::json status() const;
+
+    // Residency controls for media models (route: /v1/residency/...).
+    bool preload(const ModelEntry &e, std::string &err);
+    bool unload(const ModelEntry &e, std::string &err);
+
+private:
+    const Config &cfg;
+
+    bool has_media = false;
+    std::string ape_path;
+    std::string config_path;
+    std::string work_dir;      // shared with the router child: <pid> dir
+    std::string log_path;
+    std::atomic<int> media_port{0};
+    std::atomic<int> media_pid{0};
+    int respawns = 0;           // auto-respawns in the last quarantine window
+    long last_respawn = 0;
+
+    std::mutex mu;              // media_pid/port and respawn bookkeeping
+    std::atomic<bool> running{false};
+
+    bool spawn_media(std::string &err);
+    bool media_healthy() const;
+    bool wait_healthy(long timeout_s);
+    bool respawn_media();
 };
 
 } // namespace serve
