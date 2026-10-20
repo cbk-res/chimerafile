@@ -16,19 +16,19 @@ diff --git a/tools/server/server-models.cpp b/tools/server/server-models.cpp
 +    if (!bin_path.empty() &&
 +        ((app_cmd != nullptr && app_cmd[0] != '\0') ||
 +         (app_path != nullptr && app_path[0] != '\0'))) {
-+        auto it = args.begin() + 1;
 +        // APE-style runtimes resolve the payload from a file passed as the
 +        // first argument, not from argv[0]; LLAMA_APP_PATH carries that path.
-+        if (app_path != nullptr && app_path[0] != '\0') {
-+            args.insert(it, app_path);
-+            ++it;
-+        }
++        // One range-insert: a second insert() would leave the position
++        // dangling if the first one reallocated the vector.
++        std::vector<std::string> prefix;
++        if (app_path != nullptr && app_path[0] != '\0')
++            prefix.push_back(app_path);
 +        if (app_cmd != nullptr && app_cmd[0] != '\0') {
-+            args.insert(it, app_cmd);
-+            ++it;
++            prefix.push_back(app_cmd);
 +            // the dispatch default is combined chat+server; force server mode
-+            args.insert(it, "--server");
++            prefix.push_back("--server");
 +        }
++        args.insert(args.begin() + 1, prefix.begin(), prefix.end());
      }
  }
  
