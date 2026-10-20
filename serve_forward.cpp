@@ -874,6 +874,17 @@ void MediaForwarder::sweep_loop() {
         nlohmann::json st = status();
         if (!st.is_object() || !st.contains("resident"))
             continue;
+        // A respawned child may run a newer APE than this serve (an upgrade
+        // in flight): name the skew once instead of failing on it.
+        if (st.contains("version") && st["version"].is_string()) {
+            std::string v = st["version"].get<std::string>();
+            if (v != CHIMERAFILE_VERSION_STRING && v != warned_version) {
+                warned_version = v;
+                serve_log("media child runs chimerafile %s, this serve is %s; "
+                          "restart serve to align them\n",
+                          v.c_str(), CHIMERAFILE_VERSION_STRING);
+            }
+        }
         nlohmann::json rows = st.value("resident", nlohmann::json::array());
         std::lock_guard<std::mutex> lk(status_mu);
         resident_cache = rows;

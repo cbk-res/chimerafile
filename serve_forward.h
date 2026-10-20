@@ -191,6 +191,9 @@ private:
     mutable std::mutex status_mu;
     nlohmann::json resident_cache;
     std::thread sweeper;
+    // The child version the upgrade-skew warning was already printed for
+    // (sweeper-only, no lock needed).
+    std::string warned_version;
 
     bool spawn_media(std::string &err);
     bool media_healthy() const;

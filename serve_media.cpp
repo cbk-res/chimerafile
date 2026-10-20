@@ -1228,6 +1228,9 @@ struct MediaServer {
             out["listen"] = cfg.host + ":" + std::to_string(cfg.port);
             out["key"] = false;  // the child gates no key; serve does
             out["uptime_s"] = (long)(time(nullptr) - start_at);
+            // serve compares it against its own build and warns once on a
+            // mismatch (a respawned child after an APE upgrade).
+            out["version"] = CHIMERAFILE_VERSION_STRING;
             out["queue"] = residency.queue_json();
             out["resident"] = residency.resident_json();
             res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
