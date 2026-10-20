@@ -75,6 +75,40 @@ up to one sweep even when the GPU is already free — the request is retried
 and goes through. Best-effort by design; with `--gpu off` the lease does
 nothing at all.
 
+### Thinking models can come back with an empty `content`
+
+A thinking model spends `max_tokens` on reasoning first. When the budget
+runs out inside the thinking, the reply is a 200 with an empty `content`
+and the reasoning itself in the message's `reasoning_content` field. In the
+v0.4 gauntlet, six of twelve turns came back that way with `max_tokens=320`;
+the same question answered on the first try once the budget allowed for
+thinking (mellum can burn several thousand tokens of it). Budget
+`max_tokens` for thinking plus answer, and read `reasoning_content` if you
+care where the budget went.
+
+## GPU and memory budgets
+
+### Fixed-VRAM GPUs have no spill
+
+The memory budget for a serve is the GPU's *local* memory: there is no
+fallback to system RAM. A mellum-class model at 131k context (Q5_K_M weights
+plus the full KV cache) sits at about 7.1G resident, and flash-attn working
+buffers on top of that. On an 8G eGPU (Vega 64) that is within reach of the
+wall: a 96k-token prefill wedged the card (a child died mid-tensor-upload in
+`ggml_vk_wait_for_fence` — fence error, uncaught exception, core dump — and
+the eGPU dropped off the bus until a reboot; the in-flight request got a
+clean 500, the service itself stayed up). The child logs were lost in the
+reboot, so the exact failing allocation is unconfirmed, but the budget math
+points at the 8G wall, and no media model fits alongside such a model on 8G
+in any case. If a serve targets a fixed-VRAM card, size the config so
+weights + KV + the largest concurrent generation fit inside it.
+
+### iGPUs with shared memory are the easy case
+
+On an iGPU (e.g. AMD 780M) the "VRAM" is system RAM, so the budget is the
+machine's RAM (24G here) and mellum at 131k plus every media model fits
+comfortably. This is the intended deployment shape.
+
 ## APE and builds
 
 ### A Vulkan build without `glslc` is silently CPU-only
