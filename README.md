@@ -2,7 +2,11 @@
 
 [![build](https://github.com/cbk-res/chimerafile/actions/workflows/build.yml/badge.svg)](https://github.com/cbk-res/chimerafile/actions/workflows/build.yml)
 
-A unified inference binary that combines **llamafile** (LLM), **whisperfile** (speech-to-text), **diffusionfile** (stable-diffusion.cpp image/video generation), and **transcribefile** (transcribe.cpp speech-to-text) into a single [APE](https://justine.lol/ape.html) executable, while making zero changes to the upstream source.
+One inference binary for four engines: **llamafile** (LLM), **whisperfile**
+(speech-to-text), **diffusionfile** (stable-diffusion.cpp image/video
+generation) and **transcribefile** (transcribe.cpp speech-to-text), packed
+into a single [APE](https://justine.lol/ape.html) executable without changing
+any upstream source.
 
 ```
 ./chimerafile llama      [llamafile args...]
@@ -11,7 +15,13 @@ A unified inference binary that combines **llamafile** (LLM), **whisperfile** (s
 ./chimerafile transcribe [transcribefile args...]
 ```
 
-All engines share one **llama.cpp GGML runtime** (whisper, stable-diffusion.cpp and transcribe.cpp are all compiled against it), reducing duplication for projects that would otherwise bundle several standalone 'llamafiles'. GPU backends (Vulkan, CUDA, ROCm, Metal) are bundled as `.so` files inside the APE and loaded at runtime.
+All four engines run on **llama.cpp's GGML** runtime, so a project that would
+otherwise bundle several standalone 'llamafiles' ships one binary instead.
+GPU backends (Vulkan, CUDA, ROCm, Metal) ride along as `.so` files inside the
+APE and load at runtime.
+
+The fine print — engine quirks, APE constraints and the workarounds baked
+into the binary — lives in [quirks.md](quirks.md).
 
 ---
 
@@ -147,20 +157,66 @@ Chat completions carry the model child's own per-request `timings` object (the u
 
 ### How it runs
 
-- Llama models run behind an upstream router child: serve spawns one `llama-server` router per port (a generated `--models-preset` names the fleet) and forwards the llama API to it. The router owns model spawning, loading, queueing and crash respawns; serve keeps the front half — admission against `max_loaded_models`, TTL eviction, pins, and the status merge. The first request for a model waits for its load, and concurrent requests for a full fleet get a retryable 503.
-- Media engines (whisper, diffusion, transcribe) run in a media child process: a config with media models makes serve spawn a second child (`chimerafile media`) and forward `/v1/audio/*`, `/v1/images/*` and (when `sdcpp` is enabled) `/sdcpp/*` to it. The child keeps the single-pump discipline of the in-process days — loads, inference and unloads run on its main thread, because in this APE only the thread that dlopen'd the host engine libraries has a working host-glibc TLS state — so the first request for a model waits for its load and concurrent media jobs queue behind it; interactive work (transcription) takes a fast lane ahead of queued image generations. A crashed media child is respawned on the next request (bounded: five in any five-minute window) and that request is retried once.
-- GPU lease: with a GPU in play, model loads are serialised across the two children — while one child is loading a model, the other defers starting its own loads with a retryable 503 `model_loading` (`Retry-After: 5`). The other side's state is polled (the router snapshot every 1 s, the media child's `/v1/status` every 5 s), so the lease is coarse and best-effort, with a false-positive window of up to one sweep; with `--gpu off` it is a complete no-op.
-- No orphans: the APE runtime swallows PDEATHSIG, so every child carries its own parent-death watcher instead — when serve dies (hard kill, crash), each child notices within about a second and shuts down through its own SIGTERM path, and the tree cascades: the router takes its model children down with it. A launcher that kills the whole process group (systemd `KillMode=control-group`, job control) takes everything down immediately.
-- KV retention is the child's own: it keeps prompt tokens in its KV cache between requests (unified cache, matched by content), so a prompt that repeats a previous prefix only prefills the new tail (clients like opencode resend the whole conversation each turn); the cache never clears on its own, and each model has its own child and its own cache.
-- Diffusion models get a fresh engine context per request: the pinned stable-diffusion.cpp cannot run a second generation on the same context, so each image request pays a few seconds of model load.
-- Streaming caveat: `stop` strings are checked by llama.cpp at token boundaries, so a stream can overshoot a stop string by the rest of the token the match landed inside.
-- Tool calling is the child's: the template renders the tool schemas into the prompt and carries a PEG parser for its tool-call markup, so replies come back as structured `tool_calls` (in non-streaming responses and as streaming deltas alike) and the raw markup never leaks into `content`. The serve side only validates the request shape before forwarding (`tools` must be an array, `tool_choice` a string or an object of type `none`/`function`).
-- A prompt that does not fit the model's context — alone, or together with `max_tokens` — is a client error: 400 `context_length_exceeded` before the reply starts. In streaming mode the 400 arrives before the first chunk, not mid-stream.
-- `temperature` and `prompt` on `/v1/audio/transcriptions` are whisper-only: whisper.cpp has both, transcribe.cpp has neither, and the server passes down only what the engine supports.
-- Image generation takes the OpenAI fields `prompt`, `size` (`WxH`), `n` (1–4), `seed`, `response_format` (`b64_json` default | `url`, returned as a `data:` URL) plus the chimerafile extensions `negative_prompt`, `steps` and `cfg_scale` — all optional.
-- The `sdcpp` block mirrors the native API of stable-diffusion.cpp's own server (`/sdcpp/v1/*`) so clients pointed at an sd.cpp server work unchanged: `img_gen` jobs (txt2img, img2img via `init_image` + `strength`, hires upscale, batches of up to 8) with the upstream's async poll/cancel semantics, request field names and response shapes. What the mirror does not expose: video, control images, reference images, loras, vae tiling, and `mask_image` (rejected with a 400 — the pinned engine's mask path corrupts memory in this APE, with or without the serve layer).
+- **Llama models run behind an upstream router child.** Serve spawns one
+  `llama-server` router (a generated `--models-preset` names the fleet) and
+  forwards the llama API to it. The router owns model spawning, loading,
+  queueing and crash respawns; serve keeps the front half — admission
+  against `max_loaded_models`, TTL eviction, pins, and the status merge. The
+  first request for a model waits for its load; a request for a full fleet
+  gets a retryable 503.
+- **Media engines run in a media child.** A config with media models makes
+  serve spawn a second child (`chimerafile media`) and forward
+  `/v1/audio/*`, `/v1/images/*` and — when `sdcpp` is enabled — `/sdcpp/*` to
+  it. Loads, inference and unloads run serially on the child's main thread,
+  because in this APE only the thread that dlopen'd the engine libraries has
+  a working host-glibc TLS state. The first request for a model waits for its
+  load; concurrent media jobs queue behind it, with interactive transcription
+  taking a fast lane ahead of queued image generations. A crashed media child
+  is respawned on the next request (bounded: five in any five-minute window),
+  and that request is retried once.
+- **GPU lease.** With a GPU in play, model loads are serialised across the
+  two children: while one is loading a model, the other defers its own loads
+  with a retryable 503 `model_loading` (`Retry-After: 5`). The other side's
+  state is polled (router snapshot every 1 s, the media child's
+  `/v1/status` every 5 s), so the lease is coarse and best-effort —
+  [quirks.md](quirks.md). With `--gpu off` it is a complete no-op.
+- **No orphans.** The APE runtime swallows PDEATHSIG, so every child carries
+  its own parent-death watcher: when serve dies (hard kill, crash), each child
+  notices within about a second and shuts down through its own SIGTERM path,
+  the router taking its model children with it. A launcher that kills the
+  whole process group (systemd `KillMode=control-group`, job control) takes
+  everything down at once.
+- **KV retention is the child's.** The router keeps prompt tokens in its KV
+  cache between requests (unified cache, matched by content), so a prompt
+  that repeats an earlier prefix only prefills the new tail — clients like
+  opencode resend the whole conversation each turn. The cache never clears on
+  its own, and each model has its own child and its own cache.
+- **Tool calling is the child's.** The template renders the tool schemas into
+  the prompt and carries a PEG parser for its tool-call markup, so replies
+  come back as structured `tool_calls` — in non-streaming responses and
+  streaming deltas alike — with no raw markup in `content`. Serve only
+  validates the request shape before forwarding (`tools` must be an array,
+  `tool_choice` a string or an object of type `none`/`function`).
+- **Context overflow is a client error.** A prompt that does not fit the
+  model's context — alone, or together with `max_tokens` — is a 400
+  `context_length_exceeded` before the reply starts (before the first chunk in
+  streaming mode). Prompts that provably cannot fit are rejected by serve
+  before they are forwarded; the rest are the child's own 400. The reasoning
+  and the small residual window are in [quirks.md](quirks.md).
+- **Image generation fields.** `/v1/images/generations` takes the OpenAI
+  fields `prompt`, `size` (`WxH`), `n` (1–4), `seed`, `response_format`
+  (`b64_json` default | `url`, returned as a `data:` URL), plus the
+  chimerafile extensions `negative_prompt`, `steps` and `cfg_scale` — all
+  optional.
+- **The sdcpp surface.** The `sdcpp` block mirrors the native API of
+  stable-diffusion.cpp's own server (`/sdcpp/v1/*`), so clients pointed at an
+  sd.cpp server work unchanged: `img_gen` jobs (txt2img, img2img via
+  `init_image` + `strength`, hires upscale, batches of up to 8) with the
+  upstream async poll/cancel semantics, field names and response shapes. What
+  the mirror does not expose is in [quirks.md](quirks.md).
 
-An end-to-end smoke test of the whole surface lives at `scripts/serve-smoke-test.py` (standard library only):
+An end-to-end smoke test of the whole surface lives at
+`scripts/serve-smoke-test.py` (standard library only):
 
 ```sh
 python3 scripts/serve-smoke-test.py \
@@ -218,50 +274,9 @@ is actually self-contained — no hipBLAS installation needed, and the resulting
 
 Each produces a `.so` that gets zipaligned into the APE automatically.
 
-**Vulkan gotcha:** the shader compiler `glslc` must be on your `PATH` (or set
-`GLSLC=/path/to/glslc`) — with neither available, `vulkan.sh` fails *silently*
-and the build continues with a CPU-only APE. If you installed the SDK to a
-non-standard prefix, also export `VULKAN_SDK=/prefix/usr` so the SPIR-V
-headers are found (e.g. from unpacked F44 RPMs:
-`VULKAN_SDK=/tmp/vulksdk/root/usr GLSLC=/tmp/vulksdk/root/usr/bin/glslc`).
-
-### Troubleshooting: "Vulkan is not usable" on SELinux Fedora
-
-On SELinux-enforcing Fedora you may see:
-
-```
-fatal error: --gpu vulkan was explicitly requested but Vulkan is not usable
-on this system
-```
-
-even though `vulkaninfo` lists your GPU. This is a host policy issue, not a
-build issue. Cosmopolitan's `cosmo_dlopen` runs the host `ld-linux`
-in-process; its loader zero-fills a page of the mapped loader before making
-it executable, and SELinux's `file_mprotect` hook then requires the
-`execmod` permission on the loader's file type. Fedora's policy grants
-`unconfined_t` `execmod` on `user_home_t`/`user_tmp_t` but **not** on
-`ld_so_t` (`/lib64`), so the `mprotect` fails with EACCES and the probe
-aborts.
-
-Workaround: relocate the loader into `$HOME` (type `user_home_t`) and point
-the cached `dlopen-helper` at it — the APE reuses the helper when it is newer
-than the binary. This repo ships the fixer at
-`scripts/fix-cosmo-dlopen-selinux.sh` (no root needed); run it after
-rebuilding the APE if the error returns.
-
-### Diffusion (Vulkan) segfault at image save — fixed in the APE
-
-A `--gpu vulkan` diffusion run used to complete generation ("generate_image
-completed") then segfault in the host loader's `_dl_fixup` while writing the
-PNG. Cause: `cosmo_dlopen` runs the host `ld-linux` in-process, and the host
-glibc initialises its **brk-based** heap from the process brk — which sits at
-the base of this APE's own reserved heap arena. Under sustained allocation
-(the 2.7 GB SD model + Vulkan driver) the two heap managers interleave in the
-same region and corrupt each other, destroying the loader's `link_map`. The
-dispatcher now calls the host `mallopt(M_MMAP_THRESHOLD, 0)` right after a GPU
-backend loads, routing every host-glibc allocation through `mmap` and keeping
-it out of the shared brk region. Nothing to do — it's built in.
-
+Two build-time Vulkan gotchas — a silently CPU-only APE when `glslc` is
+missing, and the "Vulkan is not usable" error on SELinux Fedora — are in
+[quirks.md](quirks.md).
 
 ---
 
@@ -380,11 +395,9 @@ However, this has not yet been tested within chimerafile itself.
 - **v0.2** — diffusion image generation (custom stable-diffusion.cpp backend, GPU compat shim)
 - **v0.2.99** — diffusion Vulkan save-crash fix (host glibc heap routed via mmap); transcribe ported onto the shared GGML — all four engines GPU-capable from one backend
 - **v0.3** — aligned with llamafile v0.10.6: upstream diffusionfile pattern, transcribe engine, CI builds the pinned submodule
-- **v0.4** — `chimerafile serve`: OpenAI-compatible server over all four engines (declarative config, TTL residency, serial execution)
-- **v0.5** — llama path moved behind an upstream router child (one router per serve, front-side admission, TTL/pins kept); media engines still in-process
-- **v0.6** — media engines moved behind a media child process (serve is now a thin router over the router child and the media child); GPU lease serialises model loads across the two children
+- **v0.4** — `chimerafile serve`: the OpenAI-compatible server over all four engines — declarative config, TTL residency, the llama path behind an upstream router child, the media engines behind a media child (serve is a thin front over the two), the GPU lease, the sdcpp mirror surface and transcribe on the transcriptions endpoint
 
-## License
+## Licence
 
 This project is provided under the GNU General Public License version 3 (GPLv3), and does not include code sourced directly from Mozilla's llamafile, nor is this project associated with such.
 
