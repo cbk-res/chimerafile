@@ -75,6 +75,8 @@
 #include "chat.h"
 #include <nlohmann/json.hpp>
 #include <cpp-httplib/httplib.h>
+#include "serve_common.h"
+#include "serve_forward.h"
 #include "whisper.h"
 #include "stable-diffusion.h"
 #include "transcribe.h"
@@ -106,58 +108,10 @@
 
 namespace serve {
 
-enum class EngineKind { Llama, Whisper, Diffusion, Transcribe };
-
-inline const char *engine_name(EngineKind e) {
-    switch (e) {
-        case EngineKind::Llama:      return "llama";
-        case EngineKind::Whisper:    return "whisper";
-        case EngineKind::Diffusion:  return "diffusion";
-        case EngineKind::Transcribe: return "transcribe";
-    }
-    return "?";
-}
-
-// Engine defaults: the user-facing contract is 30 min for LLMs, 5 min for
-// everything else.
-inline int default_ttl(EngineKind e) {
-    return e == EngineKind::Llama ? 1800 : 300;
-}
-
-struct ModelEntry {
-    std::string id;
-    EngineKind engine = EngineKind::Llama;
-    std::string file;       // resolved
-    int ctx = 4096;         // llama
-    int gpu_layers = -1;    // llama
-    bool ctx_set = false;
-    bool gpu_set = false;
-    int ttl = -1;           // idle seconds; -1 = engine default, 0 = never
-    bool pinned = false;
-    std::vector<std::string> args;
-
-    int effective_ttl() const { return ttl < 0 ? default_ttl(engine) : ttl; }
-};
-
-struct Config {
-    std::string host = "127.0.0.1";
-    int port = 8080;
-    std::string key;                 // empty = no auth
-    std::vector<ModelEntry> models;
-
-    const ModelEntry *find(const std::string &id) const {
-        for (const auto &m : models)
-            if (m.id == id) return &m;
-        return nullptr;
-    }
-};
+// The shared types (EngineKind, ModelEntry, Config) live in
+// serve_common.h; the llama forwarder in serve_forward.h.
 
 // ── Helpers ──────────────────────────────────────────────────────────────
-
-static std::string to_lower(std::string s) {
-    for (char &c : s) c = (char)tolower((unsigned char)c);
-    return s;
-}
 
 // Standard base64 (RFC 4648), for OpenAI's b64_json image responses.
 static std::string b64_encode(const std::string &in) {
@@ -273,6 +227,15 @@ inline bool parse_config(const char *path, Config &cfg, std::string &err) {
         cfg.key = j["key"].get<std::string>();
     }
 
+    if (j.contains("max_loaded_models")) {
+        if (!j["max_loaded_models"].is_number_integer() ||
+            j["max_loaded_models"].get<int>() < 1) {
+            err = "max_loaded_models must be an integer >= 1";
+            return false;
+        }
+        cfg.max_loaded = j["max_loaded_models"].get<int>();
+    }
+
     if (!j.contains("models") || !j["models"].is_object() || j["models"].empty()) {
         err = "config must contain a non-empty 'models' object";
         return false;
@@ -295,6 +258,36 @@ inline bool parse_config(const char *path, Config &cfg, std::string &err) {
         if (!parse_engine(v["engine"].get<std::string>(), m.engine)) {
             err = "models." + m.id + ": unknown engine '" + v["engine"].get<std::string>() + "'";
             return false;
+        }
+
+        if (v.contains("alias_of")) {
+            if (!v["alias_of"].is_string() ||
+                v["alias_of"].get<std::string>().empty()) {
+                err = "models." + m.id + ": 'alias_of' must be a non-empty string";
+                return false;
+            }
+            if (m.engine != EngineKind::Llama) {
+                err = "models." + m.id + ": alias_of is only valid for llama models";
+                return false;
+            }
+            m.alias_of = v["alias_of"].get<std::string>();
+        }
+        if (m.is_alias()) {
+            // an alias shares its primary's file, engine and args; the
+            // entry carries only the id and alias_of
+            cfg.models.push_back(std::move(m));
+            continue;
+        }
+
+        // Llama ids become sections of the generated --models-preset file
+        // and travel in request bodies, so keep them to a safe alphabet.
+        if (m.engine == EngineKind::Llama) {
+            for (char c : m.id)
+                if (!isalnum((unsigned char)c) && c != '-' && c != '_') {
+                    err = "models." + m.id +
+                          ": llama model ids may only contain letters, digits, '-' and '_'";
+                    return false;
+                }
         }
 
         if (!v.contains("file") || !v["file"].is_string() ||
@@ -360,6 +353,36 @@ inline bool parse_config(const char *path, Config &cfg, std::string &err) {
         cfg.models.push_back(std::move(m));
     }
 
+    for (const auto &m : cfg.models) {
+        if (!m.is_alias())
+            continue;
+        const ModelEntry *t = cfg.find(m.alias_of);
+        if (!t) {
+            err = "models." + m.id + ": alias_of points to unknown model '" +
+                  m.alias_of + "'";
+            return false;
+        }
+        if (t->engine != EngineKind::Llama || t->is_alias()) {
+            err = "models." + m.id + ": alias_of must name a (non-alias) llama model";
+            return false;
+        }
+    }
+
+    // Pins must fit in the capacity, or the server would thrash from the
+    // first request.
+    {
+        int pinned = 0;
+        for (const auto &m : cfg.models)
+            if (m.engine == EngineKind::Llama && !m.is_alias() && m.pinned)
+                pinned++;
+        if (pinned > cfg.max_loaded) {
+            err = "max_loaded_models (" + std::to_string(cfg.max_loaded) +
+                  ") is below the number of pinned llama models (" +
+                  std::to_string(pinned) + ")";
+            return false;
+        }
+    }
+
     return true;
 }
 
@@ -373,12 +396,13 @@ inline bool parse_config(const char *path, Config &cfg, std::string &err) {
 // engine internals.  Models load on first use and unload after an idle TTL
 // (or on eviction when a bigger model doesn't fit).
 
-static void serve_log(const char *fmt, ...) {
+void serve_log(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     fprintf(stderr, "serve: ");
     vfprintf(stderr, fmt, ap);
     fputc('\n', stderr);
+    fflush(stderr);
     va_end(ap);
 }
 
@@ -569,706 +593,6 @@ static void unload_engine(PhysModel &p) {
     if (p.tmodel) { transcribe_model_free(p.tmodel); p.tmodel = nullptr; }
 }
 
-// ── Chat generation (llama) ──────────────────────────────────────────────
-//
-// One OpenAI chat completion, built entirely from official llama.cpp
-// client machinery: OpenAI messages in through
-// common_chat_msgs_parse_oaicompat, the model's chat template applied
-// through common_chat_templates_apply, sampling through a common_sampler
-// built from the config's engine args (which llama.cpp's own CLI parser
-// interpreted at load time) with the request's sampling fields applied
-// on top.  In this APE the generation must run on the process' main
-// thread (see Residency below), so run_chat is executed by the pump
-// through an InferJob; the HTTP workers only parse the request, wait,
-// and serialize the response.
-
-struct ChatRequest {
-    nlohmann::ordered_json messages;
-    float temperature = -1.0f;  // < 0 = not set in the request
-    float top_p = -1.0f;
-    int top_k = -1;
-    int max_tokens = 0;         // 0 = as many as the context allows
-    bool stream = false;
-    bool seed_set = false;
-    uint32_t seed = 0;
-    std::vector<std::string> stop;
-    std::vector<common_chat_tool> tools;  // parsed by the engine's own parser
-    common_chat_tool_choice tool_choice = COMMON_CHAT_TOOL_CHOICE_AUTO;
-    bool parallel_tool_calls = false;
-    bool parallel_tool_calls_set = false;  // absent -> the template decides
-};
-
-static bool parse_chat_request(const nlohmann::ordered_json &body,
-                               ChatRequest &out, std::string &err) {
-    if (!body.contains("messages") || !body["messages"].is_array() ||
-        body["messages"].empty()) {
-        err = "'messages' must be a non-empty array";
-        return false;
-    }
-    out.messages = body["messages"];
-    if (body.contains("temperature") && body["temperature"].is_number())
-        out.temperature = body["temperature"].get<float>();
-    if (body.contains("top_p") && body["top_p"].is_number())
-        out.top_p = body["top_p"].get<float>();
-    if (body.contains("top_k") && body["top_k"].is_number())
-        out.top_k = body["top_k"].get<int>();
-    if (body.contains("max_tokens") && body["max_tokens"].is_number())
-        out.max_tokens = body["max_tokens"].get<int>();
-    if (body.contains("max_completion_tokens") &&
-        body["max_completion_tokens"].is_number())
-        out.max_tokens = body["max_completion_tokens"].get<int>();
-    if (body.contains("stream") && body["stream"].is_boolean())
-        out.stream = body["stream"].get<bool>();
-    if (body.contains("seed") && body["seed"].is_number()) {
-        out.seed = body["seed"].get<uint32_t>();
-        out.seed_set = true;
-    }
-    if (body.contains("stop")) {
-        if (body["stop"].is_string())
-            out.stop.push_back(body["stop"].get<std::string>());
-        else if (body["stop"].is_array())
-            for (const auto &s : body["stop"])
-                if (s.is_string())
-                    out.stop.push_back(s.get<std::string>());
-    }
-    if (body.contains("n") && body["n"].is_number() && body["n"].get<int>() != 1) {
-        err = "'n' > 1 is not supported";
-        return false;
-    }
-    // Tools go through the engine's own parsers, so bad input fails here
-    // (400) instead of inside the model.
-    try {
-        if (body.contains("tools")) {
-            if (!body["tools"].is_array()) {
-                err = "'tools' must be an array";
-                return false;
-            }
-            out.tools = common_chat_tools_parse_oaicompat(body["tools"]);
-        }
-        if (body.contains("tool_choice")) {
-            const auto &tc = body["tool_choice"];
-            std::string choice;
-            if (tc.is_string()) {
-                choice = tc.get<std::string>();
-            } else if (tc.is_object()) {
-                // OpenAI's object form: {"type": "none"} or
-                // {"type": "function", ...}.  A named function maps to
-                // "required" -- the template parser cannot pin the name.
-                const auto type = tc.value("type", std::string());
-                if (type == "none")
-                    choice = "none";
-                else if (type == "function")
-                    choice = "required";
-                else {
-                    err = "'tool_choice' object must have type "
-                          "'none' or 'function'";
-                    return false;
-                }
-            } else {
-                err = "'tool_choice' must be a string or object";
-                return false;
-            }
-            out.tool_choice = common_chat_tool_choice_parse_oaicompat(choice);
-        }
-        if (body.contains("parallel_tool_calls") &&
-            body["parallel_tool_calls"].is_boolean()) {
-            out.parallel_tool_calls = body["parallel_tool_calls"].get<bool>();
-            out.parallel_tool_calls_set = true;
-        }
-    } catch (const std::exception &e) {
-        err = e.what();
-        return false;
-    }
-    return true;
-}
-
-struct GenResult {
-    bool ok = false;
-    std::string err;
-    bool bad_request = false;  // client's fault (400, not 500)
-    std::string text;
-    int prompt_tokens = 0;
-    int completion_tokens = 0;
-    std::string finish;  // "stop" | "length" | "tool_calls"
-    nlohmann::ordered_json tool_calls;  // OpenAI format; null unless a tool was called
-    std::string tool_content;           // content with the tool-call markup stripped
-    std::string reasoning_content;      // thinking block extracted by the parser
-    std::string parsed_content;         // parsed content (no thinking, no markup)
-    bool parsed = false;                // true if a strict parse succeeded
-    double prompt_seconds = 0.0;        // wall time of the prompt decode
-    double generation_seconds = 0.0;    // wall time of the token loop
-};
-
-// One piece of a streaming reply: clean content, the reasoning delta,
-// and/or one entry of the tool_calls delta.
-struct GenDelta {
-    std::string content;
-    std::string reasoning;
-    nlohmann::ordered_json tool_call;  // null unless set
-};
-
-// OpenAI-style tool call id for calls the template parser left
-// anonymous (llama-server generates these the same way).
-static std::string gen_tool_call_id() {
-    static std::mt19937 rng(std::random_device{}());
-    static const char hex[] = "0123456789abcdef";
-    std::uniform_int_distribution<int> d(0, 15);
-    std::string id = "call_";
-    for (int i = 0; i < 24; i++)
-        id += hex[d(rng)];
-    return id;
-}
-
-// The model closes an assistant turn with the template's role marker
-// (ChatML: "<|im_end|>").  The tool-call PEG grammar ends right behind the
-// closing call tag and then demands end of input, so the marker and the
-// newlines the model emits before it are trailing junk to the non-partial
-// parse.  Remove one trailing marker, with the whitespace around it.
-static void strip_assistant_turn_end(std::string &s, const std::string &marker) {
-    auto ws = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
-    auto rtrim = [&] { while (!s.empty() && ws(s.back())) s.pop_back(); };
-    rtrim();
-    if (!marker.empty() && s.size() >= marker.size() &&
-        s.compare(s.size() - marker.size(), marker.size(), marker) == 0) {
-        s.erase(s.size() - marker.size());
-        rtrim();
-    }
-}
-
-// JSON-schema-to-grammar, which builds the template's output parser, rejects
-// a `pattern` unless it is anchored with ^...$.  Tool schemas from editors
-// and MCP servers often carry unanchored ones anyway, and a single bad
-// schema fails the whole request; drop the offending keys.  Returns how many
-// were removed.
-static int strip_unanchored_patterns(nlohmann::ordered_json &node) {
-    int n = 0;
-    if (node.is_object()) {
-        auto it = node.find("pattern");
-        if (it != node.end() && it->is_string()) {
-            const std::string &p = it->get_ref<const std::string &>();
-            if (p.size() < 2 || p.front() != '^' || p.back() != '$') {
-                node.erase(it);
-                n++;
-            }
-        }
-        for (auto &el : node)
-            n += strip_unanchored_patterns(el);
-    } else if (node.is_array()) {
-        for (auto &el : node)
-            n += strip_unanchored_patterns(el);
-    }
-    return n;
-}
-
-// Apply the fix-up above to each tool's parameter schema (a JSON string).
-static int sanitize_tool_schemas(std::vector<common_chat_tool> &tools) {
-    int n = 0;
-    for (auto &t : tools) {
-        if (t.parameters.empty())
-            continue;
-        nlohmann::ordered_json schema =
-            nlohmann::ordered_json::parse(t.parameters, nullptr, false);
-        if (schema.is_discarded())
-            continue;
-        int stripped = strip_unanchored_patterns(schema);
-        if (stripped) {
-            t.parameters = schema.dump(
-                -1, ' ', false, nlohmann::json::error_handler_t::replace);
-            n += stripped;
-        }
-    }
-    return n;
-}
-
-// The template renders the tool schemas into the prompt and carries
-// the PEG parser for the reply's tool-call markup.  Const with respect
-// to the template, so a request thread may preflight while a
-// generation runs on the main thread.
-static bool apply_chat_template(PhysModel &p, const ChatRequest &req,
-                                common_chat_params &chat, std::string &err,
-                                bool log_stripped) {
-    common_chat_templates_inputs in;
-    in.messages = common_chat_msgs_parse_oaicompat(req.messages);
-    in.tools = req.tools;
-    in.tool_choice = req.tool_choice;
-    // Have the parser extract the model's thinking block into
-    // reasoning_content; the markers are derived from the template.
-    in.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
-    // As in llama-server: when the client omits the field, the template's
-    // own capability decides (its grammar may allow only one call).
-    in.parallel_tool_calls =
-        req.parallel_tool_calls_set
-            ? req.parallel_tool_calls
-            : common_chat_templates_get_caps(p.chat_tmpl.get())
-                  .at("supports_parallel_tool_calls");
-    int patterns_stripped = sanitize_tool_schemas(in.tools);
-    try {
-        chat = common_chat_templates_apply(p.chat_tmpl.get(), in);
-    } catch (const std::exception &e) {
-        err = std::string("chat template failed: ") + e.what();
-        return false;
-    }
-    if (patterns_stripped && log_stripped)
-        serve_log("tools: stripped %d unanchored schema pattern(s)\n",
-                  patterns_stripped);
-    return true;
-}
-
-static std::string ctx_overflow_msg(int n_prompt, int max_tokens, int n_ctx) {
-    std::string m = "prompt is " + std::to_string(n_prompt) + " tokens";
-    if (max_tokens > 0)
-        m += ", plus max_tokens " + std::to_string(max_tokens);
-    m += ", which exceeds the model's context (" + std::to_string(n_ctx) +
-         " tokens)";
-    return m;
-}
-
-// Must run on the process' main thread: the host-compiled GPU backend
-// only has working host-glibc malloc state there.  on_delta receives
-// each decoded piece (content, reasoning, or one tool-call delta);
-// returning false aborts the generation early (e.g. the client went
-// away).
-static GenResult run_chat(PhysModel &p, const ChatRequest &req,
-                          const std::function<bool(const GenDelta &)> &on_delta,
-                          const std::function<void(const GenResult &)> &on_preflight =
-                              nullptr) {
-    GenResult out;
-    // The streaming worker waits for the overflow check to finish before it
-    // may open the stream (the HTTP status is fixed at 200 once it does), so
-    // the verdict is reported exactly once, no matter how this returns.
-    bool preflight_reported = false;
-    auto report_preflight = [&]() {
-        if (on_preflight && !preflight_reported) {
-            preflight_reported = true;
-            on_preflight(out);
-        }
-    };
-    struct PreflightGuard {
-        std::function<void()> fn;
-        ~PreflightGuard() { fn(); }
-    } preflight_guard{[&]() { report_preflight(); }};
-    auto *model = p.init->model();
-    auto *ctx = p.init->context();
-    auto *vocab = llama_model_get_vocab(model);
-    if (!p.chat_tmpl) {
-        out.err = "model has no chat template";
-        return out;
-    }
-
-    // Candidate end-of-turn markers, most specific first: the model's own
-    // end-of-turn token, its end-of-sentence token, then the marker this
-    // ChatML template closes assistant turns with.
-    auto token_text = [&](llama_token t) -> std::string {
-        if (t < 0)
-            return {};
-        const char *text = llama_vocab_get_text(vocab, t);
-        return text ? std::string(text) : std::string();
-    };
-    std::vector<std::string> turn_end_markers;
-    for (llama_token t : { llama_vocab_eot(vocab), llama_vocab_eos(vocab) }) {
-        std::string m = token_text(t);
-        if (!m.empty())
-            turn_end_markers.push_back(m);
-    }
-    turn_end_markers.push_back("<|im_end|>");
-
-    // Per-request sampler: the config's engine args with the OpenAI
-    // sampling fields applied on top.  The chat template is applied
-    // first: when tools are present it generates the tool-call grammar,
-    // which the sampler must receive at construction to constrain the
-    // output.  That is what keeps "auto" calls on format and forces a
-    // call under tool_choice "required" (or a named function).
-    common_chat_params chat;
-    if (!apply_chat_template(p, req, chat, out.err, true)) {
-        return out;
-    }
-
-    common_params_sampling sp = p.cparams.sampling;
-    if (req.temperature >= 0.0f) sp.temp = req.temperature;
-    if (req.top_p >= 0.0f) sp.top_p = req.top_p;
-    if (req.top_k >= 0) sp.top_k = req.top_k;
-    if (req.seed_set) sp.seed = req.seed;
-    if (!chat.grammar.empty()) {
-        sp.grammar = common_grammar(COMMON_GRAMMAR_TYPE_TOOL_CALLS,
-                                   chat.grammar);
-        sp.grammar_lazy = chat.grammar_lazy;
-        sp.grammar_triggers = chat.grammar_triggers;
-        sp.generation_prompt = chat.generation_prompt;
-    }
-    struct common_sampler *gs = nullptr;
-    try {
-        gs = common_sampler_init(model, sp);
-    } catch (const std::exception &e) {
-        out.err = std::string("failed to initialize the sampler: ") + e.what();
-        return out;
-    }
-    if (!gs) {
-        out.err = "failed to initialize the sampler";
-        return out;
-    }
-
-    int32_t n_prompt = llama_tokenize(vocab, chat.prompt.data(),
-                                      (int32_t)chat.prompt.size(), nullptr, 0,
-                                      true, false);
-    if (n_prompt < 0)
-        n_prompt = -n_prompt;
-    int n_ctx = (int)llama_n_ctx(ctx);
-    if (n_prompt > n_ctx ||
-        (req.max_tokens > 0 && n_prompt + req.max_tokens > n_ctx)) {
-        out.bad_request = true;
-        out.err = ctx_overflow_msg(n_prompt, req.max_tokens, n_ctx);
-        common_sampler_free(gs);
-        return out;
-    }
-    report_preflight();  // fits in the context: the stream may open
-    std::vector<llama_token> prompt_tokens(n_prompt);
-    llama_tokenize(vocab, chat.prompt.data(), (int32_t)chat.prompt.size(),
-                   prompt_tokens.data(), n_prompt, true, false);
-    out.prompt_tokens = n_prompt;
-
-    // Warm continuation: the KV cache still holds the previous request's
-    // conversation -- its prompt plus the reply.  The longest prefix this
-    // prompt shares with it is already prefilled: a client like opencode
-    // resends the whole conversation every turn, a retry resends the same
-    // prompt, and a follow-up on the same context shares the start.  Only
-    // the rest needs decoding.  The stale tail (if any) is dropped so the
-    // new tokens land right after the shared prefix: positions track
-    // themselves, and a nullptr pos appends at the cache's end.
-    size_t n_warm = 0;
-    {
-        const size_t n_max = std::min(p.chat_cache.size(),
-                                      (size_t)n_prompt);
-        while (n_warm < n_max &&
-               p.chat_cache[n_warm] == prompt_tokens[n_warm]) {
-            n_warm++;
-        }
-    }
-    if (n_warm < p.chat_cache.size() &&
-        !llama_memory_seq_rm(llama_get_memory(ctx), 0,
-                             (llama_pos)n_warm, -1)) {
-        // The memory could not be truncated; cold start from scratch.
-        llama_memory_clear(llama_get_memory(ctx), false);
-        n_warm = 0;
-    }
-
-    // Decode the prompt tail in batches.
-    auto t_prompt = std::chrono::steady_clock::now();
-    const int n_batch = llama_n_batch(ctx);
-    for (size_t i = n_warm; i < (size_t)n_prompt; i += (size_t)n_batch) {
-        const int n = std::min(n_batch, (int)((size_t)n_prompt - i));
-        if (llama_decode(ctx, llama_batch_get_one(prompt_tokens.data() + i, n)) != 0) {
-            out.err = "failed to decode the prompt";
-            llama_memory_clear(llama_get_memory(ctx), false);
-            p.chat_cache.clear();
-            common_sampler_free(gs);
-            return out;
-        }
-    }
-    out.prompt_seconds =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                      t_prompt)
-            .count();
-    std::vector<llama_token> gen_tokens;  // what this request appends
-
-    // Incremental reply parse: the template's own PEG parser turns the
-    // raw output into clean content, reasoning, and structured tool-call
-    // deltas as they arrive.  When the parser loses the output mid-reply
-    // (the model went off-format), it keeps returning what it has: the
-    // unparsed tail simply produces no deltas, and no raw markup ever
-    // reaches the client.  If it cannot follow the reply from the very
-    // first token, the generation is reported as failed.
-    common_chat_parser_params pp(chat);
-    if (!chat.parser.empty())
-        pp.parser.load(chat.parser);
-    common_chat_msg msg_prv;
-    std::vector<std::string> tc_ids;
-    std::string gen_text;
-    bool aborted = false;
-    auto emit = [&](const GenDelta &d) {
-        if (d.content.empty() && d.reasoning.empty() && d.tool_call.is_null())
-            return;
-        if (!on_delta(d))
-            aborted = true;
-    };
-
-    // Tool-call deltas are not forwarded as they arrive: the incremental
-    // parser emits the arguments byte by byte, and a small model can cut
-    // a call off mid-arguments (an invalid escape in a shell command, a
-    // dropped "name" field).  A call whose arguments are not a complete
-    // JSON object is useless to the client -- and clients like opencode
-    // execute it anyway, surface the parse error, and feed the broken
-    // markup back into the next prompt.  Buffer each call and forward it
-    // only once complete and valid; drop it otherwise.
-    struct PendingCall {
-        std::string id;
-        std::string name;
-        std::string arguments;
-        bool done = false;  // forwarded or dropped
-    };
-    std::vector<PendingCall> pending_calls;
-    auto flush_calls = [&](size_t before_index) {
-        for (size_t i = 0; i < pending_calls.size() && i < before_index; ++i) {
-            auto &c = pending_calls[i];
-            if (c.done)
-                continue;
-            c.done = true;
-            bool valid = !c.id.empty() && !c.name.empty();
-            if (valid && !c.arguments.empty()) {
-                auto a = nlohmann::json::parse(c.arguments, nullptr, false);
-                valid = !a.is_discarded() && a.is_object();
-            }
-            if (!valid) {
-                serve_log("stream: dropped incomplete tool call %zu "
-                          "(%zu argument chars)\n",
-                          i, c.arguments.size());
-                continue;
-            }
-            GenDelta piece;
-            piece.tool_call["index"] = (int)i;
-            piece.tool_call["id"] = c.id;
-            piece.tool_call["type"] = "function";
-            nlohmann::ordered_json fn;
-            fn["name"] = c.name;
-            if (!c.arguments.empty())
-                fn["arguments"] = c.arguments;
-            piece.tool_call["function"] = fn;
-            emit(piece);
-        }
-    };
-
-    // Generate: sample, accept, emit, decode, repeat.  The sampler takes the
-    // batch-token index of the last decoded token; -1 is the last output row,
-    // which is the right one both after the prompt batch (only its final
-    // token has logits) and after each 1-token generation batch.
-    int max_tokens = req.max_tokens > 0 ? req.max_tokens
-                                        : (int)llama_n_ctx(ctx) - n_prompt;
-    auto t_gen = std::chrono::steady_clock::now();
-    for (int i = 0; i < max_tokens; i++) {
-        llama_token tok = common_sampler_sample(gs, ctx, -1);
-        common_sampler_accept(gs, tok, true);
-        if (llama_vocab_is_eog(vocab, tok)) {
-            out.finish = "stop";
-            break;
-        }
-        char buf[1024];
-        int n = llama_token_to_piece(vocab, tok, buf, (int32_t)sizeof buf, 0, false);
-        if (n < 0) {
-            out.err = "failed to decode a response token";
-            p.chat_cache = prompt_tokens;
-            p.chat_cache.insert(p.chat_cache.end(), gen_tokens.begin(),
-                                gen_tokens.end());
-            common_sampler_free(gs);
-            return out;
-        }
-        out.text.append(buf, n);
-        out.completion_tokens++;
-        gen_text.append(buf, n);
-        try {
-            auto msg_new = common_chat_parse(gen_text, true, pp);
-            msg_new.set_tool_call_ids(tc_ids, gen_tool_call_id);
-            auto diffs = common_chat_msg_diff::compute_diffs(msg_prv, msg_new);
-            msg_prv = std::move(msg_new);
-            for (const auto &d : diffs) {
-                if (d.tool_call_index != std::string::npos) {
-                    size_t idx = d.tool_call_index;
-                    // A new call starts: forward the earlier ones
-                    // first (they are complete by now).
-                    flush_calls(idx);
-                    while (pending_calls.size() <= idx)
-                        pending_calls.emplace_back();
-                    auto &c = pending_calls[idx];
-                    if (!d.tool_call_delta.id.empty())
-                        c.id = d.tool_call_delta.id;
-                    if (!d.tool_call_delta.name.empty())
-                        c.name = d.tool_call_delta.name;
-                    c.arguments += d.tool_call_delta.arguments;
-                    continue;
-                }
-                if (d.content_delta.empty() && d.reasoning_content_delta.empty())
-                    continue;
-                // Text after a call means the call is finished:
-                // forward it (if valid) before the text.
-                flush_calls(~size_t(0));
-                GenDelta piece;
-                piece.content = d.content_delta;
-                piece.reasoning = d.reasoning_content_delta;
-                emit(piece);
-            }
-        } catch (const std::exception &e) {
-            // The reply deviates from the template's format from its very
-            // first token -- the parser could not follow any prefix.
-            // Report the failure instead of sending raw markup.
-            serve_log("parse: %s\n", e.what());
-            out.err = e.what();
-            break;
-        }
-        if (aborted) {
-            p.chat_cache = prompt_tokens;
-            p.chat_cache.insert(p.chat_cache.end(), gen_tokens.begin(),
-                                gen_tokens.end());
-            break;  // client went away
-        }
-        bool stopped = false;
-        for (const auto &s : req.stop) {
-            if (!s.empty() && out.text.size() >= s.size() &&
-                out.text.compare(out.text.size() - s.size(), s.size(), s) == 0) {
-                out.text.erase(out.text.size() - s.size());
-                stopped = true;
-                break;
-            }
-        }
-        if (stopped) {
-            out.finish = "stop";
-            p.chat_cache = prompt_tokens;
-            p.chat_cache.insert(p.chat_cache.end(), gen_tokens.begin(),
-                                gen_tokens.end());
-            break;
-        }
-        gen_tokens.push_back(tok);
-        if (llama_decode(ctx, llama_batch_get_one(&tok, 1)) != 0) {
-            out.err = "failed to decode a response token";
-            llama_memory_clear(llama_get_memory(ctx), false);
-            p.chat_cache.clear();
-            common_sampler_free(gs);
-            return out;
-        }
-    }
-    out.generation_seconds =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_gen)
-            .count();
-    // Forward any complete buffered tool call before the final parse.
-    flush_calls(~size_t(0));
-    // Final parse: the reply's tool-call markup becomes structured
-    // tool_calls, and the content keeps everything else (thinking inline).
-    // Two failure modes bracket this parse:
-    //   * the incremental parse stalled mid-reply (the unparsed tail was
-    //     never streamed), but a successful strict parse here can still
-    //     yield structured tool_calls -- keep them, losing them would be
-    //     worse.
-    //   * the reverse: the incremental parse already emitted complete
-    //     tool-call deltas (the client saw them) and the strict parse
-    //     then fails on trailing junk before EOG -- fall back to that last
-    //     good message rather than reporting "stop" with no tool_calls.
-    {
-        auto to_oai = [](const std::vector<common_chat_tool_call> &tcs) {
-            nlohmann::ordered_json arr = nlohmann::ordered_json::array();
-            for (const auto &tc : tcs)
-                arr.push_back({
-                    {"id", tc.id},
-                    {"type", "function"},
-                    {"function", {
-                        {"name", tc.name},
-                        {"arguments", tc.arguments},
-                    }},
-                });
-            return arr;
-        };
-        // Usable = a name, an id, and arguments that are a JSON object
-        // (or empty).  A call the stream cut off mid-arguments is not.
-        auto complete = [](const std::vector<common_chat_tool_call> &tcs) {
-            for (const auto &tc : tcs) {
-                if (tc.name.empty() || tc.id.empty())
-                    return false;
-                if (tc.arguments.empty())
-                    continue;
-                auto a = nlohmann::json::parse(tc.arguments, nullptr, false);
-                if (a.is_discarded() || !a.is_object())
-                    return false;
-            }
-            return true;
-        };
-        bool strict_ok = false;
-        common_chat_msg reply;
-        try {
-            reply = common_chat_parse(out.text, false, pp);
-            strict_ok = true;
-        } catch (const std::exception &) {
-            // The model trailed the reply with whitespace the grammar
-            // (which ends at end-of-input) does not expect: drop it and
-            // parse once more.
-            std::string ws_trimmed = out.text;
-            while (!ws_trimmed.empty() &&
-                   std::isspace((unsigned char)ws_trimmed.back()))
-                ws_trimmed.pop_back();
-            if (!ws_trimmed.empty() && ws_trimmed != out.text) {
-                try {
-                    reply = common_chat_parse(ws_trimmed, false, pp);
-                    strict_ok = true;
-                } catch (const std::exception &) {
-                    // the whitespace was not the problem
-                }
-            }
-            if (!strict_ok) {
-                // The model spelled its turn-end role marker out as text
-                // after the tool-call markup.  The grammar ends right
-                // behind the closing call tag and then demands end of
-                // input, so the marker (and the newlines the model
-                // emitted before it) broke the parse: drop it and parse
-                // once more.
-                for (const auto &marker : turn_end_markers) {
-                    std::string trimmed = out.text;
-                    strip_assistant_turn_end(trimmed, marker);
-                    if (trimmed == out.text)
-                        continue;  // marker was not there
-                    try {
-                        reply = common_chat_parse(trimmed, false, pp);
-                        strict_ok = true;
-                        break;
-                    } catch (const std::exception &) {
-                        // not this marker either; the fallback below still
-                        // runs
-                    }
-                }
-            }
-        }
-        if (strict_ok) {
-            // reuse the incremental id cache so the ids match the ones
-            // the streaming deltas already emitted
-            reply.set_tool_call_ids(tc_ids, gen_tool_call_id);
-            out.parsed = true;
-            out.parsed_content = reply.content;
-            out.reasoning_content = reply.reasoning_content;
-            if (!reply.tool_calls.empty()) {
-                out.tool_calls = to_oai(reply.tool_calls);
-                out.tool_content = reply.content;
-                out.finish = "tool_calls";
-            }
-        }
-        if (!strict_ok && out.tool_calls.is_null() &&
-            !msg_prv.tool_calls.empty() && complete(msg_prv.tool_calls)) {
-            out.tool_calls = to_oai(msg_prv.tool_calls);
-            out.tool_content = msg_prv.content;
-            out.parsed = true;
-            out.parsed_content = msg_prv.content;
-            out.reasoning_content = msg_prv.reasoning_content;
-            out.finish = "tool_calls";
-        } else if (!strict_ok && out.tool_calls.is_null()) {
-            // The parser could not follow the reply (garbled role markers,
-            // a broken tool call) and no usable message was captured.
-            // Report the failure rather than sending raw markup as
-            // content.
-            if (out.err.empty())
-                out.err = "the model produced output that does not match "
-                          "the expected chat format";
-        }
-    }
-    if (!out.err.empty()) {
-        // The turn is unusable and the context now holds off-format
-        // tokens: invalidate the warm cache so the next request prefills
-        // from scratch.
-        llama_memory_clear(llama_get_memory(ctx), false);
-        p.chat_cache.clear();
-        common_sampler_free(gs);
-        return out;
-    }
-    if (out.finish.empty())
-        out.finish = "length";
-    out.ok = true;
-    p.chat_cache = prompt_tokens;
-    p.chat_cache.insert(p.chat_cache.end(), gen_tokens.begin(), gen_tokens.end());
-    common_sampler_free(gs);
-    return out;
-}
 
 // ── Audio transcription (whisper + transcribe) ───────────────────────────
 //
@@ -1276,10 +600,9 @@ static GenResult run_chat(PhysModel &p, const ChatRequest &req,
 // 16 kHz mono float32 PCM -- the input format both speech engines accept
 // -- with miniaudio, then handed to the engine's own full-pass API
 // (whisper_full / transcribe_run); the segments come straight back out of
-// the engine and are reshaped into the requested response format.  As
-// with run_chat, the engine work runs on the main thread through an
-// EngineJob; the HTTP worker only decodes the upload, waits, and
-// serializes the response.
+// the engine and are reshaped into the requested response format.  The
+// engine work runs on the main thread through an EngineJob; the HTTP
+// worker only decodes the upload, waits, and serializes the response.
 
 struct TranscribeResult {
     bool ok = false;
@@ -1323,8 +646,8 @@ static bool decode_audio(const std::string &data, std::vector<float> &pcm) {
     return ok && frames_read > 0;
 }
 
-// Run one transcription on a loaded model (main thread only, like
-// run_chat).  pcm is 16 kHz mono float32, as decode_audio produces.
+// Run one transcription on a loaded model (main thread only).  pcm is 16
+// kHz mono float32, as decode_audio produces.
 static TranscribeResult run_transcribe(PhysModel &p,
                                        const std::vector<float> &pcm,
                                        const std::string &language,
@@ -1466,7 +789,7 @@ struct ImageResult {
     std::vector<Img> images;
 };
 
-// Run one generation on a loaded model (main thread only, like run_chat).
+// Run one generation on a loaded model (main thread only).
 // edit is the decoded input image for image edits (nullptr = text-to-image).
 static ImageResult run_image(PhysModel &p, const std::string &prompt,
                              const std::string &negative, int w, int h,
@@ -1594,20 +917,6 @@ struct EngineJob {
 
 // Per-streaming-chat state shared between the pump (producing pieces)
 // and the content provider (draining them to the client).
-struct StreamState {
-    std::mutex mu;
-    std::condition_variable cv;
-    std::deque<GenDelta> pieces;     // pump -> provider
-    bool consumer_gone = false;      // the provider gave up (client gone)
-    bool run_finished = false;       // run_chat returned
-    GenResult result;                // valid once `run_finished`
-    // Overflow-check verdict, reported from the main thread before
-    // generation so the worker can still fail with a 400 before the
-    // first chunk.
-    bool preflight_done = false;
-    bool preflight_bad_request = false;
-    std::string preflight_err;
-};
 
 class Residency {
     Config &cfg;
@@ -1887,9 +1196,13 @@ public:
         return err.empty();
     }
 
+    // Media engines only: llama models never pass through the residency
+    // (their rows come from the forwarder's /v1/status merge).
     nlohmann::json resident_json() const {
         nlohmann::json arr = nlohmann::json::array();
         for (const auto &e : cfg.models) {
+            if (e.engine == EngineKind::Llama)
+                continue;
             auto p = find(e);
             nlohmann::json r;
             r["id"] = e.id;
@@ -2002,12 +1315,20 @@ struct Metrics {
     std::atomic<long long> prompt_seconds_ms{0};
     std::atomic<long long> generation_seconds_ms{0};
 
-    void record_chat(const GenResult &g) {
+    // Fed from the forwarder out of the child's own usage/timings fields
+    // (upstream shape: prompt_ms / predicted_ms).
+    void record_forward(const nlohmann::json &usage,
+                        const nlohmann::json &timings) {
         chat_requests++;
-        prompt_tokens += g.prompt_tokens;
-        generation_tokens += g.completion_tokens;
-        prompt_seconds_ms += (long long)(g.prompt_seconds * 1000.0);
-        generation_seconds_ms += (long long)(g.generation_seconds * 1000.0);
+        if (usage.is_object()) {
+            prompt_tokens += usage.value("prompt_tokens", 0);
+            generation_tokens += usage.value("completion_tokens", 0);
+        }
+        if (timings.is_object()) {
+            prompt_seconds_ms += (long long)timings.value("prompt_ms", 0.0);
+            generation_seconds_ms +=
+                (long long)timings.value("predicted_ms", 0.0);
+        }
     }
 };
 
@@ -2015,11 +1336,15 @@ struct Server {
     Config cfg;
     Residency residency;
     Metrics metrics;
+    Forwarder forwarder;
     httplib::Server http;
     time_t start_at = 0;
     std::thread http_thread;
+    std::string argv0;   // the APE file; the router child re-runs it
 
-    Server(Config c) : cfg(std::move(c)), residency(cfg) {}
+    Server(Config c, std::string a0)
+        : cfg(std::move(c)), residency(cfg), forwarder(cfg),
+          argv0(std::move(a0)) {}
 
     // OpenAI image generation + edits share one core: validate the model
     // (diffusion engine only), run the generation on the main thread
@@ -2209,7 +1534,11 @@ struct Server {
             res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
         });
 
-        // OpenAI: chat completions (llama engine models).
+        // OpenAI: chat completions (llama engine models).  The request is
+        // forwarded to the upstream router child as-is (the child owns the
+        // template, grammar, streaming and error semantics); the serve side
+        // validates the model, does capacity admission, and rewrites the
+        // reply's model id back to what the client asked for.
         http.Post("/v1/chat/completions",
                   [this](const httplib::Request &req, httplib::Response &res) {
             auto send_err = [](httplib::Response &res, int status,
@@ -2236,13 +1565,6 @@ struct Server {
                          "'model' is required");
                 return;
             }
-            ChatRequest cr;
-            std::string perr;
-            if (!parse_chat_request(body, cr, perr)) {
-                send_err(res, 400, "invalid_request_error", "invalid_request",
-                         perr);
-                return;
-            }
             const ModelEntry *e = cfg.find(body["model"].get<std::string>());
             if (!e) {
                 send_err(res, 404, "invalid_request_error", "model_not_found",
@@ -2257,270 +1579,7 @@ struct Server {
                          " engine, not llama");
                 return;
             }
-            std::string err;
-            auto p = residency.acquire(*e, err);
-            if (!p) {
-                send_err(res, 503, "server_error", "model_load_failed", err);
-                return;
-            }
-
-            std::string id = "chatcmpl-" + std::to_string(time(nullptr));
-            long created = (long)time(nullptr);
-
-            if (!cr.stream) {
-                auto job = std::make_shared<EngineJob>();
-                job->p = p;
-                GenResult g;
-                job->run = [p, &cr, &g] {
-                    g = run_chat(*p, cr, [](const GenDelta &) {
-                        return true;
-                    });
-                };
-                if (!residency.submit_engine(job)) {
-                    residency.release(*p);
-                    send_err(res, 503, "server_error", "server_busy",
-                             "server is shutting down");
-                    return;
-                }
-                {
-                    std::unique_lock<std::mutex> lk(job->mu);
-                    job->cv.wait(lk, [&] { return job->finished; });
-                }
-                if (!g.ok) {
-                    send_err(res, g.bad_request ? 400 : 500,
-                             g.bad_request ? "invalid_request_error"
-                                           : "server_error",
-                             g.bad_request ? "context_length_exceeded"
-                                           : "generation_failed",
-                             g.err);
-                    return;
-                }
-                nlohmann::json out;
-                out["id"] = id;
-                out["object"] = "chat.completion";
-                out["created"] = created;
-                out["model"] = e->id;
-                nlohmann::json choice;
-                choice["index"] = 0;
-                choice["message"]["role"] = "assistant";
-                if (g.tool_calls.is_null()) {
-                    choice["message"]["content"] =
-                        g.parsed ? g.parsed_content : g.text;
-                } else {
-                    choice["message"]["content"] = g.tool_content.empty()
-                        ? nlohmann::json(nullptr)
-                        : nlohmann::json(g.tool_content);
-                    choice["message"]["tool_calls"] = g.tool_calls;
-                }
-                if (!g.reasoning_content.empty())
-                    choice["message"]["reasoning_content"] =
-                        g.reasoning_content;
-                choice["finish_reason"] = g.finish;
-                out["choices"] = {choice};
-                out["usage"]["prompt_tokens"] = g.prompt_tokens;
-                out["usage"]["completion_tokens"] = g.completion_tokens;
-                out["usage"]["total_tokens"] =
-                    g.prompt_tokens + g.completion_tokens;
-                nlohmann::json timings;
-                timings["prompt_processing_s"] = g.prompt_seconds;
-                timings["generation_s"] = g.generation_seconds;
-                timings["total_s"] = g.prompt_seconds + g.generation_seconds;
-                if (g.completion_tokens > 0 && g.generation_seconds > 0.0)
-                    timings["tokens_per_second"] =
-                        g.completion_tokens / g.generation_seconds;
-                out["timings"] = timings;
-                metrics.record_chat(g);
-                res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
-                return;
-            }
-
-            // Streaming: Server-Sent Events via a chunked content provider.
-            // The generation runs on the main thread (pump); the provider
-            // only copies pieces to the client as they arrive.  An oversized
-            // prompt must still fail before the first chunk, as the HTTP
-            // status is fixed at 200 once streaming starts: the overflow
-            // check runs inside the job (run_chat) and its verdict is
-            // reported to this worker before the stream opens.
-            auto st = std::make_shared<StreamState>();
-            auto job = std::make_shared<EngineJob>();
-            job->p = p;
-            job->run = [st, p, cr] {
-                // The worker waits on this before it may open the stream;
-                // it carries the overflow-check verdict from the main thread.
-                auto on_preflight = [st](const GenResult &pr) {
-                    std::lock_guard<std::mutex> lk(st->mu);
-                    st->preflight_bad_request = pr.bad_request;
-                    st->preflight_err = pr.err;
-                    st->preflight_done = true;
-                    st->cv.notify_all();
-                };
-                {
-                    std::lock_guard<std::mutex> lk(st->mu);
-                    if (st->consumer_gone) {
-                        // the client went away before the run could start
-                        st->result.err = "client disconnected";
-                        st->run_finished = true;
-                        st->preflight_err = "client disconnected";
-                        st->preflight_done = true;
-                        st->cv.notify_all();
-                        return;
-                    }
-                }
-                auto on_delta = [st](const GenDelta &d) -> bool {
-                    std::unique_lock<std::mutex> lk(st->mu);
-                    // bounded queue: backpressure on the pump if the provider
-                    // is slow
-                    while (st->pieces.size() >= 256 && !st->consumer_gone)
-                        st->cv.wait(lk);
-                    if (st->consumer_gone)
-                        return false;
-                    st->pieces.push_back(d);
-                    st->cv.notify_all();
-                    return true;
-                };
-                st->result = run_chat(*p, cr, on_delta, on_preflight);
-                {
-                    std::lock_guard<std::mutex> lk(st->mu);
-                    st->run_finished = true;
-                    st->cv.notify_all();
-                }
-            };
-            if (!residency.submit_engine(job)) {
-                residency.release(*p);
-                send_err(res, 503, "server_error", "server_busy",
-                         "server is shutting down");
-                return;
-            }
-            // Wait for the overflow verdict; the pump releases the model
-            // when the job finishes, so the error paths here must not.
-            {
-                std::unique_lock<std::mutex> lk(st->mu);
-                st->cv.wait(lk, [&] { return st->preflight_done; });
-                if (!st->preflight_err.empty()) {
-                    if (st->preflight_bad_request) {
-                        send_err(res, 400, "invalid_request_error",
-                                 "context_length_exceeded",
-                                 st->preflight_err);
-                    } else {
-                        send_err(res, 500, "server_error",
-                                 "generation_failed", st->preflight_err);
-                    }
-                    return;
-                }
-            }
-            res.set_chunked_content_provider(
-                "text/event-stream",
-                [this, st, id, created, model_id = e->id](
-                    size_t, httplib::DataSink &sink) -> bool {
-                    auto chunk = [&](const nlohmann::json &delta,
-                                     const char *finish,
-                                     const nlohmann::json &extra =
-                                         nlohmann::json::object()) {
-                        nlohmann::json c;
-                        c["id"] = id;
-                        c["object"] = "chat.completion.chunk";
-                        c["created"] = created;
-                        c["model"] = model_id;
-                        nlohmann::json ch;
-                        ch["index"] = 0;
-                        ch["delta"] = delta;
-                        ch["finish_reason"] = finish
-                            ? nlohmann::json(finish)
-                            : nlohmann::json(nullptr);
-                        c["choices"] = {ch};
-                        if (!extra.empty())
-                            c.update(extra);
-                        std::string frame = "data: " + c.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) + "\n\n";
-                        return sink.write(frame.data(), frame.size());
-                    };
-                    auto gone = [&st] {
-                        std::lock_guard<std::mutex> lk(st->mu);
-                        st->consumer_gone = true;
-                        st->cv.notify_all();
-                    };
-                    if (!chunk({{"role", "assistant"}}, nullptr)) {
-                        gone();
-                        return true;  // client gone
-                    }
-                    bool ok = false;
-                    std::string finish;
-                    {
-                        std::unique_lock<std::mutex> lk(st->mu);
-                        for (;;) {
-                            if (!st->pieces.empty()) {
-                                GenDelta piece =
-                                    std::move(st->pieces.front());
-                                st->pieces.pop_front();
-                                lk.unlock();
-                                nlohmann::json d;
-                                if (!piece.content.empty())
-                                    d["content"] = std::move(piece.content);
-                                if (!piece.reasoning.empty())
-                                    d["reasoning_content"] =
-                                        std::move(piece.reasoning);
-                                if (!piece.tool_call.is_null())
-                                    d["tool_calls"] = {piece.tool_call};
-                                if (!d.empty() && !chunk(d, nullptr)) {
-                                    gone();
-                                    return true;  // client gone
-                                }
-                                lk.lock();
-                                continue;
-                            }
-                            if (st->run_finished) {
-                                ok = st->result.ok;
-                                finish = st->result.finish;
-                                break;
-                            }
-                            // a timeout so a stuck job cannot hang the
-                            // provider forever
-                            st->cv.wait_for(lk,
-                                            std::chrono::milliseconds(200));
-                        }
-                    }
-                    if (ok) {
-                        metrics.record_chat(st->result);
-                        nlohmann::json timings;
-                        timings["prompt_processing_s"] =
-                            st->result.prompt_seconds;
-                        timings["generation_s"] =
-                            st->result.generation_seconds;
-                        timings["total_s"] =
-                            st->result.prompt_seconds +
-                            st->result.generation_seconds;
-                        if (st->result.completion_tokens > 0 &&
-                            st->result.generation_seconds > 0.0)
-                            timings["tokens_per_second"] =
-                                st->result.completion_tokens /
-                                st->result.generation_seconds;
-                        chunk(nlohmann::json::object(), finish.c_str(),
-                              timings);
-                        std::string done = "data: [DONE]\n\n";
-                        sink.write(done.data(), done.size());
-                    } else {
-                        // The generation failed after the stream had started
-                        // (e.g. a decode error).  Tell the client instead of
-                        // just closing: a bare close makes OpenAI clients
-                        // report "stream ended without finish_reason".
-                        nlohmann::json err;
-                        err["error"]["message"] = st->result.err.empty()
-                            ? "generation failed" : st->result.err;
-                        err["error"]["type"] = st->result.bad_request
-                            ? "invalid_request_error" : "server_error";
-                        err["error"]["code"] = st->result.bad_request
-                            ? "context_length_exceeded" : "generation_failed";
-                        std::string frame =
-                            "data: " +
-                            err.dump(-1, ' ', false,
-                                     nlohmann::json::error_handler_t::replace) +
-                            "\n\n";
-                        sink.write(frame.data(), frame.size());
-                        serve_log("stream: generation failed: %s\n",
-                                  st->result.err.c_str());
-                    }
-                    sink.done();
-                    return true;
-                });
+            forwarder.handle_chat(res, *e, body);
         });
 
         // OpenAI: audio transcriptions (whisper + transcribe engines).
@@ -2840,9 +1899,9 @@ struct Server {
         });
 
         // Chimerafile extension: what is loaded, what is queued, how long
-        // the server has been up.
-        // Chimerafile extension: what is loaded, what is queued, how long
-        // the server has been up.
+        // the server has been up.  Resident rows merge the media engines'
+        // in-process state with the llama models' state from the router
+        // child (which also carries the model child's port).
         http.Get("/v1/status", [this](const httplib::Request &,
                                       httplib::Response &res) {
             nlohmann::json out;
@@ -2850,7 +1909,7 @@ struct Server {
             out["key"] = !cfg.key.empty();
             out["uptime_s"] = (long)(time(nullptr) - start_at);
             out["queue"] = residency.queue_json();
-            out["resident"] = residency.resident_json();
+            out["resident"] = resident_json();
             res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), "application/json");
         });
 
@@ -2895,7 +1954,7 @@ struct Server {
                   "Average generation throughput (process lifetime).",
                   gen_s > 0.0 ? metrics.generation_tokens.load() / gen_s
                               : 0.0);
-            for (const auto &r : residency.resident_json()) {
+            for (const auto &r : resident_json()) {
                 const std::string id = r["id"].get<std::string>();
                 gauge("chimerafile_model_state{model=\"" + id + "\"}",
                       "Model residency state: 0 unloaded, 1 loading, 2 loaded.",
@@ -2909,6 +1968,8 @@ struct Server {
         });
 
         // Chimerafile extensions: preload / explicit-unload controls.
+        // Llama models go through the forwarder (the router child loads and
+        // unloads them); media models use the in-process residency.
         http.Post(R"(^/v1/residency/([A-Za-z0-9_-]+)$)",
                   [this](const httplib::Request &req, httplib::Response &res) {
             const ModelEntry *e = cfg.find(req.matches[1].str());
@@ -2921,18 +1982,31 @@ struct Server {
                 return;
             }
             std::string err;
-            auto p = residency.acquire(*e, err);
-            if (!p) {
-                res.status = 503;
-                res.set_content(
-                    nlohmann::json({{"error", {{"message", err},
-                                               {"type", "server_error"},
-                                               {"code", "model_load_failed"}}}})
-                        .dump(-1, ' ', false, nlohmann::json::error_handler_t::replace),
-                    "application/json");
-                return;
+            if (e->engine == EngineKind::Llama) {
+                if (!forwarder.preload(*e, err)) {
+                    res.status = 503;
+                    res.set_content(
+                        nlohmann::json({{"error", {{"message", err},
+                                                   {"type", "server_error"},
+                                                   {"code", "model_load_failed"}}}})
+                            .dump(-1, ' ', false, nlohmann::json::error_handler_t::replace),
+                        "application/json");
+                    return;
+                }
+            } else {
+                auto p = residency.acquire(*e, err);
+                if (!p) {
+                    res.status = 503;
+                    res.set_content(
+                        nlohmann::json({{"error", {{"message", err},
+                                                   {"type", "server_error"},
+                                                   {"code", "model_load_failed"}}}})
+                            .dump(-1, ' ', false, nlohmann::json::error_handler_t::replace),
+                        "application/json");
+                    return;
+                }
+                residency.release(*p);  // keep it warm; the TTL clock starts now
             }
-            residency.release(*p);  // keep it warm; the TTL clock starts now
             nlohmann::json out;
             out["id"] = e->id;
             out["state"] = "loaded";
@@ -2951,7 +2025,10 @@ struct Server {
                 return;
             }
             std::string err;
-            if (!residency.unload(*e, err)) {
+            bool ok = e->engine == EngineKind::Llama
+                ? forwarder.unload(*e, err)
+                : residency.unload(*e, err);
+            if (!ok) {
                 res.status = 409;
                 out["state"] = "busy";
                 out["error"] = err;
@@ -2978,12 +2055,31 @@ struct Server {
         });
     }
 
+    // The /v1/status and /metrics rows: media engines from the in-process
+    // residency, llama models from the router child.
+    nlohmann::json resident_json() {
+        nlohmann::json out = residency.resident_json();
+        auto llama = forwarder.resident_json();
+        for (auto &r : llama)
+            out.push_back(std::move(r));
+        return out;
+    }
+
     // Binds the port (our single-instance guard) and starts the accept loop
     // on a background thread; the calling (main) thread then owns the model
     // lifecycle via residency.pump().  Returns false if the port could not
-    // be bound.
+    // be bound or the router child would not come up.
     bool start(std::string &err) {
         register_routes();
+        std::string ierr;
+        if (!forwarder.init(argv0, ierr)) {
+            err = ierr;
+            return false;
+        }
+        forwarder.record_chat = [this](const nlohmann::json &u,
+                                       const nlohmann::json &t) {
+            metrics.record_forward(u, t);
+        };
         start_at = time(nullptr);
         residency.start();
         fprintf(stderr, "serve: listening on http://%s:%d\n",
@@ -2994,17 +2090,25 @@ struct Server {
             residency.stop();
             return false;
         }
+        // the router child is up before any request can arrive
+        if (!forwarder.start(err)) {
+            residency.stop();
+            http.stop();
+            return false;
+        }
         http_thread = std::thread([this] { http.listen_after_bind(); });
         return true;
     }
 
     // Main thread, after the pump exits: stop the server and release every
-    // resident model.
+    // resident model, then let the router child (and with it the model
+    // children) go.
     void shutdown() {
         http.stop();
         if (http_thread.joinable())
             http_thread.join();
         residency.stop();
+        forwarder.stop();
     }
 };
 
@@ -3021,8 +2125,15 @@ static void print_serve_usage(FILE *f, const char *prog) {
 static void print_config_summary(const serve::Config &cfg) {
     fprintf(stderr, "serve: listen %s:%d\n", cfg.host.c_str(), cfg.port);
     fprintf(stderr, "serve: key %s\n", cfg.key.empty() ? "(none)" : "(set)");
+    fprintf(stderr, "serve: max_loaded_models %d\n", cfg.max_loaded);
     fprintf(stderr, "serve: models\n");
     for (const auto &m : cfg.models) {
+        if (m.is_alias()) {
+            fprintf(stderr, "  %-14s %-10s alias of %s\n",
+                    m.id.c_str(), serve::engine_name(m.engine),
+                    m.alias_of.c_str());
+            continue;
+        }
         fprintf(stderr, "  %-14s %-10s %s",
                 m.id.c_str(), serve::engine_name(m.engine), m.file.c_str());
         if (m.engine == serve::EngineKind::Llama) {
@@ -3079,7 +2190,9 @@ int serve_main(int argc, char **argv) {
     }
     print_config_summary(cfg);
 
-    serve::Server server(cfg);
+    // argv[0] is the APE file; the router child re-runs it through the
+    // APE runtime (/proc/self/exe).
+    serve::Server server(cfg, argv[0]);
     g_server = &server;
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);

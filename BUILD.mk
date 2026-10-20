@@ -93,7 +93,16 @@ o/$(MODE)/chimerafile/llama_dispatch.o: $(CHIMERAFILE_DIR)/llama_dispatch.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $(CHIMERAFILE_CPPFLAGS) -c -o $@ $<
 
-o/$(MODE)/chimerafile/serve.o: $(CHIMERAFILE_DIR)/serve.cpp
+# Header dependencies are stated explicitly: a layout change in a shared
+# header must force every including TU to rebuild (make has no -MMD here,
+# and a stale object mixed into the link silently corrupts object layout).
+o/$(MODE)/chimerafile/serve.o: $(CHIMERAFILE_DIR)/serve.cpp \
+	$(CHIMERAFILE_DIR)/serve_common.h $(CHIMERAFILE_DIR)/serve_forward.h
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) $(CHIMERAFILE_CPPFLAGS) -c -o $@ $<
+
+o/$(MODE)/chimerafile/serve_forward.o: $(CHIMERAFILE_DIR)/serve_forward.cpp \
+	$(CHIMERAFILE_DIR)/serve_common.h $(CHIMERAFILE_DIR)/serve_forward.h
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $(CHIMERAFILE_CPPFLAGS) -c -o $@ $<
 
@@ -307,6 +316,7 @@ CHIMERAFILE_OWN_OBJS := \
 	o/$(MODE)/chimerafile/chimerafile.o \
 	o/$(MODE)/chimerafile/llama_dispatch.o \
 	o/$(MODE)/chimerafile/serve.o \
+	o/$(MODE)/chimerafile/serve_forward.o \
 	$(CHIMERAFILE_CHECK_CPU_OBJ) \
 	$(CHIMERAFILE_WHISPER_OBJS)
 
