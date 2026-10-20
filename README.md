@@ -1,6 +1,8 @@
 # Chimerafile
 
-[![build](https://github.com/cbk-res/chimerafile/actions/workflows/build.yml/badge.svg)](https://github.com/cbk-res/chimerafile/actions/workflows/build.yml)
+![Build status](https://github.com/cbk-res/chimerafile/actions/workflows/build.yml/badge.svg)
+![Licence: GPL v3](https://img.shields.io/github/license/cbk-res/chimerafile)
+![Latest release](https://img.shields.io/github/v/release/cbk-res/chimerafile?label=latest%20release&include_prereleases)
 
 One inference binary for four engines: **llamafile** (LLM), **whisperfile**
 (speech-to-text), **diffusionfile** (stable-diffusion.cpp image/video
