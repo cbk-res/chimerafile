@@ -1,0 +1,110 @@
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -15,6 +15,7 @@
+ #include <limits>
+ #include <cstring>
+ #include <type_traits>
++#include <unordered_set>
+ 
+ json format_error_response(const std::string & message, const enum error_type type) {
+     std::string type_str;
+@@ -1151,6 +1152,88 @@
+     return n;
+ }
+ 
++// A JSON-schema node describes an "array of objects" when it is an array
++// whose items are objects (a missing "type" is inferred from "items").
++static bool schema_is_array_of_objects(const nlohmann::json & node) {
++    if (!node.is_object() || !node.contains("items")) {
++        return false;
++    }
++    if (node.contains("type") && node["type"] != "array") {
++        return false;
++    }
++    const nlohmann::json & items = node["items"];
++    if (!items.is_object()) {
++        return false;
++    }
++    if (items.contains("type")) {
++        return items["type"] == "object";
++    }
++    return items.contains("properties");
++}
++
++// Does this object schema carry a property that is an array of objects?
++static bool object_schema_has_array_of_objects(const nlohmann::json & node) {
++    if (!node.is_object() || !node.contains("properties")
++            || !node["properties"].is_object()) {
++        return false;
++    }
++    for (const auto & [name, prop] : node["properties"].items()) {
++        if (schema_is_array_of_objects(prop)
++                || (prop.is_object() && object_schema_has_array_of_objects(prop))) {
++            return true;
++        }
++    }
++    return false;
++}
++
++// True when the schema contains a doubly-nested array of objects: an array
++// of objects whose items themselves carry an array of objects (the shape of
++// the `question` tool schema).
++static bool schema_has_nested_array_of_objects(const nlohmann::json & schema) {
++    if (!schema.is_object() || !schema.contains("properties")
++            || !schema["properties"].is_object()) {
++        return false;
++    }
++    for (const auto & [name, prop] : schema["properties"].items()) {
++        if (schema_is_array_of_objects(prop)
++                && object_schema_has_array_of_objects(prop["items"])) {
++            return true;
++        }
++        if (prop.is_object() && schema_has_nested_array_of_objects(prop)) {
++            return true;
++        }
++    }
++    return false;
++}
++
++// The cosmo build corrupts the model child (SIGSEGV, the request dies) when
++// the schema-to-grammar path handles a doubly-nested array of objects; flat
++// arrays of objects are unaffected.  Drop the offending tools until the
++// root cause is fixed.  Warns once per tool name; set
++// LLAMAFILE_DROP_NESTED_ARRAY_TOOLS=0 to re-enable them.
++static int drop_nested_array_tools(std::vector<common_chat_tool> &tools) {
++    static std::unordered_set<std::string> warned;
++    int n = 0;
++    for (auto it = tools.begin(); it != tools.end();) {
++        if (it->parameters.empty()) {
++            ++it;
++            continue;
++        }
++        nlohmann::json schema = nlohmann::json::parse(it->parameters, nullptr, false);
++        if (schema.is_discarded() || !schema_has_nested_array_of_objects(schema)) {
++            ++it;
++            continue;
++        }
++        if (warned.insert(it->name).second) {
++            SRV_WRN("tools: dropped tool schema with nested array of objects (tool=%s)\n",
++                    it->name.c_str());
++        }
++        it = tools.erase(it);
++        n++;
++    }
++    return n;
++}
++
+ // used by /chat/completions endpoint
+ json oaicompat_chat_params_parse(
+     json & body, /* openai api json semantics */
+@@ -1293,6 +1376,10 @@
+     if (patterns_stripped) {
+         SRV_INF("tools: stripped %d unanchored schema pattern(s)\n", patterns_stripped);
+     }
++    const char * drop_env = getenv("LLAMAFILE_DROP_NESTED_ARRAY_TOOLS");
++    if (!(drop_env && drop_env[0] == '0')) {
++        drop_nested_array_tools(inputs.tools);
++    }
+     inputs.tool_choice            = common_chat_tool_choice_parse_oaicompat(tool_choice);
+     inputs.json_schema            = json_schema.is_null() ? "" : json_schema.dump();
+     inputs.grammar                = grammar;

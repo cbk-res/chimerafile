@@ -11,6 +11,7 @@ against the pinned submodule; this suite deliberately does not re-test it.
 | File | What it checks |
 | --- | --- |
 | `test_compat.py` | The OpenAI surface against whatever model the config points at: chat, streaming, `max_tokens`, thinking split, tools (auto + forced `required`), the error matrix, overflow-with-tools (the load-crash regression), Bearer auth. Doubles as the model/backend acceptance check. |
+| `test_tools_nested.py` | Tool schemas with a doubly-nested array of objects (the `question` tool shape): the cosmo build used to crash the model child on them (SIGSEGV, the request died). Requests carrying such a schema must complete repeatedly and a plain follow-up must survive; a flat array of scalars must complete and must not be dropped. The last test prints which fix mode the build is in ("works", or "dropped" - the child logs one warning per dropped tool). |
 | `test_kv_retention.py` | Per-model KV cache via the child's `timings.prompt_ms`: identical prompt decodes nothing, shared prefix decodes only the tail, divergent prefix pays a full prefill. Every test uses sentences no other test uses (the child's KV cache is content-addressed and never clears). |
 | `test_queueing.py` | Load: concurrent chats all succeed, `/health` stays responsive in flight, stream + non-stream interleave, recovery after a burst. |
 | `test_residency.py` | Multi-model: both models load and serve, per-model caches survive interleaving, TTL unload + on-demand reload (via `GET /v1/status`). |

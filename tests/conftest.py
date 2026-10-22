@@ -246,7 +246,7 @@ def absolutize(cfg):
 
 class ServerInfo:
     def __init__(self, base, port, cfg, model, models, profile,
-                 spawned, log_path):
+                 spawned, log_path, proc_pid=None):
         self.base = base
         self.port = port
         self.cfg = cfg
@@ -255,6 +255,7 @@ class ServerInfo:
         self.profile = profile  # "tiny": random weights, no model-quality tests
         self.spawned = spawned
         self.log_path = log_path
+        self.proc_pid = proc_pid  # spawned serve parent's pid (work dir key)
         self.client = Client(base)
 
 
@@ -344,7 +345,8 @@ def server(request):
     try:
         yield ServerInfo(base, port, cfg, llama_ids[0], llama_ids,
                          cfg.get("test_profile", "full"),
-                         proc is not None, log_path)
+                         proc is not None, log_path,
+                         proc_pid=proc.pid if proc is not None else None)
     finally:
         if proc is not None and not request.config.getoption("--keep-server"):
             proc.send_signal(signal.SIGTERM)
