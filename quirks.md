@@ -103,6 +103,16 @@ points at the 8G wall, and no media model fits alongside such a model on 8G
 in any case. If a serve targets a fixed-VRAM card, size the config so
 weights + KV + the largest concurrent generation fit inside it.
 
+The wall is not a soft failure: on 2026-10-22 a growing-context stress run
+(25 sequential turns, context climbing to ~26k) on the 8G eGPU dropped the
+card's PCIe link mid-run (`pciehp: Link Down`, child aborted, desktop
+allocator failures), and the kernel then crashed outright (crash dump
+captured) instead of surviving the bus drop. The card did not re-enumerate
+after the reboot and was disconnected. This machine is iGPU-only now, which
+is the intended deployment shape anyway; the serve config and all stress
+vehicles pin `--device Vulkan0` so placement can never pick a fixed-VRAM
+card again.
+
 ### iGPUs with shared memory are the easy case
 
 On an iGPU (e.g. AMD 780M) the "VRAM" is system RAM, so the budget is the
