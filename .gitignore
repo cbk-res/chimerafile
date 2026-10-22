@@ -11,3 +11,5 @@ tests/fixtures/*
 # test_capabilities asserts on the capabilities listing)
 !tests/fixtures/upscalers/
 !tests/fixtures/upscalers/*
+# ...and the flat tool schemas for the LCP test (small, committed)
+!tests/fixtures/tools-flat.json

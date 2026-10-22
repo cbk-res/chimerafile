@@ -76,6 +76,8 @@ fresh: # Reset the submodule trees to the pinned state, re-apply setup, rebuild
 	@bash $(CHIMERAFILE_REPO)/ci-patches/patch-tool-schema-sanitize.sh
 	@echo "==> Applying builder patches (llama.cpp nested-array tool drop)..."
 	@bash $(CHIMERAFILE_REPO)/ci-patches/patch-drop-nested-array.sh
+	@echo "==> Applying builder patches (llama.cpp per-cell KV seq_pos)..."
+	@bash $(CHIMERAFILE_REPO)/ci-patches/patch-kv-cells-seqpos.sh
 	@echo "==> Recording setup baselines..."
 	@$(CHIMERAFILE_REPO)/scripts/record-setup-baseline.sh
 	@echo "==> Building from the known state..."
@@ -132,6 +134,8 @@ setup:
 	@bash $(CHIMERAFILE_REPO)/ci-patches/patch-tool-schema-sanitize.sh
 	@echo "==> Applying builder patches (llama.cpp nested-array tool drop)..."
 	@bash $(CHIMERAFILE_REPO)/ci-patches/patch-drop-nested-array.sh
+	@echo "==> Applying builder patches (llama.cpp per-cell KV seq_pos)..."
+	@bash $(CHIMERAFILE_REPO)/ci-patches/patch-kv-cells-seqpos.sh
 	@echo "==> Recording setup baselines..."
 	@$(CHIMERAFILE_REPO)/scripts/record-setup-baseline.sh
 	@echo ""

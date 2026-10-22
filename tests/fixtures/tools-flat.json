@@ -1,0 +1,139 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "edit",
+      "description": "Edit a file by replacing an exact string with a new string.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {"type": "string", "description": "File to edit"},
+          "oldString": {"type": "string", "description": "Exact text to find and replace"},
+          "newString": {"type": "string", "description": "Text to replace oldString with"},
+          "replaceAll": {"type": "boolean", "description": "Replace every occurrence"}
+        },
+        "required": ["path", "oldString", "newString"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "glob",
+      "description": "Search file paths using a glob pattern.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pattern": {"type": "string", "description": "Glob pattern to match"},
+          "path": {"type": "string", "description": "Directory to search"}
+        },
+        "required": ["pattern"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "grep",
+      "description": "Search file contents using a regular expression.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pattern": {"type": "string", "description": "Regular expression to match"},
+          "path": {"type": "string", "description": "File or directory to search"},
+          "include": {"type": "string", "description": "Glob pattern to filter files"}
+        },
+        "required": ["pattern"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "read",
+      "description": "Read the contents of a file or directory.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {"type": "string", "description": "File or directory to read"},
+          "offset": {"type": "integer", "description": "Line to start reading from"},
+          "limit": {"type": "integer", "description": "Maximum number of lines to read"}
+        },
+        "required": ["path"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "shell",
+      "description": "Execute a shell command and return its output.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "command": {"type": "string", "description": "Shell command to execute"},
+          "workdir": {"type": "string", "description": "Working directory"}
+        },
+        "required": ["command"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "skill",
+      "description": "Load a specialized skill's instructions into the conversation.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "string", "description": "The ID of the skill"}
+        },
+        "required": ["id"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "webfetch",
+      "description": "Fetch content from an HTTP or HTTPS URL.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "url": {"type": "string", "description": "The URL to fetch"},
+          "format": {"type": "string", "description": "Format to return: text, markdown, or html"}
+        },
+        "required": ["url"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "execute",
+      "description": "Run JavaScript in the Code Mode runtime to script tool calls and HTTP requests.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "code": {"type": "string", "description": "JavaScript source to execute"}
+        },
+        "required": ["code"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "write",
+      "description": "Write content to a file, overwriting if it exists.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {"type": "string", "description": "File path to write"},
+          "content": {"type": "string", "description": "Content to write"}
+        },
+        "required": ["path", "content"]
+      }
+    }
+  }
+]

@@ -57,6 +57,8 @@ run "child kv (raw llama --server child)" tests/test_child_kv.py \
 # (the GPU lease) run when the live service has released the GPU.
 if [ -n "${GPU:-}" ]; then
     run "full suite --gpu $GPU" tests/ --gpu "$GPU"
+    run "LCP slot-reuse (mellum config, ~15 min)" tests/test_lcp_reuse.py \
+        --serve-config tests/configs/lcp-mellum.json --gpu "$GPU"
 fi
 
 echo ""

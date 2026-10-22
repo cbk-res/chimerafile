@@ -1,0 +1,14 @@
+{
+  "listen": "127.0.0.1:48091",
+  "test_profile": "full",
+  "test_lcp": true,
+  "models": {
+    "mellum": {
+      "engine": "llama",
+      "file": "/var/home/cbk8650/Downloads/Mellum2.1-12B-A2.5B-Thinking-Q5_K_M.gguf",
+      "ctx": 131072,
+      "gpu_layers": -1,
+      "args": ["--device", "Vulkan0", "--flash-attn", "on", "--cache-type-k", "q8_0", "--cache-type-v", "q8_0"]
+    }
+  }
+}
