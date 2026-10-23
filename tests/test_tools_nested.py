@@ -1,21 +1,20 @@
-"""Tool schemas with a doubly-nested array of objects (cosmo crash regression).
+"""Nested tool schemas (the `question` tool shape) must survive the model child.
 
-The cosmo build corrupts the model child (SIGSEGV, the request dies and
-the child is recycled) when the schema-to-grammar path handles a tool
-schema that carries a doubly-nested array of objects - the `question`
-tool shape: an array of objects whose items themselves carry an array of
-objects.  Flat arrays (of scalars or of objects) are unaffected.
+A tool schema with a doubly-nested array of objects (an array of objects
+whose items carry an array of objects - the `question` tool) used to kill
+the model child on the first request carrying it.  Root cause: the child
+serializes its PEG parser arena with common_peg_arena::to_json() on the
+80 KiB cosmo httplib worker stack; the initializer-list construction
+deep-copies the whole parser tree, and the embedded tool schemas are
+nested that many levels, so the recursive copy (about 10 KiB of stack per
+level in this build) overflows into the guard page (SIGSEGV).  The fix
+(peg-tomove.patch) builds the arena JSON with moves; the serialized
+output is unchanged.
 
-This test pins the behavior whatever fix mode the build is in:
-
-- "works":  the nested schema passes the grammar path, the request
-  completes;
-- "dropped": the child logs one warning per dropped tool ("tools:
-  dropped tool schema with nested array of objects (tool=...)") and
-  serves the request with the remaining tools.
-
-A crash fails the completion tests hard.  The last test prints which
-mode is in effect.
+This test requires the "works" mode: the nested schema reaches the child,
+the requests complete, and the child stays alive (a death-then-restart
+would pass a pure completion check, so the router log is checked for the
+child-exit signature too).
 """
 
 import re
@@ -64,7 +63,7 @@ NESTED_TOOL = {
     },
 }
 
-# Flat array of scalars: not the crash shape, must survive any filtering.
+# Flat array of scalars: never was the crash shape, must keep working.
 FLAT_ARRAY_TOOL = {
     "type": "function",
     "function": {
@@ -80,7 +79,8 @@ FLAT_ARRAY_TOOL = {
     },
 }
 
-DROP_WARNING_RE = re.compile(r"nested array of objects \(tool=([\w-]+)\)")
+# server-models.cpp logs this when a model child exits (any exit code).
+CHILD_EXIT_RE = re.compile(r"exited with status")
 
 
 def _chat(client, model, text, tools=None, max_tokens=64):
@@ -125,26 +125,16 @@ def test_nested_tool_requests_complete(server):
     _assert_complete(s, r, "follow-up without tools")
 
 
+def test_child_survived_nested_requests(server):
+    """A child that dies and gets respawned would still complete the
+    follow-up request above; the exit itself must not have happened."""
+    log = _router_log(server)
+    exits = CHILD_EXIT_RE.findall(log)
+    assert not exits, f"model child exited during nested tool requests: {exits}"
+
+
 def test_flat_array_tool_completes(server):
     c = server.client
     s, r = _chat(c, server.model, "What is 1+1? Answer briefly.",
                  tools=[FLAT_ARRAY_TOOL])
     _assert_complete(s, r, "flat array request")
-
-
-def test_flat_array_tool_not_dropped(server):
-    """The drop must be precise: a flat array of scalars is not the crash
-    shape and must not be dropped with it."""
-    dropped = DROP_WARNING_RE.findall(_router_log(server))
-    assert FLAT_ARRAY_TOOL["function"]["name"] not in dropped, \
-        f"flat array tool was dropped: {dropped}"
-
-
-def test_nested_mode_printed(server):
-    """Informational: which fix mode is this build in?"""
-    dropped = DROP_WARNING_RE.findall(_router_log(server))
-    if NESTED_TOOL["function"]["name"] in dropped:
-        mode = "dropped (schema stripped before the grammar path)"
-    else:
-        mode = "works (schema passes the grammar path)"
-    print(f"\nnested-array tool schema mode: {mode}")
