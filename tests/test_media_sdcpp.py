@@ -102,13 +102,6 @@ def test_txt2img_job(server):
     expect_image(poll(server, job["poll_url"]), W, W)
 
 
-@pytest.mark.xfail(reason="the pinned engine's init-image (VAE encode) path "
-                          "overflows the APE's 80 KB guest-thread stack and "
-                          "crashes the child (core 26483; pass-through-plan "
-                          "14.10): the serve layer answers 502 "
-                          "media_unavailable after its respawn. Non-strict: "
-                          "an xpass means the engine now copes and the limit "
-                          "can be lifted.", strict=False)
 def test_img2img(server):
     need_sdcpp(server)
     job = submit(server,

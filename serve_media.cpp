@@ -555,6 +555,30 @@ static size_t sdcpp_pending(const SdcppJobs &mgr) {
     return n;
 }
 
+static std::string sdcpp_error_json(const std::string &msg) {
+    return nlohmann::json({{"error", msg}})
+        .dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+}
+
+// Purge, enforce the pending cap, assign the id/seq/timestamps. Takes and
+// releases mgr.mu; false if the queue is full.
+static bool sdcpp_register(SdcppJobs &mgr,
+                           const std::shared_ptr<SdcppJob> &job) {
+    std::lock_guard<std::mutex> lk(mgr.mu);
+    sdcpp_purge(mgr, (long)time(nullptr));
+    if (sdcpp_pending(mgr) >= SdcppJobs::MAX_PENDING)
+        return false;
+    uint64_t seq = mgr.next_id++;
+    char id[48];
+    snprintf(id, sizeof id, "job_%lx_%08llx", (unsigned long)time(nullptr),
+             (unsigned long long)seq);
+    job->id = id;
+    job->seq = seq;
+    job->created_at = (long)time(nullptr);
+    mgr.jobs[job->id] = job;
+    return true;
+}
+
 // The job as clients see it; mirrors upstream's make_async_job_json.
 // Call with mgr.mu held.
 static nlohmann::json sdcpp_job_json(const SdcppJobs &mgr,
@@ -617,6 +641,118 @@ static bool decode_sdcpp_image(const std::string &encoded,
     return true;
 }
 
+// The sample_params object (upstream's parse_sample_params_json): engine
+// defaults, request fields override; unknown names are ignored, as upstream does.
+static void parse_sdcpp_sample_params(const nlohmann::json &j, SdcppJob &job) {
+    sd_img_gen_params_t scratch;
+    sd_img_gen_params_init(&scratch);
+    job.sp = scratch.sample_params;
+    job.sp.custom_sigmas = nullptr;  // repointed at the job's vector below
+    job.sp.custom_sigmas_count = 0;
+    job.sp.extra_sample_args = nullptr;
+    if (!j.contains("sample_params") || !j["sample_params"].is_object())
+        return;
+    const nlohmann::json &sp = j["sample_params"];
+    if (sp.contains("sample_steps") && sp["sample_steps"].is_number_integer())
+        job.sp.sample_steps = sp["sample_steps"].get<int>();
+    if (sp.contains("eta") && sp["eta"].is_number())
+        job.sp.eta = (float)sp["eta"].get<double>();
+    if (sp.contains("shifted_timestep") &&
+        sp["shifted_timestep"].is_number_integer())
+        job.sp.shifted_timestep = sp["shifted_timestep"].get<int>();
+    if (sp.contains("flow_shift") && sp["flow_shift"].is_number())
+        job.sp.flow_shift = (float)sp["flow_shift"].get<double>();
+    if (sp.contains("custom_sigmas") && sp["custom_sigmas"].is_array())
+        job.custom_sigmas = sp["custom_sigmas"].get<std::vector<float>>();
+    if (sp.contains("sample_method") && sp["sample_method"].is_string()) {
+        sample_method_t m = str_to_sample_method(
+            sp["sample_method"].get<std::string>().c_str());
+        if (m != SAMPLE_METHOD_COUNT)
+            job.sp.sample_method = m;
+    }
+    if (sp.contains("scheduler") && sp["scheduler"].is_string()) {
+        scheduler_t s = str_to_scheduler(
+            sp["scheduler"].get<std::string>().c_str());
+        if (s != SCHEDULER_COUNT)
+            job.sp.scheduler = s;
+    }
+    if (sp.contains("guidance") && sp["guidance"].is_object()) {
+        const nlohmann::json &g = sp["guidance"];
+        if (g.contains("txt_cfg") && g["txt_cfg"].is_number())
+            job.sp.guidance.txt_cfg = (float)g["txt_cfg"].get<double>();
+        if (g.contains("img_cfg") && g["img_cfg"].is_number())
+            job.sp.guidance.img_cfg = (float)g["img_cfg"].get<double>();
+        if (g.contains("distilled_guidance") &&
+            g["distilled_guidance"].is_number())
+            job.sp.guidance.distilled_guidance =
+                (float)g["distilled_guidance"].get<double>();
+    }
+    if (job.sp.sample_steps > 0)
+        job.sp.sample_steps = std::clamp(job.sp.sample_steps, 1, 100);
+}
+
+// The hires object (upstream's resolve(): an empty upscaler means "Latent",
+// "None" disables it, and a name that is not a builtin is an upscaler model
+// file in upscalers_dir).
+static bool parse_sdcpp_hires(const nlohmann::json &j, const Config &cfg,
+                              SdcppJob &job, std::string &err) {
+    if (!j.contains("hires") || !j["hires"].is_object())
+        return true;
+    const nlohmann::json &h = j["hires"];
+    job.hires_enabled = h.contains("enabled") && h["enabled"].is_boolean() &&
+                        h["enabled"].get<bool>();
+    std::string up;
+    if (h.contains("upscaler") && h["upscaler"].is_string())
+        up = h["upscaler"].get<std::string>();
+    if (job.hires_enabled) {
+        if (up.empty())
+            up = "Latent";
+        job.hires.upscaler = str_to_sd_hires_upscaler(up.c_str());
+        if (job.hires.upscaler == SD_HIRES_UPSCALER_NONE)
+            job.hires_enabled = false;
+        else if (job.hires.upscaler == SD_HIRES_UPSCALER_COUNT) {
+            // not a builtin: an upscaler model file in upscalers_dir
+            static const char *exts[] = {".gguf", ".safetensors", ".pt",
+                                         ".pth"};
+            std::string cand = cfg.sdcpp.upscalers_dir + "/" + up;
+            FILE *f = fopen(cand.c_str(), "r");
+            if (!f)
+                for (const char *ext : exts) {
+                    cand = cfg.sdcpp.upscalers_dir + "/" + up + ext;
+                    f = fopen(cand.c_str(), "r");
+                    if (f)
+                        break;
+                }
+            if (!f) {
+                err = "hires upscaler '" + up + "' is not a builtin name "
+                      "and no upscaler model file was found for it";
+                return false;
+            }
+            fclose(f);
+            job.hires_model_path = cand;
+            job.hires.upscaler = SD_HIRES_UPSCALER_MODEL;
+        }
+        if (h.contains("scale") && h["scale"].is_number())
+            job.hires.scale = (float)h["scale"].get<double>();
+        if (h.contains("target_width") &&
+            h["target_width"].is_number_integer())
+            job.hires.target_width = h["target_width"].get<int>();
+        if (h.contains("target_height") &&
+            h["target_height"].is_number_integer())
+            job.hires.target_height = h["target_height"].get<int>();
+        if (h.contains("steps") && h["steps"].is_number_integer())
+            job.hires.steps = h["steps"].get<int>();
+        if (h.contains("denoising_strength") &&
+            h["denoising_strength"].is_number())
+            job.hires.denoising_strength =
+                (float)h["denoising_strength"].get<double>();
+        if (h.contains("upscale_tile_size") &&
+            h["upscale_tile_size"].is_number_integer())
+            job.hires.upscale_tile_size = h["upscale_tile_size"].get<int>();
+    }
+    return true;
+}
+
 // Parse and validate one /sdcpp/v1/img_gen body into a job. Field names and the
 // ignore-unknown-fields leniency follow upstream's SDGenerationParams::from_json_str;
 // sampler/scheduler/upscaler names resolve through the engine's own str_to_* APIs
@@ -667,116 +803,10 @@ static bool parse_sdcpp_img_gen(const nlohmann::json &j, const Config &cfg,
         return false;
     }
 
-    // sample_params: engine defaults, request fields override (upstream's parse_sample_params_json).
-    {
-        sd_img_gen_params_t scratch;
-        sd_img_gen_params_init(&scratch);
-        job.sp = scratch.sample_params;
-        job.sp.custom_sigmas = nullptr;  // repointed at the job's vector below
-        job.sp.custom_sigmas_count = 0;
-        job.sp.extra_sample_args = nullptr;
-        if (j.contains("sample_params") && j["sample_params"].is_object()) {
-            const nlohmann::json &sp = j["sample_params"];
-            if (sp.contains("sample_steps") &&
-                sp["sample_steps"].is_number_integer())
-                job.sp.sample_steps = sp["sample_steps"].get<int>();
-            if (sp.contains("eta") && sp["eta"].is_number())
-                job.sp.eta = (float)sp["eta"].get<double>();
-            if (sp.contains("shifted_timestep") &&
-                sp["shifted_timestep"].is_number_integer())
-                job.sp.shifted_timestep = sp["shifted_timestep"].get<int>();
-            if (sp.contains("flow_shift") && sp["flow_shift"].is_number())
-                job.sp.flow_shift = (float)sp["flow_shift"].get<double>();
-            if (sp.contains("custom_sigmas") &&
-                sp["custom_sigmas"].is_array())
-                job.custom_sigmas =
-                    sp["custom_sigmas"].get<std::vector<float>>();
-            if (sp.contains("sample_method") &&
-                sp["sample_method"].is_string()) {
-                sample_method_t m = str_to_sample_method(
-                    sp["sample_method"].get<std::string>().c_str());
-                if (m != SAMPLE_METHOD_COUNT)
-                    job.sp.sample_method = m;
-            }
-            if (sp.contains("scheduler") && sp["scheduler"].is_string()) {
-                scheduler_t s = str_to_scheduler(
-                    sp["scheduler"].get<std::string>().c_str());
-                if (s != SCHEDULER_COUNT)
-                    job.sp.scheduler = s;
-            }
-            if (sp.contains("guidance") && sp["guidance"].is_object()) {
-                const nlohmann::json &g = sp["guidance"];
-                if (g.contains("txt_cfg") && g["txt_cfg"].is_number())
-                    job.sp.guidance.txt_cfg = (float)g["txt_cfg"].get<double>();
-                if (g.contains("img_cfg") && g["img_cfg"].is_number())
-                    job.sp.guidance.img_cfg = (float)g["img_cfg"].get<double>();
-                if (g.contains("distilled_guidance") &&
-                    g["distilled_guidance"].is_number())
-                    job.sp.guidance.distilled_guidance =
-                        (float)g["distilled_guidance"].get<double>();
-            }
-        }
-        if (job.sp.sample_steps > 0)
-            job.sp.sample_steps = std::clamp(job.sp.sample_steps, 1, 100);
-    }
+    parse_sdcpp_sample_params(j, job);
 
-    // hires (upstream's resolve(): an empty upscaler means "Latent", "None" disables it, and a
-    // name that is not a builtin is an upscaler model file in upscalers_dir).
-    if (j.contains("hires") && j["hires"].is_object()) {
-        const nlohmann::json &h = j["hires"];
-        job.hires_enabled = h.contains("enabled") && h["enabled"].is_boolean() &&
-                            h["enabled"].get<bool>();
-        std::string up;
-        if (h.contains("upscaler") && h["upscaler"].is_string())
-            up = h["upscaler"].get<std::string>();
-        if (job.hires_enabled) {
-            if (up.empty())
-                up = "Latent";
-            job.hires.upscaler = str_to_sd_hires_upscaler(up.c_str());
-            if (job.hires.upscaler == SD_HIRES_UPSCALER_NONE)
-                job.hires_enabled = false;
-            else if (job.hires.upscaler == SD_HIRES_UPSCALER_COUNT) {
-                // not a builtin: an upscaler model file in upscalers_dir
-                static const char *exts[] = {".gguf", ".safetensors", ".pt",
-                                             ".pth"};
-                std::string cand = cfg.sdcpp.upscalers_dir + "/" + up;
-                FILE *f = fopen(cand.c_str(), "r");
-                if (!f)
-                    for (const char *ext : exts) {
-                        cand = cfg.sdcpp.upscalers_dir + "/" + up + ext;
-                        f = fopen(cand.c_str(), "r");
-                        if (f)
-                            break;
-                    }
-                if (!f) {
-                    err = "hires upscaler '" + up + "' is not a builtin name "
-                          "and no upscaler model file was found for it";
-                    return false;
-                }
-                fclose(f);
-                job.hires_model_path = cand;
-                job.hires.upscaler = SD_HIRES_UPSCALER_MODEL;
-            }
-            if (h.contains("scale") && h["scale"].is_number())
-                job.hires.scale = (float)h["scale"].get<double>();
-            if (h.contains("target_width") &&
-                h["target_width"].is_number_integer())
-                job.hires.target_width = h["target_width"].get<int>();
-            if (h.contains("target_height") &&
-                h["target_height"].is_number_integer())
-                job.hires.target_height = h["target_height"].get<int>();
-            if (h.contains("steps") && h["steps"].is_number_integer())
-                job.hires.steps = h["steps"].get<int>();
-            if (h.contains("denoising_strength") &&
-                h["denoising_strength"].is_number())
-                job.hires.denoising_strength =
-                    (float)h["denoising_strength"].get<double>();
-            if (h.contains("upscale_tile_size") &&
-                h["upscale_tile_size"].is_number_integer())
-                job.hires.upscale_tile_size =
-                    h["upscale_tile_size"].get<int>();
-        }
-    }
+    if (!parse_sdcpp_hires(j, cfg, job, err))
+        return false;
 
     job.output_format = str("output_format");
     if (job.output_format.empty())
@@ -835,6 +865,49 @@ static void build_sdcpp_params(const SdcppJob &job, sd_img_gen_params_t &sp) {
                              : sp.sample_params.sample_steps;
         sp.hires.denoising_strength = job.hires.denoising_strength;
         sp.hires.upscale_tile_size = job.hires.upscale_tile_size;
+    }
+}
+
+// Out of the route lambda: a separate function keeps its own (small) frame
+// on the cosmo guest stacks, instead of piling into the lambda's.
+static void run_sdcpp_job(SdcppJobs &jobs, PhysModel &p,
+                          const std::shared_ptr<SdcppJob> &job) {
+    {
+        std::lock_guard<std::mutex> lk(jobs.mu);
+        // cancelled while queued: never generate
+        if (job->status == SdcppStatus::Cancelled)
+            return;
+        job->status = SdcppStatus::Generating;
+        job->started_at = (long)time(nullptr);
+    }
+    std::string gerr;
+    {
+        sd_img_gen_params_t sp;
+        build_sdcpp_params(*job, sp);
+        std::vector<ImageResult::Img> imgs;
+        image_generate(p, sp, imgs, gerr);
+        if (gerr.empty()) {
+            bool encoded_all = true;
+            for (const auto &img : imgs) {
+                std::string png;
+                if (!encode_png(img, png)) {
+                    encoded_all = false;
+                    break;
+                }
+                job->result_b64.push_back(b64_encode(png));
+            }
+            if (!encoded_all)
+                gerr = "failed to encode the generated image(s)";
+        }
+    }
+    std::lock_guard<std::mutex> lk(jobs.mu);
+    job->completed_at = (long)time(nullptr);
+    if (!gerr.empty()) {
+        job->status = SdcppStatus::Failed;
+        job->error_code = "generation_failed";
+        job->error_message = gerr;
+    } else {
+        job->status = SdcppStatus::Completed;
     }
 }
 
@@ -1675,30 +1748,15 @@ struct MediaServer {
                 std::string perr;
                 if (!parse_sdcpp_img_gen(body, cfg, *job, perr)) {
                     res.status = 400;
-                    res.set_content(
-                        nlohmann::json({{"error", perr}})
-                            .dump(-1, ' ', false,
-                                  nlohmann::json::error_handler_t::replace),
-                        "application/json");
+                    res.set_content(sdcpp_error_json(perr),
+                                    "application/json");
                     return;
                 }
-                {
-                    std::lock_guard<std::mutex> lk(sdcpp_jobs.mu);
-                    sdcpp_purge(sdcpp_jobs, (long)time(nullptr));
-                    if (sdcpp_pending(sdcpp_jobs) >= SdcppJobs::MAX_PENDING) {
-                        res.status = 429;
-                        res.set_content(R"({"error":"job queue is full"})",
-                                        "application/json");
-                        return;
-                    }
-                    uint64_t seq = sdcpp_jobs.next_id++;
-                    std::ostringstream oss;
-                    oss << "job_" << std::hex << (long)time(nullptr) << "_"
-                        << std::setw(8) << std::setfill('0') << seq;
-                    job->id = oss.str();
-                    job->seq = seq;
-                    job->created_at = (long)time(nullptr);
-                    sdcpp_jobs.jobs[job->id] = job;
+                if (!sdcpp_register(sdcpp_jobs, job)) {
+                    res.status = 429;
+                    res.set_content(R"({"error":"job queue is full"})",
+                                    "application/json");
+                    return;
                 }
                 std::string aerr;
                 auto p = residency.acquire(*sdcpp_model, aerr);
@@ -1707,53 +1765,14 @@ struct MediaServer {
                     sdcpp_jobs.jobs.erase(job->id);
                     res.status = 503;
                     res.set_content(
-                        nlohmann::json(
-                            {{"error", "model load failed: " + aerr}})
-                            .dump(-1, ' ', false,
-                                  nlohmann::json::error_handler_t::replace),
+                        sdcpp_error_json("model load failed: " + aerr),
                         "application/json");
                     return;
                 }
                 auto ej = std::make_shared<EngineJob>();
                 ej->p = p;
-                ej->run = [this, p, job] {
-                    {
-                        std::lock_guard<std::mutex> lk(sdcpp_jobs.mu);
-                        // cancelled while queued: never generate
-                        if (job->status == SdcppStatus::Cancelled)
-                            return;
-                        job->status = SdcppStatus::Generating;
-                        job->started_at = (long)time(nullptr);
-                    }
-                    std::string gerr;
-                    {
-                        sd_img_gen_params_t sp;
-                        build_sdcpp_params(*job, sp);
-                        std::vector<ImageResult::Img> imgs;
-                        image_generate(*p, sp, imgs, gerr);
-                        if (gerr.empty()) {
-                            bool encoded_all = true;
-                            for (const auto &img : imgs) {
-                                std::string png;
-                                if (!encode_png(img, png)) {
-                                    encoded_all = false;
-                                    break;
-                                }
-                                job->result_b64.push_back(b64_encode(png));
-                            }
-                            if (!encoded_all)
-                                gerr = "failed to encode the generated image(s)";
-                        }
-                    }
-                    std::lock_guard<std::mutex> lk(sdcpp_jobs.mu);
-                    job->completed_at = (long)time(nullptr);
-                    if (!gerr.empty()) {
-                        job->status = SdcppStatus::Failed;
-                        job->error_code = "generation_failed";
-                        job->error_message = gerr;
-                    } else {
-                        job->status = SdcppStatus::Completed;
-                    }
+                ej->run = [jobs = &sdcpp_jobs, p, job] {
+                    run_sdcpp_job(*jobs, *p, job);
                 };
                 if (!residency.submit_engine(ej)) {
                     residency.release(*p);
@@ -1764,10 +1783,7 @@ struct MediaServer {
                     job->error_message = "server is shutting down";
                     res.status = 503;
                     res.set_content(
-                        nlohmann::json(
-                            {{"error", "server is shutting down"}})
-                            .dump(-1, ' ', false,
-                                  nlohmann::json::error_handler_t::replace),
+                        sdcpp_error_json("server is shutting down"),
                         "application/json");
                     return;
                 }
