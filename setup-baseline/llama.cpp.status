@@ -16,6 +16,8 @@
 430c32365524308e5f82f45dbf754522645ca83d	ggml/src/ggml-cuda/convert.cu
 433fa0c6bf34d0eb4390aeb7e5af6f311290bfce	ggml/src/ggml-backend.cpp
 46b264d62063489cf2beddc1c3898893bfe6d521	ggml/src/ggml-cpu/ops.cpp
+4ff6ea8549721cd0344d1ef4dbd48e2fd632974b	src/llama-batch.cpp
+5b2ce6534fe35653465befc10a2ff986e710f93f	src/llama-batch.h
 5d2851173927c1d8318b148b27dac2e989afae5b	ggml/src/ggml-cpu/ggml-cpu.c
 63fae0684ba5dbbb7296f24bbaa656f14ba68cac	tools/server/server-stream.cpp
 69341cdcc10fa8d3992607ec26514786d01c17a2	ggml/include/ggml-cpu.h

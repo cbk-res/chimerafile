@@ -1,0 +1,328 @@
+diff --git a/src/llama-batch.cpp b/src/llama-batch.cpp
+index 2b98a55..4ff6ea8 100644
+--- a/src/llama-batch.cpp
++++ b/src/llama-batch.cpp
+@@ -5,9 +5,178 @@
+ #include "llama-memory.h"
+ 
+ #include <cassert>
++#include <cstdlib>
+ #include <cstring>
+ #include <algorithm>
+ #include <sstream>
++#include <mutex>
++
++//
++// seq_pos corruption watchdog
++//
++// A production core showed a seq_pos set destroyed with a corrupted tree
++// header for a sequence id no running slot ever used: a wild write somewhere
++// else in the process had overwritten the set's inline header, and the
++// corruption was only noticed at destruction. This watchdog keeps a ring of
++// the recent batch operations and verifies the seq_pos set headers on every
++// init() and destruction; on a violation it dumps the ring and aborts, so the
++// core is taken at detection time with the preceding operations on record.
++// Disable with LLAMA_BATCH_WATCH=0.
++//
++namespace {
++
++struct llb_rec {
++    uint64_t tick;
++    uint64_t owner;
++    uint32_t op;
++    uint32_t n_tokens;
++    int32_t  seq_min;
++    int32_t  seq_max;
++    int32_t  pos_min;
++    int32_t  pos_max;
++};
++
++const uint32_t LLB_OP_CTOR   = 1;
++const uint32_t LLB_OP_DTOR   = 2;
++const uint32_t LLB_OP_INIT   = 3;
++const uint32_t LLB_OP_CLEAR  = 4;
++const uint32_t LLB_OP_UBATCH = 5;
++
++// The set headers are checked by raw byte reads only, so the check can never
++// dereference a corrupted node pointer itself. The header layout (which word
++// holds the count, what the empty sentinels are) is probed at arm time from
++// freshly constructed sets, and the checks are disabled if the stdlib layout
++// does not match the expectations.
++struct llb_watch {
++    bool enabled    = true;
++    bool armed      = false;
++    bool reported   = false;
++    bool layout_ok  = false;
++    size_t count_off = 16;       // byte offset of the element count
++    long   first_off = 8;        // empty-set value of the first pointer, relative to the set
++    void * empty_root = nullptr; // value of the second pointer while empty
++    uint64_t tick   = 0;
++    size_t   head   = 0;
++    std::mutex mu;
++    std::vector<llb_rec> ring;
++
++    void probe_layout() {
++        std::set<int> e;
++        std::set<int> o { 7 };
++        std::set<int> t { 7, 3, 9 };
++        unsigned char be[48], bo[48], bt[48];
++        std::memcpy(be, &e, sizeof(e));
++        std::memcpy(bo, &o, sizeof(o));
++        std::memcpy(bt, &t, sizeof(t));
++
++        // the count field is the word that reads 0, 1, 3 in the three sets
++        size_t cand = (size_t) -1;
++        for (size_t off = 0; off + 8 <= sizeof(e); off += 8) {
++            size_t ve, vo, vt;
++            std::memcpy(&ve, be + off, 8);
++            std::memcpy(&vo, bo + off, 8);
++            std::memcpy(&vt, bt + off, 8);
++            if (ve == 0 && vo == 1 && vt == 3) {
++                cand = off;
++                break;
++            }
++        }
++        if (cand == (size_t) -1) {
++            return;
++        }
++        count_off = cand;
++
++        // the empty first pointer points into the set object itself
++        void * first;
++        std::memcpy(&first, be, 8);
++        const long rel = (const char *) first - (const char *) &e;
++        if (rel < 0 || rel > (long) sizeof(e)) {
++            return;
++        }
++        first_off = rel;
++        std::memcpy(&empty_root, be + 8, 8);
++
++        // a one-element set must not keep the empty sentinels
++        void * fo, * ro;
++        std::memcpy(&fo, bo, 8);
++        std::memcpy(&ro, bo + 8, 8);
++        if (fo == (void *) ((char *) &o + first_off) || ro == empty_root) {
++            return;
++        }
++        layout_ok = true;
++    }
++
++    void arm() {
++        if (armed) {
++            return;
++        }
++        armed = true;
++
++        const char * e = getenv("LLAMA_BATCH_WATCH");
++        if (e != nullptr) {
++            enabled = atoi(e) != 0;
++        }
++        if (!enabled) {
++            return;
++        }
++
++        ring.resize(4096);
++        probe_layout();
++    }
++
++    // the first construction happens during model loading, before the
++    // child's log plumbing is live, so the arming is reported on the first
++    // init() instead
++    void report_armed() {
++        if (!armed || reported) {
++            return;
++        }
++        reported = true;
++        LLAMA_LOG_WARN("%s: seq_pos watchdog %s (ring = %zu records, layout check %s, disable with LLAMA_BATCH_WATCH=0)\n",
++                __func__, enabled ? "armed" : "disabled", ring.size(), layout_ok ? "ok" : "FAILED");
++    }
++
++    void record(const void * owner, uint32_t op, uint32_t n_tokens,
++                int32_t seq_min, int32_t seq_max, int32_t pos_min, int32_t pos_max) {
++        static std::once_flag flag;
++        std::call_once(flag, [this] { arm(); });
++        if (!enabled) {
++            return;
++        }
++        std::lock_guard<std::mutex> lk(mu);
++        const llb_rec rec {
++            ++tick,
++            (uint64_t) owner,
++            op,
++            n_tokens,
++            seq_min,
++            seq_max,
++            pos_min,
++            pos_max,
++        };
++        ring[head] = rec;
++        head = (head + 1) % ring.size();
++    }
++
++    // abort rather than continue: a corrupted header stays corrupted, and the
++    // core taken at detection is more useful than the one at destruction
++    void fail(const char * what, int32_t seq_idx) {
++        std::lock_guard<std::mutex> lk(mu);
++        const size_t n = ring.size();
++        LLAMA_LOG_ERROR("%s: seq_pos watchdog: %s (seq = %d), dumping the last %zu batch operations\n",
++                __func__, what, seq_idx, n);
++        for (size_t i = 0; i < n; ++i) {
++            const llb_rec & r = ring[(head + i) % n];
++            LLAMA_LOG_ERROR("%s:   tick = %llu, owner = %p, op = %u, n_tokens = %u, seq = [%d, %d], pos = [%d, %d]\n",
++                    __func__, (unsigned long long) r.tick, (void *) r.owner, r.op, r.n_tokens,
++                    r.seq_min, r.seq_max, r.pos_min, r.pos_max);
++        }
++        fflush(nullptr);
++        std::abort();
++    }
++} g_llb_watch;
++
++} // namespace
+ 
+ llama_batch_allocr::llama_batch_allocr(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {
+     const char * LLAMA_BATCH_DEBUG = getenv("LLAMA_BATCH_DEBUG");
+@@ -20,6 +189,49 @@ llama_batch_allocr::llama_batch_allocr(uint32_t n_pos_per_embd) : n_pos_per_embd
+     }
+ 
+     seq_idx.resize(LLAMA_MAX_SEQ, -1);
++
++    g_llb_watch.record(this, LLB_OP_CTOR, 0, -1, -1, -1, -1);
++}
++
++llama_batch_allocr::~llama_batch_allocr() {
++    g_llb_watch.record(this, LLB_OP_DTOR, 0, -1, -1, -1, -1);
++    if (g_llb_watch.enabled) {
++        const int32_t bad = check_seq_pos_headers();
++        if (bad >= 0) {
++            g_llb_watch.fail("corrupted seq_pos header at destruction", bad);
++        }
++    }
++}
++
++int32_t llama_batch_allocr::check_seq_pos_headers() const {
++    if (!g_llb_watch.layout_ok) {
++        return -1;
++    }
++
++    for (size_t s = 0; s < seq_pos.size(); ++s) {
++        const auto & set = seq_pos[s];
++        unsigned char b[48];
++        std::memcpy(b, &set, std::min(sizeof(set), (size_t) 48));
++
++        void * first, * root;
++        size_t count;
++        std::memcpy(&first, b, 8);
++        std::memcpy(&root, b + 8, 8);
++        std::memcpy(&count, b + g_llb_watch.count_off, 8);
++        const void * sentinel = (const void *) ((const char *) &set + g_llb_watch.first_off);
++
++        if (count == 0) {
++            if (first != sentinel || root != g_llb_watch.empty_root) {
++                return (int32_t) s;
++            }
++        } else if (first == sentinel || root == sentinel
++                || (uintptr_t) first < 0x1000 || (uintptr_t) root < 0x1000) {
++            // a small integer is never a node pointer (page zero is unmapped)
++            return (int32_t) s;
++        }
++    }
++
++    return -1;
+ }
+ 
+ bool llama_batch_allocr::init(
+@@ -385,6 +597,35 @@ bool llama_batch_allocr::init(
+         }
+     }
+ 
++    {
++        int32_t smin = -1, smax = -1, pmin = -1, pmax = -1;
++        for (size_t s = 0; s < seq_pos.size(); ++s) {
++            if (seq_pos[s].empty()) {
++                continue;
++            }
++            if (smin < 0) {
++                smin = (int32_t) s;
++            }
++            smax = (int32_t) s;
++            const auto lo = *seq_pos[s].begin();
++            const auto hi = *seq_pos[s].rbegin();
++            if (pmin < 0 || lo < pmin) {
++                pmin = (int32_t) lo;
++            }
++            if (hi > pmax) {
++                pmax = (int32_t) hi;
++            }
++        }
++        g_llb_watch.record(this, LLB_OP_INIT, batch.n_tokens, smin, smax, pmin, pmax);
++    }
++    if (g_llb_watch.enabled) {
++        g_llb_watch.report_armed();
++        const int32_t bad = check_seq_pos_headers();
++        if (bad >= 0) {
++            g_llb_watch.fail("corrupted seq_pos header at init", bad);
++        }
++    }
++
+     split_reset();
+ 
+     return true;
+@@ -721,6 +962,8 @@ llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
+ }
+ 
+ void llama_batch_allocr::clear() {
++    g_llb_watch.record(this, LLB_OP_CLEAR, 0, -1, -1, -1, -1);
++
+     n_outputs = 0;
+ 
+     batch = {};
+@@ -840,6 +1083,27 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
+         ubatch_print(res, debug);
+     }
+ 
++    {
++        int32_t smin = -1, smax = -1, pmin = -1, pmax = -1;
++        for (uint32_t s = 0; s < res.n_seqs_unq; ++s) {
++            if (smin < 0) {
++                smin = (int32_t) res.seq_id_unq[s];
++            }
++            if (res.seq_id_unq[s] > smax) {
++                smax = (int32_t) res.seq_id_unq[s];
++            }
++        }
++        for (uint32_t i = 0; i < res.n_tokens; ++i) {
++            if (pmin < 0 || res.pos[i] < pmin) {
++                pmin = (int32_t) res.pos[i];
++            }
++            if (res.pos[i] > pmax) {
++                pmax = (int32_t) res.pos[i];
++            }
++        }
++        g_llb_watch.record(this, LLB_OP_UBATCH, res.n_tokens, smin, smax, pmin, pmax);
++    }
++
+     return res;
+ }
+ 
+diff --git a/src/llama-batch.h b/src/llama-batch.h
+index a3d1889..5b2ce65 100644
+--- a/src/llama-batch.h
++++ b/src/llama-batch.h
+@@ -72,6 +72,7 @@ struct llama_ubatch {
+ class llama_batch_allocr {
+ public:
+     llama_batch_allocr(uint32_t n_pos_per_embd);
++    ~llama_batch_allocr();
+ 
+     // sanitize and auto-gen missing data in the input batch
+     // memory is optional. if provided will be used to check for sequence continuity and to determine the positions
+@@ -117,6 +118,9 @@ public:
+ private:
+     void clear();
+ 
++    // corruption watchdog, see the definition in llama-batch.cpp
++    int32_t check_seq_pos_headers() const;
++
+     // create the next ubatch based on the provided batch indices (idxs) and the number of sequence sets (n_seqs)
+     // return llama_ubatch.n_tokens == 0 if the entire batch was consumed
+     llama_ubatch ubatch_add(const std::vector<int32_t> & idxs, uint32_t n_seqs, bool equal_seqs);

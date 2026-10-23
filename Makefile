@@ -80,6 +80,8 @@ fresh: # Reset the submodule trees to the pinned state, re-apply setup, rebuild
 	@bash $(CHIMERAFILE_REPO)/ci-patches/patch-grammar-no-regex.sh
 	@echo "==> Applying builder patches (llama.cpp move-based arena to_json)..."
 	@bash $(CHIMERAFILE_REPO)/ci-patches/patch-peg-tomove.sh
+	@echo "==> Applying builder patches (llama.cpp batch-allocr seq_pos watchdog)..."
+	@bash $(CHIMERAFILE_REPO)/ci-patches/patch-batch-watch.sh
 	@echo "==> Recording setup baselines..."
 	@$(CHIMERAFILE_REPO)/scripts/record-setup-baseline.sh
 	@echo "==> Building from the known state..."
@@ -140,6 +142,8 @@ setup:
 	@bash $(CHIMERAFILE_REPO)/ci-patches/patch-grammar-no-regex.sh
 	@echo "==> Applying builder patches (llama.cpp move-based arena to_json)..."
 	@bash $(CHIMERAFILE_REPO)/ci-patches/patch-peg-tomove.sh
+	@echo "==> Applying builder patches (llama.cpp batch-allocr seq_pos watchdog)..."
+	@bash $(CHIMERAFILE_REPO)/ci-patches/patch-batch-watch.sh
 	@echo "==> Recording setup baselines..."
 	@$(CHIMERAFILE_REPO)/scripts/record-setup-baseline.sh
 	@echo ""
