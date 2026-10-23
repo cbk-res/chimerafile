@@ -22,6 +22,7 @@ operation touches the damaged memory next.
 | C2 | 23, 20:22:46 | 251694 | SEGV | `server_slot::prompt_clear -> llama_kv_cache::seq_rm -> llama_kv_cells::seq_rm -> std::__tree::__erase_unique -> __tree_remove`. Bad node pointer mid-operation. Triggered by my probe (new prompt reusing a slot). |
 | C3 | 23, 20:35:19 | 252834 | ABRT | **FIXED (2026-10-23, commit 81428a4).** `common_prompt_checkpoint::load_tgt` -> GGML_ABORT "checkpoint size mismatch: expected %zu, got %zu". State restore threw mid-stream ("failed to restore kv cache"); partial byte count tripped the assert. Trigger: LCP partial reuse (f_keep=0.622). Fixed by upstream f174553 + e467e5b (section 2); live C3-shape probe on the new build: all 200, LCP path fired (f_sim 0.995, f_keep 0.973 on the probe), no abort, no core. |
 | C4 | 23, 21:33:31 | 260480 | SEGV | **New.** HTTP httplib worker thread, destroying a `nlohmann::json` in a POST route handler: `json_value::destroy -> std::string::~string -> free -> __mspace_free` (corrupted heap chunk). Full 26-frame stack resolved (core 612 MB, `/tmp/opencode/core-segv-260480`). Killed the instance mid-conversation - this is the crash that stalled the skills-config chat at 21:33 (4-min reload gap) and caused the 36k-token full re-prefill at 21:42. |
+| C5 | 24, 00:26:56 | 297621 | SEGV | **Recurrence of the C2 shape, on the checkpoint-fix build** (GPU-lane run, test server workdir 297572). `server_context_impl::pre_decode` -> `common_context_seq_rm` -> `llama_kv_cache_iswa::seq_rm` -> `llama_kv_cache::seq_rm` -> `llama_kv_cells::seq_rm` -> `std::__tree::__erase_unique` -> `__tree_remove` (bad node pointer, same surface as C2). Trigger: a new request (f_sim 0.111, f_keep 0.000) landed on the slot left by the 25-turn LCP scenario - a single ~15k-cell truncation down to ~4 tokens. Core 268 MB, `/tmp/opencode/core-segv-297621`. No checkpoint involvement in the stack. |
 
 ### Analysis so far
 
@@ -40,7 +41,26 @@ operation touches the damaged memory next.
   3. For C3 specifically: also a plausible *logic* bug in the checkpoint/SWA interaction
      (see section 2 - upstream already fixed one such bug). **CONFIRMED for C3**: the
      stale-checkpoint restore was exactly the upstream bug class; fixed and live-verified
-     2026-10-23 (section 2). C1/C2/C4 remain the open wild-write question.
+     2026-10-23 (section 2). C1/C2/C4/C5 remain the open wild-write question.
+
+### C5 (2026-10-24 00:26) - the C2 family is still alive
+
+- The checkpoint-fix build crashed on the GPU-lane stress run: the 25-turn LCP scenario
+  (small tail truncation every turn) passed, then a new request landed on the surviving
+  slot (f_sim 0.111, f_keep 0.000) and `pre_decode`'s single ~15k-cell truncation walked
+  into a corrupted `seq_pos` tree node (`__tree_remove`). Same surface as C2, different
+  entry point (slot switch, not prompt_clear).
+- The checkpoint port is **not** a suspect: for Mellum (iSWA) the old iswa code gated
+  the base cache under PARTIAL_ONLY and the new code makes the plain base cache
+  early-return - behaviorally identical; f174553 only changes which checkpoints get
+  invalidated. Neither touches the seq_rm/seq_pos path.
+- Only one task was active at the moment (no decode in flight, no draft context), so a
+  racing llama thread is less likely here than for C4 - but the corruption can accumulate
+  earlier in the run and surface on the first tree walk that touches the damaged node;
+  the boundary-only watchdog gives no timestamp for the damage.
+- Repeatable stress vehicle: the GPU-lane mellum suite (LCP + checkpoint scenarios,
+  ~15 min). ASan on that workload is now the cheap definitive path (held on fan noise -
+  needs user OK).
 - **Only ASan can pin a wild write definitively.** ASan soak is HELD by user (fan noise on
   iGPU box) - needs explicit OK before relaunching.
 
@@ -177,10 +197,13 @@ feel like it. Crashes make it literally from scratch (KV gone).
    conversation + system-shared divergent probe) all 200, LCP path fired, no abort, no
    core. Standing regression: `tests/test_checkpoint_reuse.py` (CPU lane in the matrix;
    GPU lane on `lcp-mellum.json` when convenient).
-3. **Watch C2/C4 recurrence** in production (they are random-walk corruption; the
-   checkpoint fixes may not touch them). If they recur after step 1-2: data-race audit
-   of everything that touches llama_kv_cache and route-handler JSON (threads: server
-   loop, httplib pool, llama threadpool), then ASan soak (needs user OK).
+3. **C2/C4 recurrence: CONFIRMED (C5, 2026-10-24 00:26, GPU-lane stress run)** - the
+   checkpoint fixes did not touch the wild-corruption family, as predicted. Now a
+   data-race / double-free audit of everything that allocates or frees `llama_kv_cells`
+   nodes and seq_pos entries, with the GPU-lane mellum suite as the repeatable trigger
+   and the C5 core as the reference. Threads to clear: server queue loop (pre_decode
+   seq_rm), llama threadpool (decode writes), Vulkan backend workers, APE runtime.
+   Then ASan on the same workload (needs user OK - fan noise).
 4. **Model-competence items (section 3)**: no code; tell the user the skills chat was
    Mellum's tool confusion + the 21:33 crash, not a broken config.
 5. **Push the 6 unpushed commits** when user says go.
