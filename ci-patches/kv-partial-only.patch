@@ -1,0 +1,54 @@
+diff --git a/src/llama-kv-cache-iswa.cpp b/src/llama-kv-cache-iswa.cpp
+index e918664..334bef1 100644
+--- a/src/llama-kv-cache-iswa.cpp
++++ b/src/llama-kv-cache-iswa.cpp
+@@ -257,19 +257,13 @@ bool llama_kv_cache_iswa::get_can_shift() const {
+ }
+ 
+ void llama_kv_cache_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+-        kv_base->state_write(io, seq_id, flags);
+-    }
+-
+-    kv_swa->state_write(io, seq_id, flags);
++    kv_base->state_write(io, seq_id, flags);
++    kv_swa ->state_write(io, seq_id, flags);
+ }
+ 
+ void llama_kv_cache_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+-        kv_base->state_read(io, seq_id, flags);
+-    }
+-
+-    kv_swa->state_read(io, seq_id, flags);
++    kv_base->state_read(io, seq_id, flags);
++    kv_swa ->state_read(io, seq_id, flags);
+ }
+ 
+ llama_kv_cache * llama_kv_cache_iswa::get_base() const {
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 5382cd7..3c67523 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1970,7 +1970,9 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
+         return;
+     }
+ 
+-    GGML_UNUSED(flags);
++    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) && swa_type == LLAMA_SWA_TYPE_NONE) {
++        return;
++    }
+ 
+     io.write(&n_stream, sizeof(n_stream));
+ 
+@@ -2040,7 +2042,9 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
+         return;
+     }
+ 
+-    GGML_UNUSED(flags);
++    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) && swa_type == LLAMA_SWA_TYPE_NONE) {
++        return;
++    }
+ 
+     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
+ 

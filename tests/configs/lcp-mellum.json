@@ -2,6 +2,7 @@
   "listen": "127.0.0.1:48091",
   "test_profile": "full",
   "test_lcp": true,
+  "test_ckpt": true,
   "models": {
     "mellum": {
       "engine": "llama",

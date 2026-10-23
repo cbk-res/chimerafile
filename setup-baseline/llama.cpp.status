@@ -7,9 +7,11 @@
 1c680c6061760e33fc3492498c6983845a562526	BUILD.mk
 24caf0a43886676888a01bd4fb4170e0f28863e7	src/llama-kv-cells.h
 2a716afc1d7db1bf1faf31fcae0123da9857dc45	ggml/src/ggml-vulkan/ggml-vulkan.cpp
+334bef1ab0a09ab6c382fa3b59a9d569832bb85b	src/llama-kv-cache-iswa.cpp
 373b42abb41d71102a7749f319fa4d8afe7745b1	ggml/src/ggml-cuda/mmvq.cu
 386e1b2927662221da59bbf3907408be54dbeb34	ggml/src/ggml-cpu/amx/amx.cpp
 39238ca46ef395e7ae127462686cc51bb886a9e9	tools/server/server-models.cpp
+3c67523e1f8504432659f52b08af6415bc4d5c17	src/llama-kv-cache.cpp
 3ca9243fed5cc4431527fd02d9b1971bd8aba86f	src/models/t5.cpp
 3ec014e4499577d6146b1594e9c184d6a50b3939	src/models/dflash.cpp
 4082dca23cf594c7b0a689e776538a2683898671	common/http.h
@@ -20,6 +22,7 @@
 5b2ce6534fe35653465befc10a2ff986e710f93f	src/llama-batch.h
 5d2851173927c1d8318b148b27dac2e989afae5b	ggml/src/ggml-cpu/ggml-cpu.c
 63fae0684ba5dbbb7296f24bbaa656f14ba68cac	tools/server/server-stream.cpp
+641bb704e53fa07e17dddc1abcf36f4ae6889c77	tools/server/server-context.cpp
 69341cdcc10fa8d3992607ec26514786d01c17a2	ggml/include/ggml-cpu.h
 6df8c4306271e3d36cfec8c1cc37667070692137	ggml/src/ggml-metal/ggml-metal.cpp
 72ff4027b948a111a611a9ff41c6f72c7c8a8a89	README.llamafile
@@ -49,5 +52,6 @@ e9ea53bfe46d5bfbc53448a831b8d536bb76f293	ggml/src/gguf.cpp
 ef660fa2fedc1a76ff2c91e4cf6190f596f728ff	ggml/src/ggml-cpu/repack.cpp
 efacd24700453896e31c89ac0f9cbc87c3b3655e	src/llama-mmap.h
 f01cab37f5a9da48ae6ebd1761ed73bd52849ed9	vendor/cpp-httplib/httplib.cpp
+fcfb9e66ec237a0469cdb4cf3c15d1e24ae951b8	tools/server/tests/unit/test_completion.py
 feb88feb728aa2e791ec6f7ef06c278cbb9d06fb	common/download.cpp
 ff024dff2662f1288c35ffa1d63bec696c49dbc8	common/arg.cpp

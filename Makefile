@@ -82,6 +82,10 @@ fresh: # Reset the submodule trees to the pinned state, re-apply setup, rebuild
 	@bash $(CHIMERAFILE_REPO)/ci-patches/patch-peg-tomove.sh
 	@echo "==> Applying builder patches (llama.cpp batch-allocr seq_pos watchdog)..."
 	@bash $(CHIMERAFILE_REPO)/ci-patches/patch-batch-watch.sh
+	@echo "==> Applying builder patches (llama.cpp PARTIAL_ONLY in KV caches)..."
+	@bash $(CHIMERAFILE_REPO)/ci-patches/patch-kv-partial-only.sh
+	@echo "==> Applying builder patches (llama.cpp SWA checkpoint invalidation)..."
+	@bash $(CHIMERAFILE_REPO)/ci-patches/patch-ckpt-invalidate.sh
 	@echo "==> Recording setup baselines..."
 	@$(CHIMERAFILE_REPO)/scripts/record-setup-baseline.sh
 	@echo "==> Building from the known state..."
@@ -144,6 +148,10 @@ setup:
 	@bash $(CHIMERAFILE_REPO)/ci-patches/patch-peg-tomove.sh
 	@echo "==> Applying builder patches (llama.cpp batch-allocr seq_pos watchdog)..."
 	@bash $(CHIMERAFILE_REPO)/ci-patches/patch-batch-watch.sh
+	@echo "==> Applying builder patches (llama.cpp PARTIAL_ONLY in KV caches)..."
+	@bash $(CHIMERAFILE_REPO)/ci-patches/patch-kv-partial-only.sh
+	@echo "==> Applying builder patches (llama.cpp SWA checkpoint invalidation)..."
+	@bash $(CHIMERAFILE_REPO)/ci-patches/patch-ckpt-invalidate.sh
 	@echo "==> Recording setup baselines..."
 	@$(CHIMERAFILE_REPO)/scripts/record-setup-baseline.sh
 	@echo ""

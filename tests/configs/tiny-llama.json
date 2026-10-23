@@ -1,6 +1,7 @@
 {
   "listen": "127.0.0.1:18091",
   "test_profile": "tiny",
+  "test_ckpt": true,
   "models": {
     "tiny": {
       "engine": "llama",
