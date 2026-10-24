@@ -58,6 +58,17 @@ operation touches the damaged memory next.
   racing llama thread is less likely here than for C4 - but the corruption can accumulate
   earlier in the run and surface on the first tree walk that touches the damaged node;
   the boundary-only watchdog gives no timestamp for the damage.
+- **OOM alternative (raised by user, partly supported):** the machine has 23 GiB RAM +
+  8 GiB swap. The GPU-lane run loaded a *second* full Mellum (model + 131k KV) on top of
+  the live instance + desktop + browser - structurally over budget. The kernel's **global
+  OOM killer fired at 00:13:06** (invoked by the APE runtime, pid 297627) and **killed
+  the user's Brave browser** (the death the user noticed). C5 landed 13 min later, while
+  the system was still swap-thrashing, with no further OOM invocations. APE cores always
+  store si_code=0/fault_addr=0 (verified on every core, incl. C4), so the fault address
+  cannot be read from the core to tell NULL-deref (plausible if the runtime allocator
+  fails to NULL under pressure) from a wild write. **Discriminator: re-run the same
+  GPU-lane suite with memory headroom (live Mellum idle-unloaded) - clean pass makes
+  C5 OOM-induced; a repeat crash under headroom confirms corruption.**
 - Repeatable stress vehicle: the GPU-lane mellum suite (LCP + checkpoint scenarios,
   ~15 min). ASan on that workload is now the cheap definitive path (held on fan noise -
   needs user OK).
